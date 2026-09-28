@@ -12,6 +12,140 @@ fn yacli() -> Command {
     command
 }
 
+#[test]
+fn devcat_oauth_uses_owned_client_and_read_only_scopes_without_local_tokens() {
+    let temp = tempdir().expect("tempdir");
+    write_accounts_file(
+        temp.path(),
+        r#"
+version = 1
+[accounts.mock]
+email = "me@yandex.ru"
+default = true
+[accounts.mock.mail]
+enabled = true
+auth_mode = "oauth_xoauth2"
+imap_host = "imap.yandex.com"
+imap_port = 993
+smtp_host = "smtp.yandex.com"
+smtp_port = 465
+credential_ref = "vault:DEVCAT_TEST_MAIL"
+[accounts.mock.calendar]
+enabled = false
+auth_mode = "app_password"
+caldav_base_url = "https://caldav.yandex.ru"
+[accounts.mock.disk]
+enabled = true
+auth_mode = "oauth"
+rest_base_url = "https://cloud-api.yandex.net"
+credential_ref = "vault:DEVCAT_TEST_DISK"
+"#,
+    );
+    for (service, expected, forbidden) in [
+        ("mail", "mail%3Aimap_ro", "mail%3Aimap_full"),
+        ("disk", "cloud_api%3Adisk.read", "cloud_api%3Adisk.write"),
+    ] {
+        let output = yacli()
+            .env("YACLI_CONFIG_DIR", temp.path())
+            .env("YACLI_DEVCAT_MODE", "1")
+            .env("YACLI_DEVCAT_ACCOUNT", "mock")
+            .env("YACLI_DEVCAT_DISK_ROOTS", "disk:/safe")
+            .env("YACLI_DEVCAT_OAUTH_CLIENT_ID", "owned-test-client")
+            .args(["auth", "login", "--account", "mock", "--service", service])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let value: Value = serde_json::from_slice(&output).expect("pending OAuth json");
+        let url = value["authorization"]["authorization_url"]
+            .as_str()
+            .expect("authorization URL");
+        assert!(url.contains("client_id=owned-test-client"));
+        assert!(url.contains(expected));
+        assert!(!url.contains(forbidden));
+    }
+    assert!(!temp.path().join("credentials.toml").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn devcat_oauth_exchange_writes_only_to_vault_helper() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempdir().unwrap();
+    let helper = temp.path().join("bruce-secret");
+    fs::write(&helper, "#!/bin/sh\ncase \"$1\" in exists) exit 10;; put) cat > \"$DEVCAT_FAKE_VAULT_DIR/$2\";; *) exit 1;; esac\n").unwrap();
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+    let path = format!(
+        "{}:{}",
+        temp.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    write_accounts_file(
+        temp.path(),
+        r#"
+version = 1
+[accounts.mock]
+email = "me@yandex.ru"
+default = true
+[accounts.mock.mail]
+enabled = true
+auth_mode = "oauth_xoauth2"
+imap_host = "imap.yandex.com"
+imap_port = 993
+smtp_host = "smtp.yandex.com"
+smtp_port = 465
+credential_ref = "vault:DEVCAT_TEST_MAIL"
+[accounts.mock.calendar]
+enabled = false
+auth_mode = "app_password"
+caldav_base_url = "https://caldav.yandex.ru"
+[accounts.mock.disk]
+enabled = true
+auth_mode = "oauth"
+rest_base_url = "https://cloud-api.yandex.net"
+credential_ref = "vault:DEVCAT_TEST_DISK"
+"#,
+    );
+    let mut oauth = Server::new();
+    let _token = oauth.mock("POST", "/token")
+        .match_body(Matcher::Regex("grant_type=authorization_code&code=confirm-123&client_id=owned-test-client&code_verifier=.+".into()))
+        .with_status(200).with_header("content-type", "application/json")
+        .with_body(r#"{"access_token":"fake-access-token","token_type":"bearer","expires_in":3600,"scope":"mail:imap_ro"}"#).create();
+    let output = yacli()
+        .env("PATH", path)
+        .env("DEVCAT_FAKE_VAULT_DIR", temp.path())
+        .env("YACLI_CONFIG_DIR", temp.path())
+        .env("YACLI_OAUTH_BASE_URL", oauth.url())
+        .env("YACLI_DEVCAT_MODE", "1")
+        .env("YACLI_DEVCAT_ACCOUNT", "mock")
+        .env("YACLI_DEVCAT_DISK_ROOTS", "disk:/safe")
+        .env("YACLI_DEVCAT_OAUTH_CLIENT_ID", "owned-test-client")
+        .args([
+            "auth",
+            "login",
+            "--account",
+            "mock",
+            "--service",
+            "mail",
+            "--code",
+            "confirm-123",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(value["credential_ref"], "vault:DEVCAT_TEST_MAIL");
+    assert!(!String::from_utf8_lossy(&output).contains("fake-access-token"));
+    assert_eq!(
+        fs::read_to_string(temp.path().join("DEVCAT_TEST_MAIL")).unwrap(),
+        "fake-access-token"
+    );
+    assert!(!temp.path().join("credentials.toml").exists());
+}
+
 fn current_release_update_target() -> (&'static str, &'static str) {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => ("yacli-aarch64-apple-darwin.tar.gz", "aarch64-apple-darwin"),

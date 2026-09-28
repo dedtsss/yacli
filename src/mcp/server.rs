@@ -14,8 +14,10 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use base64::Engine;
 use rand::{Rng, distr::Alphanumeric};
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, broadcast, mpsc as tokio_mpsc, oneshot};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::{BroadcastStream, ReceiverStream};
@@ -71,7 +73,7 @@ use crate::{
 };
 use chrono::{DateTime, Utc};
 
-use super::{prompts, skills};
+use super::{devcat, prompts, skills};
 
 const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
 const APP_RESOURCE_URI: &str = "ui://yacli/dashboard";
@@ -372,6 +374,17 @@ struct HttpAuthDiscovery {
 }
 
 pub fn serve_http(listen: &str, public_url: Option<&str>) -> Result<()> {
+    devcat::validate()?;
+    if devcat::enabled() {
+        let address: std::net::SocketAddr = listen
+            .parse()
+            .map_err(|_| YacliError::Config("DevCat MCP requires an IP socket address".into()))?;
+        if !address.ip().is_loopback() {
+            return Err(YacliError::Config(
+                "DevCat MCP must listen on loopback".into(),
+            ));
+        }
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -379,6 +392,11 @@ pub fn serve_http(listen: &str, public_url: Option<&str>) -> Result<()> {
 
     runtime.block_on(async move {
         let auth = HttpAuthConfig::from_env();
+        if devcat::enabled() && auth.bearer_token.is_none() {
+            return Err(YacliError::Config(
+                "DevCat MCP requires a bearer token from Bruce vault".into(),
+            ));
+        }
         let auth_discovery = HttpAuthDiscovery::from_config(listen, public_url, &auth)?;
         let state = HttpAppState {
             sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -388,6 +406,7 @@ pub fn serve_http(listen: &str, public_url: Option<&str>) -> Result<()> {
         spawn_http_resource_poller(state.clone());
 
         let app = Router::new()
+            .route("/healthz", get(|| async { StatusCode::OK }))
             .route(
                 PROTECTED_RESOURCE_METADATA_PATH,
                 get(handle_http_protected_resource_metadata),
@@ -523,6 +542,9 @@ async fn handle_http_post(
     };
 
     if messages.iter().any(is_client_response_message) {
+        if devcat::enabled() && !state.auth.authorized(&headers) {
+            return http_unauthorized_response(vec![], state.auth_discovery.as_ref());
+        }
         if !messages.iter().all(is_client_response_message) {
             return http_error_response(
                 StatusCode::BAD_REQUEST,
@@ -533,7 +555,7 @@ async fn handle_http_post(
         return handle_http_client_responses(&state, &headers, messages).await;
     }
 
-    if needs_http_auth(&messages) && !state.auth.authorized(&headers) {
+    if (devcat::enabled() || needs_http_auth(&messages)) && !state.auth.authorized(&headers) {
         return http_unauthorized_response(
             required_scopes(&messages),
             state.auth_discovery.as_ref(),
@@ -564,6 +586,13 @@ async fn handle_http_post(
         && requested_tool_name(messages[0].get("params").unwrap_or(&Value::Null))
             == Some("yacli.roots.list")
     {
+        if devcat::enabled() {
+            return http_error_response(
+                StatusCode::FORBIDDEN,
+                "DevCat roots tool disabled",
+                Some(&session_id),
+            );
+        }
         if messages.len() != 1 {
             return http_error_response(
                 StatusCode::BAD_REQUEST,
@@ -797,6 +826,9 @@ async fn handle_http_roots_tool_call(
 }
 
 async fn handle_http_get(State(state): State<HttpAppState>, headers: HeaderMap) -> Response {
+    if devcat::enabled() && !state.auth.authorized(&headers) {
+        return http_unauthorized_response(vec![], state.auth_discovery.as_ref());
+    }
     if let Err(err) = request_origin_allowed(&headers) {
         return http_error_response(StatusCode::FORBIDDEN, &err.to_string(), None);
     }
@@ -864,6 +896,9 @@ async fn handle_http_get(State(state): State<HttpAppState>, headers: HeaderMap) 
 }
 
 async fn handle_http_delete(State(state): State<HttpAppState>, headers: HeaderMap) -> Response {
+    if devcat::enabled() && !state.auth.authorized(&headers) {
+        return http_unauthorized_response(vec![], state.auth_discovery.as_ref());
+    }
     if let Err(err) = request_origin_allowed(&headers) {
         return http_error_response(StatusCode::FORBIDDEN, &err.to_string(), None);
     }
@@ -1019,9 +1054,24 @@ fn handle_request(
             "MCP session is not initialized; call `initialize` first".to_string(),
         ));
     }
+    if devcat::enabled() && !matches!(method, "initialize" | "ping" | "tools/list" | "tools/call") {
+        return Err(YacliError::UnsupportedOperation(format!(
+            "DevCat MCP method disabled: {method}"
+        )));
+    }
 
     match method {
         "initialize" => {
+            if devcat::enabled() {
+                session.initialized = true;
+                session.ui_enabled = false;
+                session.supports_roots_requests = false;
+                return Ok(json!({
+                    "protocolVersion": MCP_PROTOCOL_VERSION,
+                    "capabilities": {"tools": {"listChanged": false}},
+                    "serverInfo": {"name":"yacli-devcat", "version": env!("CARGO_PKG_VERSION")}
+                }));
+            }
             session.ui_enabled = client_supports_ui(&params);
             session.roots_list_changed_supported = client_supports_roots_list_changed(&params);
             session.supports_roots_requests = client_supports_roots(&params);
@@ -1562,6 +1612,17 @@ fn tool_definitions(ui_enabled: bool, roots_enabled: bool) -> Vec<Value> {
             ui_enabled,
         ),
         tool(
+            "yacli.disk.read",
+            "Read a Yandex Disk file up to 1 MiB as base64.",
+            json!({
+                "type": "object",
+                "properties": { "account": {"type":"string"}, "path": {"type":"string"} },
+                "required": ["path"], "additionalProperties": false
+            }),
+            None,
+            ui_enabled,
+        ),
+        tool(
             "yacli.disk.mkdir",
             "Create one Yandex Disk directory.",
             json!({
@@ -1664,15 +1725,34 @@ fn tool_definitions(ui_enabled: bool, roots_enabled: bool) -> Vec<Value> {
     ]);
 
     tools
+        .into_iter()
+        .filter(|tool| {
+            tool.get("name")
+                .and_then(Value::as_str)
+                .is_some_and(devcat::tool_allowed)
+        })
+        .collect()
 }
 
 fn tool(
     name: &str,
     description: &str,
-    input_schema: Value,
+    mut input_schema: Value,
     visibility: Option<&[&str]>,
     ui_enabled: bool,
 ) -> Value {
+    if devcat::enabled() && devcat::is_risky(name) {
+        if let Some(properties) = input_schema
+            .get_mut("properties")
+            .and_then(Value::as_object_mut)
+        {
+            properties.insert(
+                "review_sha256".into(),
+                json!({"type":"string", "description":"SHA-256 returned by the matching dry run"}),
+            );
+            properties.insert("dry_run".into(), json!({"type":"boolean"}));
+        }
+    }
     let mut object = Map::new();
     object.insert("name".to_string(), Value::String(name.to_string()));
     object.insert(
@@ -1693,12 +1773,31 @@ fn call_tool(params: Value, ui_enabled: bool) -> Result<Value> {
         .get("name")
         .and_then(Value::as_str)
         .ok_or_else(|| YacliError::Validation("tools/call requires `name`".to_string()))?;
-    let arguments = params
+    let mut arguments = params
         .get("arguments")
         .cloned()
         .unwrap_or(Value::Object(Map::new()));
+    if devcat::enabled() {
+        if let Ok(account) = std::env::var("YACLI_DEVCAT_ACCOUNT") {
+            if let Some(object) = arguments.as_object_mut() {
+                object.entry("account").or_insert(Value::String(account));
+            }
+        }
+    }
+    devcat::check_tool(name, &arguments)?;
+    if devcat::enabled()
+        && devcat::is_risky(name)
+        && optional_bool(&arguments, "dry_run") != Some(true)
+    {
+        eprintln!(
+            "{}",
+            json!({"event":"devcat_mcp_mutation", "tool":name,
+            "account": arguments.get("account").and_then(Value::as_str),
+            "timestamp": chrono::Utc::now().to_rfc3339(), "result":"attempt"})
+        );
+    }
 
-    let structured = match name {
+    let mut structured = match name {
         "yacli.app.snapshot" => app_snapshot()?,
         "yacli.account.list" => account_list()?,
         "yacli.account.current" => account_current()?,
@@ -1890,9 +1989,14 @@ fn call_tool(params: Value, ui_enabled: bool) -> Result<Value> {
             optional_usize(&arguments, "limit").unwrap_or(100),
             optional_u64(&arguments, "offset").unwrap_or(0),
         )?,
+        "yacli.disk.read" => disk_read(
+            arguments.get("account").and_then(Value::as_str),
+            required_string(&arguments, "path")?,
+        )?,
         "yacli.disk.mkdir" => disk_mkdir(
             arguments.get("account").and_then(Value::as_str),
             required_string(&arguments, "path")?,
+            optional_bool(&arguments, "dry_run").unwrap_or(false),
         )?,
         "yacli.disk.upload" => disk_upload(
             arguments.get("account").and_then(Value::as_str),
@@ -1941,6 +2045,20 @@ fn call_tool(params: Value, ui_enabled: bool) -> Result<Value> {
         }
     };
 
+    if devcat::enabled() && devcat::is_risky(name) {
+        if optional_bool(&arguments, "dry_run") == Some(true) {
+            let digest = devcat::review_hash(name, &arguments)?;
+            devcat::record_review(digest.clone());
+            structured["review_sha256"] = Value::String(digest);
+        } else {
+            eprintln!(
+                "{}",
+                json!({"event":"devcat_mcp_mutation", "tool":name,
+                "account": arguments.get("account").and_then(Value::as_str),
+                "timestamp": chrono::Utc::now().to_rfc3339(), "result":"success"})
+            );
+        }
+    }
     let text = serde_json::to_string_pretty(&structured)
         .map_err(|err| YacliError::Serialization(err.to_string()))?;
 
@@ -3078,7 +3196,45 @@ fn disk_list(account: Option<&str>, path: &str, limit: usize, offset: u64) -> Re
     }))
 }
 
-fn disk_mkdir(account: Option<&str>, path: &str) -> Result<Value> {
+fn disk_read(account: Option<&str>, path: &str) -> Result<Value> {
+    let (resolved_account, base_url, access_token) = resolve_disk_private_context(account)?;
+    let resource = fetch_private_resource(
+        &base_url,
+        &access_token,
+        &PrivateDiskListRequest {
+            path: path.to_string(),
+            limit: 1,
+            offset: 0,
+        },
+    )?;
+    if resource.resource_type != "file" || resource.size.unwrap_or(u64::MAX) > 1024 * 1024 {
+        return Err(YacliError::Validation(
+            "Disk read requires a file of at most 1 MiB".into(),
+        ));
+    }
+    let temp = tempfile::NamedTempFile::new()?;
+    let (_, download) = download_private_resource(
+        &base_url,
+        &access_token,
+        &PrivateDiskDownloadRequest {
+            path: path.to_string(),
+            output: temp.path().to_path_buf(),
+            force: true,
+        },
+    )?;
+    if download.bytes_written > 1024 * 1024 {
+        return Err(YacliError::Validation("Disk read exceeded 1 MiB".into()));
+    }
+    let bytes = std::fs::read(temp.path())?;
+    Ok(json!({"account": resolved_account, "path": path,
+        "encoding": "base64", "bytes": bytes.len(),
+        "data": base64::engine::general_purpose::STANDARD.encode(bytes)}))
+}
+
+fn disk_mkdir(account: Option<&str>, path: &str, dry_run: bool) -> Result<Value> {
+    if dry_run {
+        return Ok(json!({"account":account,"path":path,"dry_run":true,"operation":"disk.mkdir"}));
+    }
     let (resolved_account, base_url, access_token) = resolve_disk_private_context(account)?;
     let resource = create_private_directory(
         &base_url,
@@ -3304,6 +3460,9 @@ fn disk_unpublish(account: Option<&str>, request: DiskUnpublishToolRequest) -> R
 }
 
 fn record_activity_mcp(entry: NewActivityEntry) {
+    if devcat::enabled() {
+        return;
+    }
     if let Err(err) = record_activity(entry) {
         eprintln!(
             "{}",
@@ -3950,6 +4109,11 @@ fn execute_stdio_request(
     poller: &mut ResourceSubscriptionPoller,
 ) -> Result<Value> {
     if method == "tools/call" && requested_tool_name(&params) == Some("yacli.roots.list") {
+        if devcat::enabled() {
+            return Err(YacliError::UnsupportedOperation(
+                "DevCat roots tool disabled".into(),
+            ));
+        }
         return roots_list_tool_stdio(session, writer, rx, poller);
     }
 
@@ -4327,6 +4491,18 @@ fn request_origin_allowed(headers: &HeaderMap) -> Result<()> {
     let parsed = Url::parse(&origin).map_err(|err| {
         YacliError::Validation(format!("invalid Origin header `{origin}`: {err}"))
     })?;
+    if devcat::enabled()
+        && std::env::var("YACLI_DEVCAT_ALLOWED_ORIGINS")
+            .ok()
+            .is_some_and(|allowlist| {
+                allowlist
+                    .split(',')
+                    .map(str::trim)
+                    .any(|allowed| allowed == origin)
+            })
+    {
+        return Ok(());
+    }
     let Some(host) = parsed.host_str() else {
         return Err(YacliError::Validation(
             "origin is not allowed for local MCP HTTP transport".to_string(),
@@ -4350,10 +4526,16 @@ fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
 
 impl HttpAuthConfig {
     fn from_env() -> Self {
-        let bearer_token = std::env::var(HTTP_AUTH_TOKEN_ENV)
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
+        let bearer_token = if devcat::enabled() {
+            std::env::var("YACLI_DEVCAT_MCP_TOKEN_VAULT_KEY")
+                .ok()
+                .and_then(|key| crate::runtime_context::vault_secret(&key).ok())
+        } else {
+            std::env::var(HTTP_AUTH_TOKEN_ENV)
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        };
         Self { bearer_token }
     }
 
@@ -4364,10 +4546,15 @@ impl HttpAuthConfig {
         let Some(authorization) = header_value(headers, "Authorization") else {
             return false;
         };
-        authorization
-            .strip_prefix("Bearer ")
-            .map(|token| token == expected)
-            .unwrap_or(false)
+        authorization.strip_prefix("Bearer ").is_some_and(|token| {
+            let supplied = Sha256::digest(token.as_bytes());
+            let expected = Sha256::digest(expected.as_bytes());
+            supplied
+                .iter()
+                .zip(expected.iter())
+                .fold(0_u8, |diff, (a, b)| diff | (a ^ b))
+                == 0
+        })
     }
 }
 

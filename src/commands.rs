@@ -1596,13 +1596,35 @@ fn execute_auth(format: OutputFormat, action: AuthCommand) -> Result<RenderedOut
                         };
                         return Err(YacliError::Validation(command_hint.to_string()));
                     }
+                    if crate::mcp::devcat::enabled() {
+                        crate::mcp::devcat::validate()?;
+                    }
+                    let configured_devcatoauth = if crate::mcp::devcat::enabled() {
+                        std::env::var("YACLI_DEVCAT_OAUTH_CLIENT_ID").ok()
+                    } else {
+                        None
+                    };
+                    if crate::mcp::devcat::enabled()
+                        && client_id.as_deref().is_some_and(|provided| {
+                            Some(provided) != configured_devcatoauth.as_deref()
+                        })
+                    {
+                        return Err(YacliError::Config(
+                            "DevCat login must use the configured owned OAuth client ID".into(),
+                        ));
+                    }
                     let client_id_source = if client_id.is_some() {
                         "override"
+                    } else if configured_devcatoauth.is_some() {
+                        "devcat_config"
                     } else {
                         "built_in"
                     };
-                    let client_id =
-                        client_id.unwrap_or_else(|| default_yacli_client_id().to_string());
+                    let client_id = client_id.unwrap_or_else(|| {
+                        configured_devcatoauth
+                            .clone()
+                            .unwrap_or_else(|| default_yacli_client_id().to_string())
+                    });
                     let resolved_login_hint = login_hint.or(Some(account.email.clone()));
                     let mut session_store = PendingOauthSessionStore::load()?;
                     let existing_pending = session_store
@@ -1656,32 +1678,61 @@ fn execute_auth(format: OutputFormat, action: AuthCommand) -> Result<RenderedOut
                         session_store.save()?;
                     }
 
-                    let mut credential_store = CredentialStore::load()?;
-                    let credential_refs: Vec<_> = services
-                        .iter()
-                        .map(|service| {
-                            credential_store.set_oauth(
-                                account_name.clone(),
-                                service.as_str().to_string(),
-                                login.credential.clone(),
-                            );
-                            account_store.set_service_credential_ref(
-                                &account_name,
-                                service.as_str(),
-                                Some(service.store_ref().to_string()),
-                            )?;
-                            Ok((
-                                service.as_str().to_string(),
-                                service.store_ref().to_string(),
-                            ))
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-                    credential_store.save()?;
-                    account_store.save()?;
+                    let credential_refs: Vec<_> = if crate::mcp::devcat::enabled() {
+                        services
+                            .iter()
+                            .map(|service| {
+                                let configured = account_store.get_account(&account_name)?;
+                                let reference = match service {
+                                    OauthService::Mail => configured.mail.credential_ref.as_deref(),
+                                    OauthService::Disk => configured.disk.credential_ref.as_deref(),
+                                }
+                                .ok_or_else(|| {
+                                    YacliError::Config(
+                                        "DevCat account needs vault credential references".into(),
+                                    )
+                                })?;
+                                let key = reference.strip_prefix("vault:").ok_or_else(|| {
+                                    YacliError::Config(
+                                        "DevCat OAuth token must use a vault reference".into(),
+                                    )
+                                })?;
+                                crate::runtime_context::vault_store_token(
+                                    key,
+                                    &login.credential.access_token,
+                                )?;
+                                Ok((service.as_str().to_string(), reference.to_string()))
+                            })
+                            .collect::<Result<Vec<_>>>()?
+                    } else {
+                        let mut credential_store = CredentialStore::load()?;
+                        let refs: Vec<_> = services
+                            .iter()
+                            .map(|service| {
+                                credential_store.set_oauth(
+                                    account_name.clone(),
+                                    service.as_str().to_string(),
+                                    login.credential.clone(),
+                                );
+                                account_store.set_service_credential_ref(
+                                    &account_name,
+                                    service.as_str(),
+                                    Some(service.store_ref().to_string()),
+                                )?;
+                                Ok((
+                                    service.as_str().to_string(),
+                                    service.store_ref().to_string(),
+                                ))
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        credential_store.save()?;
+                        account_store.save()?;
+                        refs
+                    };
 
                     if services.len() == 1 {
                         let service = services[0];
-                        let credential_ref = service.store_ref().to_string();
+                        let credential_ref = credential_refs[0].1.clone();
                         return ok_output(
                             format,
                             "auth.login",

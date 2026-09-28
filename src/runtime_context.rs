@@ -33,6 +33,7 @@ pub struct CalendarConnectionContext {
 enum CredentialReference<'a> {
     Env(&'a str),
     Store(&'a str),
+    Vault(&'a str),
 }
 
 pub fn auth_state(
@@ -101,6 +102,11 @@ pub fn auth_state(
                     },
                 }
             }
+            Some(CredentialReference::Vault(key)) => CredentialState {
+                credential_ref: Some(raw.to_string()),
+                credential_state: "vault_ref",
+                detail: format!("Bruce vault key {key}; checked at use time"),
+            },
             None => CredentialState {
                 credential_ref: Some(raw.to_string()),
                 credential_state: "unsupported_reference",
@@ -220,6 +226,7 @@ pub fn resolve_oauth_access_token(
 
     match parse_credential_ref(reference) {
         Some(CredentialReference::Env(var_name)) => required_env(var_name),
+        Some(CredentialReference::Vault(key)) => vault_secret(key),
         Some(CredentialReference::Store(store_service)) => {
             if store_service != service.as_str() {
                 return Err(YacliError::Config(format!(
@@ -270,6 +277,7 @@ pub fn resolve_app_password_secret(
 
     match parse_credential_ref(reference) {
         Some(CredentialReference::Env(var_name)) => required_env(var_name),
+        Some(CredentialReference::Vault(key)) => vault_secret(key),
         Some(CredentialReference::Store(store_service)) => {
             if store_service != service {
                 return Err(YacliError::Config(format!(
@@ -302,6 +310,9 @@ fn required_env(name: &str) -> Result<String> {
 }
 
 fn parse_credential_ref(raw: &str) -> Option<CredentialReference<'_>> {
+    if let Some(value) = raw.strip_prefix("vault:") {
+        return Some(CredentialReference::Vault(value));
+    }
     if let Some(value) = raw.strip_prefix("env:") {
         return Some(CredentialReference::Env(value));
     }
@@ -309,4 +320,84 @@ fn parse_credential_ref(raw: &str) -> Option<CredentialReference<'_>> {
         return Some(CredentialReference::Store(value));
     }
     None
+}
+
+pub(crate) fn vault_secret(key: &str) -> Result<String> {
+    if !crate::mcp::devcat::enabled() {
+        return Err(YacliError::Auth(
+            "vault reference requires DevCat mode".into(),
+        ));
+    }
+    if key.is_empty()
+        || !key
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+    {
+        return Err(YacliError::Config("invalid vault key name".into()));
+    }
+    let output = std::process::Command::new("bruce-secret")
+        .arg("get")
+        .arg(key)
+        .output()
+        .map_err(|_| YacliError::Auth("Bruce vault helper unavailable".into()))?;
+    if !output.status.success() {
+        return Err(YacliError::Auth(format!(
+            "Bruce vault key unavailable: {key}"
+        )));
+    }
+    let value = String::from_utf8(output.stdout)
+        .map_err(|_| YacliError::Auth("invalid vault response".into()))?;
+    let value = value.trim_end_matches(['\r', '\n']).to_string();
+    if value.is_empty() {
+        return Err(YacliError::Auth(format!("Bruce vault key empty: {key}")));
+    }
+    Ok(value)
+}
+
+pub(crate) fn vault_store_token(key: &str, value: &str) -> Result<()> {
+    if !crate::mcp::devcat::enabled() {
+        return Err(YacliError::Auth("vault write requires DevCat mode".into()));
+    }
+    if key.is_empty()
+        || !key
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+    {
+        return Err(YacliError::Config("invalid vault key name".into()));
+    }
+    let status = std::process::Command::new("bruce-secret")
+        .arg("exists")
+        .arg(key)
+        .output()
+        .map_err(|_| YacliError::Auth("Bruce vault helper unavailable".into()))?
+        .status;
+    let action = match status.code() {
+        Some(0) => "replace",
+        Some(10) => "put",
+        _ => {
+            return Err(YacliError::Auth(format!(
+                "Bruce vault preflight failed: {key}"
+            )));
+        }
+    };
+    let mut child = std::process::Command::new("bruce-secret")
+        .arg(action)
+        .arg(key)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|_| YacliError::Auth("Bruce vault write helper unavailable".into()))?;
+    use std::io::Write;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| YacliError::Auth("Bruce vault stdin unavailable".into()))?
+        .write_all(value.as_bytes())?;
+    if !child.wait()?.success() {
+        return Err(YacliError::Auth(format!(
+            "Bruce vault token write failed: {key}"
+        )));
+    }
+    Ok(())
 }
