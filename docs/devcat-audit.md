@@ -22,10 +22,10 @@ The read-only MCP surface still needs careful classification: dashboard/goal/sug
 
 ## Alternatives inspected
 
-* `denis-samatov/yandex-workspace-mcp` (MIT, active 2026-09-24) has useful deny-by-default, path policy and audit patterns, but its code and deployment model include Wiki, multi-user OAuth, Redis and separate secret storage; adopting it would add a second backend and a wider surface.
+* `denis-samatov/yandex-workspace-mcp` (MIT, active 2026-09-24) has useful deny-by-default, path policy (`policies/paths.py`) and fixed-field audit (`security/audit.py`) patterns, but its code and deployment model include Wiki, multi-user OAuth, Redis and separate secret storage; adopting it would add a second backend and a wider surface.
 * `gdigora/yandex-mail-mcp` (no detected license, last push 2025-12-22) is a smaller IMAP/SMTP Python server with search/read/send/move/delete; it lacks Disk and its `server.py` includes permanent-delete fallback semantics.
-* `andrewmalov/mcp-imap` (no detected license, last push 2026-01-07) has IMAP/SMTP tools and tests but no Disk. It logs tool argument dictionaries in `server.py`, unsuitable for mail content without further work.
+* `andrewmalov/mcp-imap` (`pyproject.toml` declares MIT, but no standalone license file appears in the tree; last push 2026-01-07) has IMAP/SMTP tools and tests but no Disk. It logs tool argument dictionaries in `server.py`, unsuitable for mail content without further work.
 
 Only the security ideas from the MIT donor are reused; no donor source is copied. Upstream repositories remain read-only.
 
-Official references: [Yandex OAuth and PKCE](https://yandex.com/dev/id/doc/en/codes/code-url), [app registration](https://yandex.com/dev/id/doc/en/register-client), [Mail IMAP/SMTP](https://yandex.com/support/yandex-360/business/mail/en/mail-clients/others), [Disk REST API](https://yandex.com/dev/disk/rest/).
+Official references: [Yandex OAuth and PKCE](https://yandex.com/dev/id/doc/en/codes/code-url), [app registration](https://yandex.com/dev/id/doc/en/register-client), [Mail OAuth scopes and XOAUTH2](https://yandex.ru/support/yandex-360/business/mail/ru/web/security/oauth), [Mail IMAP/SMTP](https://yandex.com/support/yandex-360/business/mail/en/mail-clients/others), [Disk REST API](https://yandex.com/dev/disk/rest/).

@@ -424,6 +424,8 @@ yacli mcp --transport http --listen 127.0.0.1:8787           # HTTP
 
 `stdio` автоматически совместим с `Content-Length` framing и line-delimited JSON — один бинарник работает и в старых, и в новых клиентах.
 
+Для production-интеграции DevCat с Яндекс Почтой и Диском используйте ограниченный профиль, конфигурацию Bruce vault и Secure MCP Tunnel из [руководства оператора](docs/devcat-operator.md). Включение профиля через `YACLI_DEVCAT_MODE=1` закрывает изменяющие операции по умолчанию, ограничивает пути Диска и требует аутентификацию HTTP.
+
 ### Установка в клиенты
 
 ```bash
