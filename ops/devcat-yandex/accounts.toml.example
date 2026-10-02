@@ -1,0 +1,25 @@
+version = 1
+
+[accounts.devcat]
+email = "REPLACE_WITH_YANDEX_ADDRESS"
+default = true
+
+[accounts.devcat.mail]
+enabled = true
+auth_mode = "oauth_xoauth2"
+imap_host = "imap.yandex.com"
+imap_port = 993
+smtp_host = "smtp.yandex.com"
+smtp_port = 465
+credential_ref = "vault:DEVCAT_YANDEX_MAIL_OAUTH_TOKEN"
+
+[accounts.devcat.calendar]
+enabled = false
+auth_mode = "app_password"
+caldav_base_url = "https://caldav.yandex.ru"
+
+[accounts.devcat.disk]
+enabled = true
+auth_mode = "oauth"
+rest_base_url = "https://cloud-api.yandex.net"
+credential_ref = "vault:DEVCAT_YANDEX_DISK_OAUTH_TOKEN"

@@ -281,6 +281,266 @@ fn basic_auth_header(account: &str, app_password: &str) -> String {
     )
 }
 
+#[cfg(unix)]
+#[test]
+fn devcat_profile_authenticates_and_enforces_capabilities_paths_and_review() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().expect("tempdir");
+    let helper = temp.path().join("bruce-secret");
+    std::fs::write(&helper, "#!/bin/sh\n[ \"$1\" = get ] && [ \"$2\" = DEVCAT_TEST_MCP ] && printf 'test-mcp-token\\n'\n")
+        .expect("fake vault helper");
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).expect("helper mode");
+    let path = format!(
+        "{}:{}",
+        temp.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let config = temp.path().join("config");
+    write_mock_disk_account(&config, "https://cloud-api.yandex.net");
+    let server = TestHttpServer::spawn_with_envs(&[
+        ("PATH", &path),
+        ("YACLI_CONFIG_DIR", config.to_str().unwrap()),
+        ("YACLI_DEVCAT_MODE", "1"),
+        ("YACLI_DEVCAT_ACCOUNT", "mock"),
+        (
+            "YACLI_DEVCAT_CAPABILITIES",
+            "mail.read,disk.read,disk.write",
+        ),
+        ("YACLI_DEVCAT_DISK_ROOTS", "disk:/safe"),
+        ("YACLI_DEVCAT_OAUTH_CLIENT_ID", "owned-test-client"),
+        ("YACLI_DEVCAT_MCP_TOKEN_VAULT_KEY", "DEVCAT_TEST_MCP"),
+    ]);
+    let client = client();
+    let init = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}});
+    assert_eq!(
+        post_json(&client, &server.url(), init.clone(), None, None).status(),
+        401
+    );
+    let response = client
+        .post(server.url())
+        .bearer_auth("test-mcp-token")
+        .json(&init)
+        .send()
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let session = response
+        .headers()
+        .get("mcp-session-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let initialized: Value = response.json().unwrap();
+    assert!(initialized["result"]["capabilities"]["resources"].is_null());
+    assert_eq!(
+        client
+            .get(server.url())
+            .header("Mcp-Session-Id", &session)
+            .send()
+            .unwrap()
+            .status(),
+        401
+    );
+    let call = |id, method: &str, params: Value| -> Value {
+        client
+            .post(server.url())
+            .bearer_auth("test-mcp-token")
+            .header("Mcp-Session-Id", &session)
+            .json(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
+            .send()
+            .unwrap()
+            .json()
+            .unwrap()
+    };
+    let tools = call(2, "tools/list", json!({}));
+    let resources = call(20, "resources/list", json!({}));
+    assert!(resources["error"].is_object());
+    let names: Vec<_> = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v["name"].as_str())
+        .collect();
+    assert!(names.contains(&"yacli.mail.search"));
+    assert!(names.contains(&"yacli.disk.read"));
+    assert!(names.contains(&"yacli.disk.mkdir"));
+    assert!(!names.contains(&"yacli.mail.send"));
+    assert!(!names.contains(&"yacli.disk.publish"));
+    let denied = call(
+        3,
+        "tools/call",
+        json!({"name":"yacli.disk.list","arguments":{"path":"disk:/safe/../private"}}),
+    );
+    assert!(denied["result"]["isError"].as_bool().unwrap_or(false) || denied["error"].is_object());
+    for path in [
+        "disk:/safely",
+        "disk:/safe/%2e%2e/private",
+        "disk:/safe\\private",
+    ] {
+        let denied = call(
+            30,
+            "tools/call",
+            json!({"name":"yacli.disk.list","arguments":{"path":path}}),
+        );
+        assert!(
+            denied["result"]["isError"].as_bool().unwrap_or(false) || denied["error"].is_object(),
+            "{path}"
+        );
+    }
+    let read_only = call(
+        4,
+        "tools/call",
+        json!({"name":"yacli.mail.send","arguments":{}}),
+    );
+    assert!(
+        read_only["result"]["isError"].as_bool().unwrap_or(false) || read_only["error"].is_object()
+    );
+    let preview = call(
+        5,
+        "tools/call",
+        json!({"name":"yacli.disk.mkdir","arguments":{"path":"disk:/safe/new","dry_run":true}}),
+    );
+    let digest = preview["result"]["structuredContent"]["review_sha256"]
+        .as_str()
+        .expect("review digest");
+    assert_eq!(digest.len(), 64);
+    let wrong = call(
+        6,
+        "tools/call",
+        json!({"name":"yacli.disk.mkdir","arguments":{"path":"disk:/safe/new","review_sha256":"wrong"}}),
+    );
+    assert!(wrong["result"]["isError"].as_bool().unwrap_or(false) || wrong["error"].is_object());
+}
+
+#[cfg(unix)]
+#[test]
+fn devcat_disk_list_and_read_use_vault_token_without_write_capability() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let helper = temp.path().join("bruce-secret");
+    std::fs::write(&helper, "#!/bin/sh\ncase \"$2\" in DEVCAT_TEST_MCP) printf 'mcp-token\\n';; DEVCAT_TEST_DISK) printf 'disk-token\\n';; *) exit 10;; esac\n").unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = format!(
+        "{}:{}",
+        temp.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut provider = Server::new();
+    write_accounts_file(
+        temp.path(),
+        &format!(
+            r#"
+version = 1
+[accounts.mock]
+email = "me@yandex.ru"
+default = true
+[accounts.mock.mail]
+enabled = true
+auth_mode = "oauth_xoauth2"
+imap_host = "imap.yandex.com"
+imap_port = 993
+smtp_host = "smtp.yandex.com"
+smtp_port = 465
+[accounts.mock.calendar]
+enabled = false
+auth_mode = "app_password"
+caldav_base_url = "https://caldav.yandex.ru"
+[accounts.mock.disk]
+enabled = true
+auth_mode = "oauth"
+rest_base_url = "{}"
+credential_ref = "vault:DEVCAT_TEST_DISK"
+"#,
+            provider.url()
+        ),
+    );
+    let _list = provider.mock("GET", "/v1/disk/resources")
+        .match_header("authorization", "OAuth disk-token")
+        .match_query(Matcher::AllOf(vec![Matcher::UrlEncoded("path".into(), "disk:/safe".into()), Matcher::UrlEncoded("limit".into(), "100".into()), Matcher::UrlEncoded("offset".into(), "0".into())]))
+        .with_status(200).with_header("content-type", "application/json")
+        .with_body(r#"{"name":"safe","path":"disk:/safe","type":"dir","_embedded":{"limit":100,"offset":0,"total":1,"items":[{"name":"note.txt","path":"disk:/safe/note.txt","type":"file","size":4}]}}"#).create();
+    let metadata = r#"{"name":"note.txt","path":"disk:/safe/note.txt","type":"file","size":4}"#;
+    let _read_meta = provider
+        .mock("GET", "/v1/disk/resources")
+        .match_query(Matcher::AllOf(vec![
+            Matcher::UrlEncoded("path".into(), "disk:/safe/note.txt".into()),
+            Matcher::UrlEncoded("limit".into(), "1".into()),
+            Matcher::UrlEncoded("offset".into(), "0".into()),
+        ]))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(metadata)
+        .create();
+    let _download_meta = provider
+        .mock("GET", "/v1/disk/resources")
+        .match_query(Matcher::AllOf(vec![
+            Matcher::UrlEncoded("path".into(), "disk:/safe/note.txt".into()),
+            Matcher::UrlEncoded("limit".into(), "100".into()),
+            Matcher::UrlEncoded("offset".into(), "0".into()),
+        ]))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(metadata)
+        .create();
+    let _ticket = provider
+        .mock("GET", "/v1/disk/resources/download")
+        .match_query(Matcher::UrlEncoded(
+            "path".into(),
+            "disk:/safe/note.txt".into(),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(format!(
+            r#"{{"href":"{}/download/note.txt","method":"GET"}}"#,
+            provider.url()
+        ))
+        .create();
+    let _body = provider
+        .mock("GET", "/download/note.txt")
+        .with_status(200)
+        .with_body("test")
+        .create();
+    let server = TestHttpServer::spawn_with_envs(&[
+        ("PATH", &path),
+        ("YACLI_CONFIG_DIR", temp.path().to_str().unwrap()),
+        ("YACLI_DEVCAT_MODE", "1"),
+        ("YACLI_DEVCAT_ACCOUNT", "mock"),
+        ("YACLI_DEVCAT_CAPABILITIES", "mail.read,disk.read"),
+        ("YACLI_DEVCAT_DISK_ROOTS", "disk:/safe"),
+        ("YACLI_DEVCAT_OAUTH_CLIENT_ID", "owned-test-client"),
+        ("YACLI_DEVCAT_MCP_TOKEN_VAULT_KEY", "DEVCAT_TEST_MCP"),
+    ]);
+    let client = client();
+    let init = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}});
+    let response = client
+        .post(server.url())
+        .bearer_auth("mcp-token")
+        .json(&init)
+        .send()
+        .unwrap();
+    let session = response
+        .headers()
+        .get("Mcp-Session-Id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let call = |id, name: &str, path: &str| -> Value {
+        client.post(server.url()).bearer_auth("mcp-token").header("Mcp-Session-Id", &session)
+            .json(&json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":name,"arguments":{"path":path}}}))
+            .send().unwrap().json().unwrap()
+    };
+    let listed = call(2, "yacli.disk.list", "disk:/safe");
+    assert_eq!(
+        listed["result"]["structuredContent"]["resource"]["path"],
+        "disk:/safe"
+    );
+    let read = call(3, "yacli.disk.read", "disk:/safe/note.txt");
+    assert_eq!(read["result"]["structuredContent"]["data"], "dGVzdA==");
+    let denied = call(4, "yacli.disk.mkdir", "disk:/safe/new");
+    assert!(denied["error"].is_object() || denied["result"]["isError"].as_bool().unwrap_or(false));
+}
+
 #[test]
 fn mcp_http_initialize_returns_session_header_and_supports_follow_up_requests() {
     let server = TestHttpServer::spawn();
