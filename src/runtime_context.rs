@@ -342,9 +342,7 @@ pub(crate) fn vault_secret(key: &str) -> Result<String> {
         .output()
         .map_err(|_| YacliError::Auth("vault helper unavailable".into()))?;
     if !output.status.success() {
-        return Err(YacliError::Auth(format!(
-            "vault key unavailable: {key}"
-        )));
+        return Err(YacliError::Auth(format!("vault key unavailable: {key}")));
     }
     let value = String::from_utf8(output.stdout)
         .map_err(|_| YacliError::Auth("invalid vault response".into()))?;
