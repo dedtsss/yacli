@@ -335,14 +335,15 @@ pub(crate) fn vault_secret(key: &str) -> Result<String> {
     {
         return Err(YacliError::Config("invalid vault key name".into()));
     }
-    let output = std::process::Command::new("bruce-secret")
+    let helper = vault_helper_path()?;
+    let output = std::process::Command::new(helper)
         .arg("get")
         .arg(key)
         .output()
-        .map_err(|_| YacliError::Auth("Bruce vault helper unavailable".into()))?;
+        .map_err(|_| YacliError::Auth("vault helper unavailable".into()))?;
     if !output.status.success() {
         return Err(YacliError::Auth(format!(
-            "Bruce vault key unavailable: {key}"
+            "vault key unavailable: {key}"
         )));
     }
     let value = String::from_utf8(output.stdout)
@@ -365,11 +366,12 @@ pub(crate) fn vault_store_token(key: &str, value: &str) -> Result<()> {
     {
         return Err(YacliError::Config("invalid vault key name".into()));
     }
-    let status = std::process::Command::new("bruce-secret")
+    let helper = vault_helper_path()?;
+    let status = std::process::Command::new(&helper)
         .arg("exists")
         .arg(key)
         .output()
-        .map_err(|_| YacliError::Auth("Bruce vault helper unavailable".into()))?
+        .map_err(|_| YacliError::Auth("vault helper unavailable".into()))?
         .status;
     let action = match status.code() {
         Some(0) => "replace",
@@ -380,14 +382,14 @@ pub(crate) fn vault_store_token(key: &str, value: &str) -> Result<()> {
             )));
         }
     };
-    let mut child = std::process::Command::new("bruce-secret")
+    let mut child = std::process::Command::new(helper)
         .arg(action)
         .arg(key)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .map_err(|_| YacliError::Auth("Bruce vault write helper unavailable".into()))?;
+        .map_err(|_| YacliError::Auth("vault write helper unavailable".into()))?;
     use std::io::Write;
     child
         .stdin
@@ -400,4 +402,15 @@ pub(crate) fn vault_store_token(key: &str, value: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn vault_helper_path() -> Result<std::path::PathBuf> {
+    let configured = std::env::var_os("YACLI_DEVCAT_VAULT_HELPER")
+        .unwrap_or_else(|| std::ffi::OsString::from("bruce-secret"));
+    if configured.is_empty() {
+        return Err(YacliError::Config(
+            "YACLI_DEVCAT_VAULT_HELPER must name a vault helper".into(),
+        ));
+    }
+    Ok(configured.into())
 }

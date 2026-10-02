@@ -58,6 +58,11 @@ impl OauthService {
         if crate::mcp::devcat::enabled() {
             return match self {
                 Self::Mail
+                    if std::env::var("YACLI_DEVCAT_OAUTH_MAIL_FULL").as_deref() == Ok("1") =>
+                {
+                    MAIL_SCOPES
+                }
+                Self::Mail
                     if crate::mcp::devcat::has_capability("mail.mutate")
                         || crate::mcp::devcat::has_capability("mail.delete") =>
                 {

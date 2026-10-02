@@ -1,5 +1,5 @@
 [Unit]
-Description=DevCat Yandex Mail and Disk MCP
+Description=DevCat Yandex Mail and Disk MCP (CatVPS)
 After=network-online.target
 Wants=network-online.target
 
@@ -10,10 +10,12 @@ Group=codex
 WorkingDirectory=/opt/yacli-devcat/current
 Environment=YACLI_DEVCAT_MODE=1
 Environment=YACLI_DEVCAT_ACCOUNT=devcat
-Environment=YACLI_DEVCAT_CAPABILITIES=mail.read,disk.read
+Environment=YACLI_DEVCAT_CAPABILITIES=mail.read,mail.send,disk.read,disk.write
 Environment=YACLI_DEVCAT_DISK_ROOTS=disk:/DevCat
 Environment=YACLI_DEVCAT_MCP_TOKEN_VAULT_KEY=DEVCAT_YANDEX_MCP_BEARER
-Environment=YACLI_DEVCAT_OAUTH_CLIENT_ID=REPLACE_WITH_OWNED_CLIENT_ID
+Environment=YACLI_DEVCAT_OAUTH_CLIENT_ID=7caac656017c4cac84c193cef1e02a34
+Environment=YACLI_DEVCAT_OAUTH_MAIL_FULL=1
+Environment=YACLI_DEVCAT_VAULT_HELPER=/usr/local/libexec/catvps-vault
 Environment=YACLI_CONFIG_DIR=/var/lib/yacli-devcat/config
 ExecStart=/opt/yacli-devcat/current/yacli mcp --transport http --listen 127.0.0.1:8787
 Restart=on-failure

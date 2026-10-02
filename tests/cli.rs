@@ -65,6 +65,25 @@ credential_ref = "vault:DEVCAT_TEST_DISK"
         assert!(url.contains(expected));
         assert!(!url.contains(forbidden));
     }
+    let full_mail = yacli()
+        .env("YACLI_CONFIG_DIR", temp.path())
+        .env("YACLI_DEVCAT_MODE", "1")
+        .env("YACLI_DEVCAT_ACCOUNT", "mock")
+        .env("YACLI_DEVCAT_DISK_ROOTS", "disk:/safe")
+        .env("YACLI_DEVCAT_OAUTH_CLIENT_ID", "owned-test-client")
+        .env("YACLI_DEVCAT_OAUTH_MAIL_FULL", "1")
+        .args(["auth", "login", "--account", "mock", "--service", "mail"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let full_mail: Value = serde_json::from_slice(&full_mail).expect("full Mail OAuth json");
+    let full_mail_url = full_mail["authorization"]["authorization_url"]
+        .as_str()
+        .expect("authorization URL");
+    assert!(full_mail_url.contains("mail%3Aimap_full"));
+    assert!(full_mail_url.contains("mail%3Asmtp"));
     assert!(!temp.path().join("credentials.toml").exists());
 }
 
@@ -73,7 +92,7 @@ credential_ref = "vault:DEVCAT_TEST_DISK"
 fn devcat_oauth_exchange_writes_only_to_vault_helper() {
     use std::os::unix::fs::PermissionsExt;
     let temp = tempdir().unwrap();
-    let helper = temp.path().join("bruce-secret");
+    let helper = temp.path().join("exact-vault-helper");
     fs::write(&helper, "#!/bin/sh\ncase \"$1\" in exists) exit 10;; put) cat > \"$DEVCAT_FAKE_VAULT_DIR/$2\";; *) exit 1;; esac\n").unwrap();
     fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
     let path = format!(
@@ -115,12 +134,14 @@ credential_ref = "vault:DEVCAT_TEST_DISK"
     let output = yacli()
         .env("PATH", path)
         .env("DEVCAT_FAKE_VAULT_DIR", temp.path())
+        .env("YACLI_DEVCAT_VAULT_HELPER", &helper)
         .env("YACLI_CONFIG_DIR", temp.path())
         .env("YACLI_OAUTH_BASE_URL", oauth.url())
         .env("YACLI_DEVCAT_MODE", "1")
         .env("YACLI_DEVCAT_ACCOUNT", "mock")
         .env("YACLI_DEVCAT_DISK_ROOTS", "disk:/safe")
         .env("YACLI_DEVCAT_OAUTH_CLIENT_ID", "owned-test-client")
+        .env("YACLI_DEVCAT_OAUTH_MAIL_FULL", "1")
         .args([
             "auth",
             "login",
