@@ -10,6 +10,8 @@ Group=codex
 WorkingDirectory=/opt/yacli-devcat/current
 Environment=YACLI_DEVCAT_MODE=1
 Environment=YACLI_DEVCAT_ACCOUNT=devcat
+# Optional comma-separated additional accounts. The default account above remains the fallback.
+# Environment=YACLI_DEVCAT_ALLOWED_ACCOUNTS=devcat,second-account
 Environment=YACLI_DEVCAT_CAPABILITIES=mail.read,mail.send,disk.read,disk.write
 Environment=YACLI_DEVCAT_DISK_ROOTS=disk:/DevCat
 Environment=YACLI_DEVCAT_MCP_TOKEN_VAULT_KEY=DEVCAT_YANDEX_MCP_BEARER

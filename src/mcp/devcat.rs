@@ -25,10 +25,13 @@ pub fn validate() -> Result<()> {
         ));
     }
     let account = std::env::var("YACLI_DEVCAT_ACCOUNT")
-        .map_err(|_| YacliError::Config("DevCat MCP requires one account name".into()))?;
+        .map_err(|_| YacliError::Config("DevCat MCP requires a default account name".into()))?;
     if account.trim().is_empty() {
-        return Err(YacliError::Config("DevCat account name is empty".into()));
+        return Err(YacliError::Config(
+            "DevCat default account name is empty".into(),
+        ));
     }
+    let _ = allowed_accounts(&account)?;
     let roots = std::env::var("YACLI_DEVCAT_DISK_ROOTS")
         .map_err(|_| YacliError::Config("DevCat MCP requires disk roots".into()))?;
     let parsed: Vec<_> = roots
@@ -60,6 +63,34 @@ pub fn validate() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn allowed_accounts(default_account: &str) -> Result<BTreeSet<String>> {
+    let configured = std::env::var("YACLI_DEVCAT_ALLOWED_ACCOUNTS").ok();
+    merge_allowed_accounts(default_account, configured.as_deref())
+}
+
+fn merge_allowed_accounts(
+    default_account: &str,
+    configured: Option<&str>,
+) -> Result<BTreeSet<String>> {
+    let default_account = default_account.trim();
+    if default_account.is_empty() {
+        return Err(YacliError::Config(
+            "DevCat default account name is empty".into(),
+        ));
+    }
+    let mut accounts = BTreeSet::from([default_account.to_string()]);
+    if let Some(configured) = configured {
+        for account in configured
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            accounts.insert(account.to_string());
+        }
+    }
+    Ok(accounts)
 }
 
 fn capabilities() -> BTreeSet<String> {
@@ -108,11 +139,12 @@ pub fn check_tool(name: &str, arguments: &serde_json::Value) -> Result<()> {
             "MCP capability denied for {name}"
         )));
     }
-    if let Ok(account) = std::env::var("YACLI_DEVCAT_ACCOUNT") {
+    if let Ok(default_account) = std::env::var("YACLI_DEVCAT_ACCOUNT") {
+        let allowed = allowed_accounts(&default_account)?;
         if arguments
             .get("account")
             .and_then(serde_json::Value::as_str)
-            .is_some_and(|requested| requested != account)
+            .is_some_and(|requested| !allowed.contains(requested))
         {
             return Err(YacliError::Auth("MCP account denied".into()));
         }
@@ -344,6 +376,25 @@ fn clean_path(path: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_allowlist_keeps_default_and_exact_additional_accounts() {
+        let accounts = merge_allowed_accounts(
+            "dedts",
+            Some("dedts, ykkareliadom, dvabobra2014, ykkareliadom"),
+        )
+        .unwrap();
+        assert_eq!(
+            accounts,
+            BTreeSet::from([
+                "dedts".to_string(),
+                "dvabobra2014".to_string(),
+                "ykkareliadom".to_string(),
+            ])
+        );
+        assert!(!accounts.contains("other"));
+        assert!(merge_allowed_accounts("   ", Some("dedts")).is_err());
+    }
 
     #[test]
     fn rejects_traversal_forms() {
