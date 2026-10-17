@@ -283,6 +283,27 @@ fn basic_auth_header(account: &str, app_password: &str) -> String {
 
 #[cfg(unix)]
 #[test]
+fn devcat_secure_tunnel_trust_allows_loopback_without_inner_bearer() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let config = temp.path().join("config");
+    write_mock_disk_account(&config, "https://cloud-api.yandex.net");
+    let server = TestHttpServer::spawn_with_envs(&[
+        ("YACLI_CONFIG_DIR", config.to_str().unwrap()),
+        ("YACLI_DEVCAT_MODE", "1"),
+        ("YACLI_DEVCAT_ACCOUNT", "mock"),
+        ("YACLI_DEVCAT_CAPABILITIES", "mail.read,disk.read"),
+        ("YACLI_DEVCAT_DISK_ROOTS", "disk:/safe"),
+        ("YACLI_DEVCAT_OAUTH_CLIENT_ID", "owned-test-client"),
+        ("YACLI_DEVCAT_TRUST_SECURE_TUNNEL", "1"),
+    ]);
+    let client = client();
+    let init = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}});
+    let response = post_json(&client, &server.url(), init, None, None);
+    assert_eq!(response.status(), 200);
+}
+
+#[cfg(unix)]
+#[test]
 fn devcat_profile_authenticates_and_enforces_capabilities_paths_and_review() {
     use std::os::unix::fs::PermissionsExt;
     let temp = tempfile::tempdir().expect("tempdir");

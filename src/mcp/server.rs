@@ -94,6 +94,7 @@ const HTTP_MCP_PATH: &str = "/mcp";
 const MCP_SESSION_HEADER: &str = "Mcp-Session-Id";
 const HTTP_AUTH_TOKEN_ENV: &str = "YACLI_MCP_HTTP_BEARER_TOKEN";
 const HTTP_AUTH_ISSUER_ENV: &str = "YACLI_MCP_HTTP_AUTH_ISSUER";
+const DEVCAT_TRUST_SECURE_TUNNEL_ENV: &str = "YACLI_DEVCAT_TRUST_SECURE_TUNNEL";
 const MODEL_AND_APP_VISIBILITY: &[&str] = &["model", "app"];
 const APP_ONLY_VISIBILITY: &[&str] = &["app"];
 const RESOURCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -392,9 +393,11 @@ pub fn serve_http(listen: &str, public_url: Option<&str>) -> Result<()> {
 
     runtime.block_on(async move {
         let auth = HttpAuthConfig::from_env();
-        if devcat::enabled() && auth.bearer_token.is_none() {
+        let trust_secure_tunnel = devcat::enabled()
+            && std::env::var(DEVCAT_TRUST_SECURE_TUNNEL_ENV).as_deref() == Ok("1");
+        if devcat::enabled() && auth.bearer_token.is_none() && !trust_secure_tunnel {
             return Err(YacliError::Config(
-                "DevCat MCP requires a bearer token from Bruce vault".into(),
+                "DevCat MCP requires a bearer token from Bruce vault unless Secure MCP Tunnel trust is explicitly enabled".into(),
             ));
         }
         let auth_discovery = HttpAuthDiscovery::from_config(listen, public_url, &auth)?;
