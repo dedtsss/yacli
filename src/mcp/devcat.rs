@@ -70,6 +70,44 @@ fn allowed_accounts(default_account: &str) -> Result<BTreeSet<String>> {
     merge_allowed_accounts(default_account, configured.as_deref())
 }
 
+/// Public metadata only: discovery must not fetch secrets from the vault.
+pub fn account_schema() -> Result<serde_json::Value> {
+    let default = std::env::var("YACLI_DEVCAT_ACCOUNT")
+        .map_err(|_| YacliError::Config("DevCat default account unavailable".into()))?;
+    let allowed = allowed_accounts(&default)?;
+    let store = crate::account_store::AccountStore::load()?;
+    for name in &allowed {
+        store.get_account(name)?;
+    }
+    let services: Vec<_> = allowed
+        .iter()
+        .map(|name| {
+            let account = store.file.accounts.get(name);
+            let state = |enabled: bool, configured: bool| {
+                if !configured {
+                    "NOT_CONFIGURED"
+                } else if enabled {
+                    "configured"
+                } else {
+                    "disabled"
+                }
+            };
+            match account {
+                Some(a) => format!(
+                    "{name}: mail={}, disk={}",
+                    state(a.mail.enabled, a.mail.credential_ref.is_some()),
+                    state(a.disk.enabled, a.disk.credential_ref.is_some())
+                ),
+                None => format!("{name}: account metadata unavailable"),
+            }
+        })
+        .collect();
+    Ok(serde_json::json!({
+        "type": "string", "enum": allowed, "default": default,
+        "description": format!("Exact account identifier; omitted account defaults to {default}. {}. Configured describes metadata, not current provider authorization.", services.join("; "))
+    }))
+}
+
 fn merge_allowed_accounts(
     default_account: &str,
     configured: Option<&str>,
@@ -141,6 +179,11 @@ pub fn check_tool(name: &str, arguments: &serde_json::Value) -> Result<()> {
     }
     if let Ok(default_account) = std::env::var("YACLI_DEVCAT_ACCOUNT") {
         let allowed = allowed_accounts(&default_account)?;
+        if arguments.get("account").is_some_and(|v| !v.is_string()) {
+            return Err(YacliError::Validation(
+                "account must be an exact string identifier".into(),
+            ));
+        }
         if arguments
             .get("account")
             .and_then(serde_json::Value::as_str)
@@ -438,5 +481,21 @@ mod tests {
         record_review(digest.clone());
         assert!(consume_review(&digest));
         assert!(!consume_review(&digest));
+    }
+
+    #[test]
+    fn expired_reviews_and_changed_upload_bytes_are_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.txt");
+        std::fs::write(&source, "before").unwrap();
+        let args = serde_json::json!({"account":"a", "source":source, "path":"disk:/safe/test"});
+        let before = review_hash("yacli.disk.upload", &args).unwrap();
+        std::fs::write(&source, "after").unwrap();
+        assert_ne!(before, review_hash("yacli.disk.upload", &args).unwrap());
+        reviews()
+            .lock()
+            .unwrap()
+            .insert(before.clone(), Instant::now() - Duration::from_secs(1));
+        assert!(!consume_review(&before));
     }
 }

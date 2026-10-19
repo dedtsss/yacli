@@ -336,11 +336,7 @@ pub(crate) fn vault_secret(key: &str) -> Result<String> {
         return Err(YacliError::Config("invalid vault key name".into()));
     }
     let helper = vault_helper_path()?;
-    let output = std::process::Command::new(helper)
-        .arg("get")
-        .arg(key)
-        .output()
-        .map_err(|_| YacliError::Auth("vault helper unavailable".into()))?;
+    let output = read_vault_helper(&helper, key, std::time::Duration::from_secs(15))?;
     if !output.status.success() {
         return Err(YacliError::Auth(format!("vault key unavailable: {key}")));
     }
@@ -351,6 +347,70 @@ pub(crate) fn vault_secret(key: &str) -> Result<String> {
         return Err(YacliError::Auth(format!("Bruce vault key empty: {key}")));
     }
     Ok(value)
+}
+
+// A helper may itself wait on a remote vault. Bound both process execution and
+// pipe EOF, and terminate its process group on Unix (including SSH descendants).
+fn read_vault_helper(
+    helper: &std::path::Path,
+    key: &str,
+    timeout: std::time::Duration,
+) -> Result<std::process::Output> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    let mut command = Command::new(helper);
+    command
+        .args(["get", key])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|_| YacliError::Auth("vault helper unavailable".into()))?;
+    let stdout = child.stdout.take().expect("piped vault stdout");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = stdout.take(65537).read_to_end(&mut bytes).map(|_| bytes);
+        let _ = tx.send(result);
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    let result = (|| {
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(YacliError::Network("vault helper timed out".into()));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let stdout = rx
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .map_err(|_| YacliError::Network("vault helper output timed out".into()))??;
+        if stdout.len() > 65536 {
+            return Err(YacliError::Auth("vault response too large".into()));
+        }
+        Ok(std::process::Output {
+            status,
+            stdout,
+            stderr: Vec::new(),
+        })
+    })();
+    if result.is_err() {
+        #[cfg(unix)]
+        // SAFETY: the child was placed in its own process group at spawn.
+        unsafe {
+            libc::kill(-(child.id() as i32), libc::SIGKILL);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    result
 }
 
 pub(crate) fn vault_store_token(key: &str, value: &str) -> Result<()> {
@@ -411,4 +471,43 @@ fn vault_helper_path() -> Result<std::path::PathBuf> {
         ));
     }
     Ok(configured.into())
+}
+
+#[cfg(all(test, unix))]
+mod vault_deadline_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn vault_deadline_bounds_helper_and_descendant_holding_stdout() {
+        let temp = tempfile::tempdir().unwrap();
+        let helper = temp.path().join("helper");
+        for body in ["sleep 30", "sleep 30 &\nexit 0"] {
+            std::fs::write(&helper, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let start = Instant::now();
+            let error =
+                read_vault_helper(&helper, "TEST_KEY", Duration::from_millis(100)).unwrap_err();
+            assert_eq!(error.code(), "NETWORK_ERROR");
+            assert!(error.to_string().contains("timed out"));
+            assert!(start.elapsed() < Duration::from_secs(1));
+        }
+    }
+
+    #[test]
+    fn vault_nonzero_and_oversize_responses_fail_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let helper = temp.path().join("helper");
+        std::fs::write(
+            &helper,
+            "#!/bin/sh\nprintf 'not-an-authorized-token'\nexit 10\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let output = read_vault_helper(&helper, "TEST_KEY", Duration::from_secs(1)).unwrap();
+        assert!(!output.status.success());
+        std::fs::write(&helper, "#!/bin/sh\nhead -c 65537 /dev/zero\n").unwrap();
+        assert!(read_vault_helper(&helper, "TEST_KEY", Duration::from_secs(1)).is_err());
+    }
 }

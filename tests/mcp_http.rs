@@ -283,6 +283,162 @@ fn basic_auth_header(account: &str, app_password: &str) -> String {
 
 #[cfg(unix)]
 #[test]
+fn devcat_slow_or_abandoned_tool_does_not_block_sessions_and_reviews_bind_accounts() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Instant;
+    let temp = tempfile::tempdir().unwrap();
+    write_mock_disk_account(temp.path(), "https://cloud-api.yandex.net");
+    let config = temp.path().join("accounts.toml");
+    let original = std::fs::read_to_string(&config).unwrap().replace(
+        "smtp_port = 465",
+        "smtp_port = 465\ncredential_ref = \"vault:TEST_MAIL\"",
+    );
+    let second = original
+        .replace("version = 1", "")
+        .replace("accounts.mock", "accounts.second")
+        .replace("default = true", "default = false")
+        .replace("credential_ref = \"store:disk\"", "");
+    std::fs::write(&config, format!("{original}\n{second}")).unwrap();
+    let helper = temp.path().join("vault-helper");
+    let marker = temp.path().join("entered");
+    std::fs::write(
+        &helper,
+        format!(
+            "#!/bin/sh\ntouch '{}'\nsleep 1\nprintf 'test-token\\n'\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let server = TestHttpServer::spawn_with_envs(&[
+        ("YACLI_CONFIG_DIR", temp.path().to_str().unwrap()),
+        ("YACLI_DEVCAT_MODE", "1"),
+        ("YACLI_DEVCAT_ACCOUNT", "mock"),
+        ("YACLI_DEVCAT_ALLOWED_ACCOUNTS", "mock,second"),
+        (
+            "YACLI_DEVCAT_CAPABILITIES",
+            "mail.read,mail.send,disk.read,disk.write",
+        ),
+        ("YACLI_DEVCAT_DISK_ROOTS", "disk:/safe"),
+        ("YACLI_DEVCAT_OAUTH_CLIENT_ID", "owned-test-client"),
+        ("YACLI_DEVCAT_TRUST_SECURE_TUNNEL", "1"),
+        ("YACLI_DEVCAT_VAULT_HELPER", helper.to_str().unwrap()),
+    ]);
+    let client = client();
+    let init = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}});
+    let first = post_json(&client, &server.url(), init.clone(), None, None);
+    let session = first.headers()["mcp-session-id"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let second = post_json(&client, &server.url(), init, None, None);
+    let other_session = second.headers()["mcp-session-id"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let call = |session: &str, method: &str, params: Value| -> Value {
+        post_json(
+            &client,
+            &server.url(),
+            json!({"jsonrpc":"2.0","id":2,"method":method,"params":params}),
+            Some(session),
+            None,
+        )
+        .json()
+        .unwrap()
+    };
+    let url = server.url();
+    let session_for_thread = session.clone();
+    let abandoned = thread::spawn(move || {
+        let response = Client::builder().timeout(Duration::from_millis(150)).build().unwrap()
+            .post(url).header("Mcp-Session-Id", session_for_thread)
+            .json(&json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"yacli.mail.send","arguments":{"to":"me@yandex.ru","subject":"test","text":"test","dry_run":true}}}))
+            .send();
+        assert!(response.is_err(), "client must abandon the slow preview");
+    });
+    for _ in 0..100 {
+        if marker.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(marker.exists());
+    abandoned.join().unwrap();
+    let started = Instant::now();
+    assert!(call(&session, "ping", json!({}))["result"].is_object());
+    let catalog = call(&other_session, "tools/list", json!({}));
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "slow/abandoned tool held the session registry"
+    );
+    let tools = catalog["result"]["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 11);
+    for tool in tools {
+        let schema = &tool["inputSchema"]["properties"]["account"];
+        assert_eq!(schema["enum"], json!(["mock", "second"]));
+        assert_eq!(schema["default"], "mock");
+        assert!(
+            schema["description"]
+                .as_str()
+                .unwrap()
+                .contains("second: mail=configured, disk=NOT_CONFIGURED")
+        );
+        let name = tool["name"].as_str().unwrap();
+        assert_eq!(
+            tool["annotations"]["destructiveHint"],
+            name == "yacli.disk.upload"
+        );
+        assert_eq!(
+            tool["annotations"]["openWorldHint"],
+            name.starts_with("yacli.mail.send")
+        );
+        assert_eq!(
+            tool["annotations"]["readOnlyHint"],
+            !matches!(
+                name,
+                "yacli.disk.upload"
+                    | "yacli.disk.mkdir"
+                    | "yacli.mail.send"
+                    | "yacli.mail.send_published_link"
+            )
+        );
+    }
+    for account in [Value::Null, json!(42), json!("unknown")] {
+        let denied = call(
+            &session,
+            "tools/call",
+            json!({"name":"yacli.disk.mkdir","arguments":{"account":account,"path":"disk:/safe/test","dry_run":true}}),
+        );
+        assert!(denied["error"].is_object());
+    }
+    let preview = call(
+        &session,
+        "tools/call",
+        json!({"name":"yacli.disk.mkdir","arguments":{"path":"disk:/safe/test","dry_run":true}}),
+    );
+    assert_eq!(preview["result"]["structuredContent"]["account"], "mock");
+    let digest = &preview["result"]["structuredContent"]["review_sha256"];
+    assert!(digest.is_string());
+    let crossed = call(
+        &session,
+        "tools/call",
+        json!({"name":"yacli.disk.mkdir","arguments":{"account":"second","path":"disk:/safe/test","review_sha256":digest}}),
+    );
+    assert!(crossed["error"].is_object());
+    let changed = call(
+        &session,
+        "tools/call",
+        json!({"name":"yacli.disk.mkdir","arguments":{"path":"disk:/safe/changed","review_sha256":digest}}),
+    );
+    assert!(changed["error"].is_object());
+    std::fs::write(&config, "invalid toml [").unwrap();
+    assert!(call(&session, "tools/list", json!({}))["error"].is_object());
+    std::fs::remove_file(&config).unwrap();
+    assert!(call(&session, "tools/list", json!({}))["error"].is_object());
+}
+
+#[cfg(unix)]
+#[test]
 fn devcat_secure_tunnel_trust_allows_loopback_without_inner_bearer() {
     let temp = tempfile::tempdir().expect("tempdir");
     let config = temp.path().join("config");

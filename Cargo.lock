@@ -2771,6 +2771,7 @@ dependencies = [
  "dirs",
  "flate2",
  "keyring",
+ "libc",
  "mailparse",
  "mime_guess",
  "mockito",

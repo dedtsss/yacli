@@ -613,27 +613,46 @@ async fn handle_http_post(
     }
 
     let mut responses = Vec::new();
-    {
-        let mut sessions = state.sessions.lock().await;
-        let session = sessions
-            .entry(session_id.clone())
-            .or_insert_with(HttpSession::new);
-        for message in messages {
-            match tokio::task::block_in_place(|| {
+    for message in messages {
+        // DevCat tools have no session-local state. Never hold the registry lock
+        // across vault/provider I/O, including after the HTTP client disconnects.
+        let result = if devcat::enabled()
+            && message.get("method").and_then(Value::as_str) == Some("tools/call")
+        {
+            let initialized = {
+                let sessions = state.sessions.lock().await;
+                sessions
+                    .get(&session_id)
+                    .is_some_and(|s| s.state.initialized)
+            };
+            tokio::task::spawn_blocking(move || {
+                let mut snapshot = SessionState::http();
+                snapshot.initialized = initialized;
+                execute_message(message, &mut snapshot, None)
+            })
+            .await
+            .unwrap_or_else(|_| Err(YacliError::Io("MCP tool worker failed".into())))
+        } else {
+            let mut sessions = state.sessions.lock().await;
+            let session = sessions
+                .entry(session_id.clone())
+                .or_insert_with(HttpSession::new);
+            tokio::task::block_in_place(|| {
                 execute_message(message, &mut session.state, Some(&mut session.poller))
-            }) {
-                Ok(Some(response)) => responses.push(response),
-                Ok(None) => {}
-                Err(err) => responses.push(json!({
-                    "jsonrpc": "2.0",
-                    "id": Value::Null,
-                    "error": {
-                        "code": error_code(&err),
-                        "message": err.to_string(),
-                        "data": err.as_json(),
-                    }
-                })),
-            }
+            })
+        };
+        match result {
+            Ok(Some(response)) => responses.push(response),
+            Ok(None) => {}
+            Err(err) => responses.push(json!({
+                "jsonrpc": "2.0",
+                "id": Value::Null,
+                "error": {
+                    "code": error_code(&err),
+                    "message": err.to_string(),
+                    "data": err.as_json(),
+                }
+            })),
         }
     }
 
@@ -1110,7 +1129,7 @@ fn handle_request(
         "prompts/list" => Ok(json!({ "prompts": prompts::prompt_definitions() })),
         "prompts/get" => prompts::get_prompt(params),
         "tools/list" => Ok(json!({
-            "tools": tool_definitions(session.ui_enabled, session.supports_roots_requests)
+            "tools": tool_definitions(session.ui_enabled, session.supports_roots_requests)?
         })),
         "tools/call" => {
             if requested_tool_name(&params) == Some("yacli.roots.list") {
@@ -1134,7 +1153,12 @@ fn handle_request(
     }
 }
 
-fn tool_definitions(ui_enabled: bool, roots_enabled: bool) -> Vec<Value> {
+fn tool_definitions(ui_enabled: bool, roots_enabled: bool) -> Result<Vec<Value>> {
+    let account_schema = if devcat::enabled() {
+        Some(devcat::account_schema()?)
+    } else {
+        None
+    };
     let mut tools = Vec::new();
     if ui_enabled {
         tools.push(tool(
@@ -1727,14 +1751,24 @@ fn tool_definitions(ui_enabled: bool, roots_enabled: bool) -> Vec<Value> {
         ),
     ]);
 
-    tools
+    Ok(tools
         .into_iter()
         .filter(|tool| {
             tool.get("name")
                 .and_then(Value::as_str)
                 .is_some_and(devcat::tool_allowed)
         })
-        .collect()
+        .map(|mut tool| {
+            if let Some(schema) = &account_schema {
+                if let Some(properties) = tool["inputSchema"]["properties"].as_object_mut() {
+                    if properties.contains_key("account") {
+                        properties.insert("account".into(), schema.clone());
+                    }
+                }
+            }
+            tool
+        })
+        .collect())
 }
 
 fn tool(
@@ -1763,6 +1797,18 @@ fn tool(
         Value::String(description.to_string()),
     );
     object.insert("inputSchema".to_string(), input_schema);
+    if devcat::enabled() {
+        let read_only = !devcat::is_risky(name);
+        object.insert(
+            "annotations".into(),
+            json!({
+                "readOnlyHint": read_only,
+            "destructiveHint": name == "yacli.disk.upload" || name == "yacli.disk.upload_link",
+                "idempotentHint": read_only,
+            "openWorldHint": name.starts_with("yacli.mail.send")
+            }),
+        );
+    }
     if let Some(visibility) = visibility
         && ui_enabled
     {
