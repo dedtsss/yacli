@@ -1,0 +1,827 @@
+{
+  "date": "2026-10-19",
+  "run_id": "audit-20261019-44dca688f3",
+  "state": "COMPLETE",
+  "route": "isolated candidate loopback; production unchanged",
+  "candidate_sha256": "97d55484309a16aee140c5cca8f9f54778bddf66fa435aff102ee8ba8f135e76",
+  "default": "dedts",
+  "confirmed_self_addresses": true,
+  "published_file": false,
+  "disk_test_directory": "disk:/DevCat/audit-20261019-44dca688f3",
+  "upload_bytes": 64,
+  "upload_sha256": "567c5857734748376f22492c59322ca1376057f09c1b4683c7d60da1b9643304",
+  "cases": [
+    {
+      "account": "dedts",
+      "tool": "mail.folders",
+      "phase": "read",
+      "seconds": 10.422,
+      "status": "PASS",
+      "count": 64
+    },
+    {
+      "account": "dedts",
+      "tool": "mail.send",
+      "phase": "unreviewed deny",
+      "seconds": 0.002,
+      "status": "EXPECTED_DENY",
+      "code": "AUTH_ERROR",
+      "reason": "requires review_sha256"
+    },
+    {
+      "account": "dedts",
+      "tool": "mail.send",
+      "phase": "dry_run",
+      "seconds": 9.654,
+      "status": "PASS"
+    },
+    {
+      "account": "dedts",
+      "tool": "mail.send",
+      "phase": "execute once",
+      "seconds": 10.96,
+      "status": "PASS"
+    },
+    {
+      "account": "dedts",
+      "tool": "mail.list",
+      "phase": "read",
+      "seconds": 13.656,
+      "status": "PASS",
+      "count": 1
+    },
+    {
+      "account": "dedts",
+      "tool": "mail.search",
+      "phase": "read",
+      "seconds": 10.845,
+      "status": "PASS",
+      "count": 0
+    },
+    {
+      "account": "dedts",
+      "tool": "mail.search",
+      "phase": "one bounded visibility retry",
+      "seconds": 11.648,
+      "status": "PASS",
+      "count": 0
+    },
+    {
+      "account": "dedts",
+      "tool": "mail.read",
+      "phase": "read",
+      "seconds": 35.029,
+      "status": "BLOCKED",
+      "code": "TRANSPORT_TimeoutError",
+      "reason": "bounded client failure; no mutation retry"
+    },
+    {
+      "account": "dedts",
+      "tool": "mail.send_published_link",
+      "phase": "preview only; no public URL",
+      "seconds": 9.553,
+      "status": "PASS",
+      "positive_execution": "BLOCKED_FIXTURE: no known safe already-published test-object URL. Tool requires mail.send plus review digest, not disk.publish.",
+      "historical_blocker_wording": "BLOCKED: disk.publish capability absent; no audit public URL"
+    },
+    {
+      "account": "dedts",
+      "tool": "mail.send_published_link",
+      "phase": "unreviewed deny",
+      "seconds": 0.005,
+      "status": "EXPECTED_DENY",
+      "code": "AUTH_ERROR",
+      "reason": "requires review_sha256"
+    },
+    {
+      "account": "dedts",
+      "tool": "disk.publish",
+      "phase": "capability deny",
+      "seconds": 0.002,
+      "status": "EXPECTED_DENY",
+      "code": "AUTH_ERROR",
+      "reason": "MCP capability denied"
+    },
+    {
+      "account": "dedts",
+      "tool": "disk.info",
+      "phase": "read",
+      "seconds": 9.946,
+      "status": "PASS"
+    },
+    {
+      "account": "dedts",
+      "tool": "disk.mkdir",
+      "phase": "unreviewed deny",
+      "seconds": 0.006,
+      "status": "EXPECTED_DENY",
+      "code": "AUTH_ERROR",
+      "reason": "requires review_sha256"
+    },
+    {
+      "account": "dedts",
+      "tool": "disk.mkdir",
+      "phase": "dry_run",
+      "seconds": 0.004,
+      "status": "PASS"
+    },
+    {
+      "account": "dedts",
+      "tool": "disk.mkdir",
+      "phase": "execute once",
+      "seconds": 10.296,
+      "status": "PASS"
+    },
+    {
+      "account": "dedts",
+      "tool": "disk.list",
+      "phase": "read",
+      "seconds": 12.098,
+      "status": "PASS"
+    },
+    {
+      "account": "dedts",
+      "tool": "disk.upload",
+      "phase": "unreviewed deny",
+      "seconds": 0.017,
+      "status": "EXPECTED_DENY",
+      "code": "AUTH_ERROR",
+      "reason": "requires review_sha256"
+    },
+    {
+      "account": "dedts",
+      "tool": "disk.upload",
+      "phase": "dry_run",
+      "seconds": 10.285,
+      "status": "PASS"
+    },
+    {
+      "account": "dedts",
+      "tool": "disk.upload",
+      "phase": "execute once",
+      "seconds": 11.018,
+      "status": "PASS"
+    },
+    {
+      "account": "dedts",
+      "tool": "disk.read",
+      "phase": "read",
+      "seconds": 29.536,
+      "status": "BLOCKED",
+      "code": "NETWORK_ERROR",
+      "reason": "provider_or_validation_error"
+    },
+    {
+      "account": "ykkareliadom",
+      "tool": "mail.folders",
+      "phase": "read",
+      "seconds": 10.333,
+      "status": "PASS",
+      "count": 10
+    },
+    {
+      "account": "ykkareliadom",
+      "tool": "mail.send",
+      "phase": "unreviewed deny",
+      "seconds": 0.003,
+      "status": "EXPECTED_DENY",
+      "code": "AUTH_ERROR",
+      "reason": "requires review_sha256"
+    },
+    {
+      "account": "ykkareliadom",
+      "tool": "mail.send",
+      "phase": "dry_run",
+      "seconds": 9.675,
+      "status": "PASS"
+    },
+    {
+      "account": "ykkareliadom",
+      "tool": "mail.send",
+      "phase": "execute once",
+      "seconds": 11.204,
+      "status": "PASS"
+    },
+    {
+      "account": "ykkareliadom",
+      "tool": "mail.list",
+      "phase": "read",
+      "seconds": 35.035,
+      "status": "BLOCKED",
+      "code": "TRANSPORT_TimeoutError",
+      "reason": "bounded client failure; no mutation retry"
+    },
+    {
+      "account": "ykkareliadom",
+      "tool": "mail.search",
+      "phase": "read",
+      "seconds": 10.844,
+      "status": "PASS",
+      "count": 0
+    },
+    {
+      "account": "ykkareliadom",
+      "tool": "mail.search",
+      "phase": "one bounded visibility retry",
+      "seconds": 16.064,
+      "status": "PASS",
+      "count": 0
+    },
+    {
+      "account": "ykkareliadom",
+      "tool": "mail.read",
+      "phase": "dependency",
+      "status": "BLOCKED",
+      "reason": "no bounded UID available"
+    },
+    {
+      "account": "ykkareliadom",
+      "tool": "mail.send_published_link",
+      "phase": "preview only; no public URL",
+      "seconds": 9.732,
+      "status": "PASS",
+      "positive_execution": "BLOCKED_FIXTURE: no known safe already-published test-object URL. Tool requires mail.send plus review digest, not disk.publish.",
+      "historical_blocker_wording": "BLOCKED: disk.publish capability absent; no audit public URL"
+    },
+    {
+      "account": "ykkareliadom",
+      "tool": "mail.send_published_link",
+      "phase": "unreviewed deny",
+      "seconds": 0.002,
+      "status": "EXPECTED_DENY",
+      "code": "AUTH_ERROR",
+      "reason": "requires review_sha256"
+    },
+    {
+      "account": "ykkareliadom",
+      "tool": "disk.publish",
+      "phase": "capability deny",
+      "seconds": 0.002,
+      "status": "EXPECTED_DENY",
+      "code": "AUTH_ERROR",
+      "reason": "MCP capability denied"
+    },
+    {
+      "account": "ykkareliadom",
+      "tool": "disk.info",
+      "phase": "read",
+      "seconds": 0.003,
+      "status": "EXPECTED_DENY",
+      "code": "AUTH_ERROR",
+      "reason": "no credential configured for disk",
+      "configuration": "NOT_CONFIGURED"
+    },
+    {
+      "account": "ykkareliadom",
+      "tool": "disk.list",
+      "phase": "read",
+      "seconds": 0.005,
+      "status": "EXPECTED_DENY",
+      "code": "AUTH_ERROR",
+      "reason": "no credential configured for disk",
+      "configuration": "NOT_CONFIGURED"
+    },
+    {
+      "account": "ykkareliadom",
+      "tool": "disk.mkdir",
+      "phase": "unreviewed deny",
+      "seconds": 0.003,
+      "status": "EXPECTED_DENY",
+      "code": "AUTH_ERROR",
+      "reason": "requires review_sha256"
+    },
+    {
+      "account": "ykkareliadom",
+      "tool": "disk.mkdir",
+      "phase": "dry_run",
+      "seconds": 0.003,
+      "status": "PASS"
+    },
+    {
+      "account": "ykkareliadom",
+      "tool": "disk.mkdir",
+      "phase": "execute once",
+      "seconds": 0.012,
+      "status": "EXPECTED_DENY",
+      "code": "AUTH_ERROR",
+      "reason": "no credential configured for disk",
+      "configuration": "NOT_CONFIGURED"
+    },
+    {
+      "account": "ykkareliadom",
+      "tool": "disk.upload",
+      "phase": "unreviewed deny",
+      "seconds": 0.003,
+      "status": "EXPECTED_DENY",
+      "code": "AUTH_ERROR",
+      "reason": "requires review_sha256"
+    },
+    {
+      "account": "ykkareliadom",
+      "tool": "disk.upload",
+      "phase": "dry_run",
+      "seconds": 0.004,
+      "status": "BLOCKED",
+      "code": "AUTH_ERROR",
+      "reason": "no credential configured for disk"
+    },
+    {
+      "account": "ykkareliadom",
+      "tool": "disk.read",
+      "phase": "read",
+      "seconds": 0.004,
+      "status": "EXPECTED_DENY",
+      "code": "AUTH_ERROR",
+      "reason": "no credential configured for disk",
+      "configuration": "NOT_CONFIGURED"
+    },
+    {
+      "account": "dvabobra2014",
+      "tool": "mail.folders",
+      "phase": "read",
+      "seconds": 10.171,
+      "status": "PASS",
+      "count": 24
+    },
+    {
+      "account": "dvabobra2014",
+      "tool": "mail.send",
+      "phase": "unreviewed deny",
+      "seconds": 0.005,
+      "status": "EXPECTED_DENY",
+      "code": "AUTH_ERROR",
+      "reason": "requires review_sha256"
+    },
+    {
+      "account": "dvabobra2014",
+      "tool": "mail.send",
+      "phase": "dry_run",
+      "seconds": 9.877,
+      "status": "PASS"
+    },
+    {
+      "account": "dvabobra2014",
+      "tool": "mail.send",
+      "phase": "execute once",
+      "seconds": 11.002,
+      "status": "PASS"
+    },
+    {
+      "account": "dvabobra2014",
+      "tool": "mail.list",
+      "phase": "read",
+      "seconds": 11.148,
+      "status": "PASS",
+      "count": 1
+    },
+    {
+      "account": "dvabobra2014",
+      "tool": "mail.search",
+      "phase": "read",
+      "seconds": 11.015,
+      "status": "PASS",
+      "count": 0
+    },
+    {
+      "account": "dvabobra2014",
+      "tool": "mail.search",
+      "phase": "one bounded visibility retry",
+      "seconds": 10.792,
+      "status": "PASS",
+      "count": 0
+    },
+    {
+      "account": "dvabobra2014",
+      "tool": "mail.read",
+      "phase": "read",
+      "seconds": 11.992,
+      "status": "PASS"
+    },
+    {
+      "account": "dvabobra2014",
+      "tool": "mail.send_published_link",
+      "phase": "preview only; no public URL",
+      "seconds": 9.64,
+      "status": "PASS",
+      "positive_execution": "BLOCKED_FIXTURE: no known safe already-published test-object URL. Tool requires mail.send plus review digest, not disk.publish.",
+      "historical_blocker_wording": "BLOCKED: disk.publish capability absent; no audit public URL"
+    },
+    {
+      "account": "dvabobra2014",
+      "tool": "mail.send_published_link",
+      "phase": "unreviewed deny",
+      "seconds": 0.006,
+      "status": "EXPECTED_DENY",
+      "code": "AUTH_ERROR",
+      "reason": "requires review_sha256"
+    },
+    {
+      "account": "dvabobra2014",
+      "tool": "disk.publish",
+      "phase": "capability deny",
+      "seconds": 0.005,
+      "status": "EXPECTED_DENY",
+      "code": "AUTH_ERROR",
+      "reason": "MCP capability denied"
+    },
+    {
+      "account": "dvabobra2014",
+      "tool": "disk.info",
+      "phase": "read",
+      "seconds": 0.008,
+      "status": "EXPECTED_DENY",
+      "code": "AUTH_ERROR",
+      "reason": "no credential configured for disk",
+      "configuration": "NOT_CONFIGURED"
+    },
+    {
+      "account": "dvabobra2014",
+      "tool": "disk.list",
+      "phase": "read",
+      "seconds": 0.004,
+      "status": "EXPECTED_DENY",
+      "code": "AUTH_ERROR",
+      "reason": "no credential configured for disk",
+      "configuration": "NOT_CONFIGURED"
+    },
+    {
+      "account": "dvabobra2014",
+      "tool": "disk.mkdir",
+      "phase": "unreviewed deny",
+      "seconds": 0.004,
+      "status": "EXPECTED_DENY",
+      "code": "AUTH_ERROR",
+      "reason": "requires review_sha256"
+    },
+    {
+      "account": "dvabobra2014",
+      "tool": "disk.mkdir",
+      "phase": "dry_run",
+      "seconds": 0.006,
+      "status": "PASS"
+    },
+    {
+      "account": "dvabobra2014",
+      "tool": "disk.mkdir",
+      "phase": "execute once",
+      "seconds": 0.006,
+      "status": "EXPECTED_DENY",
+      "code": "AUTH_ERROR",
+      "reason": "no credential configured for disk",
+      "configuration": "NOT_CONFIGURED"
+    },
+    {
+      "account": "dvabobra2014",
+      "tool": "disk.upload",
+      "phase": "unreviewed deny",
+      "seconds": 0.011,
+      "status": "EXPECTED_DENY",
+      "code": "AUTH_ERROR",
+      "reason": "requires review_sha256"
+    },
+    {
+      "account": "dvabobra2014",
+      "tool": "disk.upload",
+      "phase": "dry_run",
+      "seconds": 0.007,
+      "status": "BLOCKED",
+      "code": "AUTH_ERROR",
+      "reason": "no credential configured for disk"
+    },
+    {
+      "account": "dvabobra2014",
+      "tool": "disk.read",
+      "phase": "read",
+      "seconds": 0.006,
+      "status": "EXPECTED_DENY",
+      "code": "AUTH_ERROR",
+      "reason": "no credential configured for disk",
+      "configuration": "NOT_CONFIGURED"
+    },
+    {
+      "account": "dedts",
+      "tool": "mail.search",
+      "phase": "one read-only release recheck",
+      "seconds": 16.358,
+      "status": "PASS",
+      "count": 0
+    },
+    {
+      "account": "dedts",
+      "tool": "mail.folders",
+      "phase": "one read-only release recheck",
+      "seconds": 10.128,
+      "status": "PASS",
+      "count": 64
+    },
+    {
+      "account": "dedts",
+      "tool": "mail.search",
+      "phase": "one read-only release recheck",
+      "seconds": 10.927,
+      "status": "PASS",
+      "count": 0
+    },
+    {
+      "account": "dedts",
+      "tool": "mail.list",
+      "phase": "one read-only release recheck",
+      "seconds": 15.069,
+      "status": "PASS",
+      "count": 3
+    },
+    {
+      "account": "dedts",
+      "tool": "mail.read",
+      "phase": "one read-only release recheck",
+      "seconds": 10.547,
+      "status": "PASS"
+    },
+    {
+      "account": "ykkareliadom",
+      "tool": "mail.search",
+      "phase": "one read-only release recheck",
+      "seconds": 10.849,
+      "status": "PASS",
+      "count": 0
+    },
+    {
+      "account": "ykkareliadom",
+      "tool": "mail.folders",
+      "phase": "one read-only release recheck",
+      "seconds": 10.845,
+      "status": "PASS",
+      "count": 10
+    },
+    {
+      "account": "ykkareliadom",
+      "tool": "mail.search",
+      "phase": "one read-only release recheck",
+      "seconds": 10.888,
+      "status": "PASS",
+      "count": 0
+    },
+    {
+      "account": "ykkareliadom",
+      "tool": "mail.list",
+      "phase": "one read-only release recheck",
+      "seconds": 35.035,
+      "status": "BLOCKED",
+      "code": "TRANSPORT_TimeoutError",
+      "reason": "bounded transport failure"
+    },
+    {
+      "account": "dvabobra2014",
+      "tool": "mail.search",
+      "phase": "one read-only release recheck",
+      "seconds": 10.76,
+      "status": "PASS",
+      "count": 0
+    },
+    {
+      "account": "dvabobra2014",
+      "tool": "mail.folders",
+      "phase": "one read-only release recheck",
+      "seconds": 10.272,
+      "status": "PASS",
+      "count": 24
+    },
+    {
+      "account": "dvabobra2014",
+      "tool": "mail.search",
+      "phase": "one read-only release recheck",
+      "seconds": 10.42,
+      "status": "PASS",
+      "count": 0
+    },
+    {
+      "account": "dvabobra2014",
+      "tool": "mail.list",
+      "phase": "one read-only release recheck",
+      "seconds": 13.021,
+      "status": "PASS",
+      "count": 3
+    },
+    {
+      "account": "dvabobra2014",
+      "tool": "mail.read",
+      "phase": "one read-only release recheck",
+      "seconds": 18.155,
+      "status": "PASS"
+    },
+    {
+      "account": "dedts",
+      "tool": "disk.read",
+      "phase": "one read-only release recheck",
+      "seconds": 29.713,
+      "status": "BLOCKED",
+      "code": "NETWORK_ERROR",
+      "reason": "Network error: error sending request for url (<url-redacted>"
+    },
+    {
+      "account": "dedts",
+      "tool": "mail.list",
+      "phase": "post-connect-repair list",
+      "seconds": 12.927,
+      "status": "PASS",
+      "count": 1
+    },
+    {
+      "account": "dedts",
+      "tool": "mail.search",
+      "phase": "post-connect-repair positive search",
+      "seconds": 11.089,
+      "status": "PASS",
+      "count": 0,
+      "known_message_matched": false
+    },
+    {
+      "account": "dedts",
+      "tool": "mail.read",
+      "phase": "post-connect-repair read",
+      "seconds": 12.143,
+      "status": "PASS"
+    },
+    {
+      "account": "ykkareliadom",
+      "tool": "mail.list",
+      "phase": "post-connect-repair list",
+      "seconds": 11.624,
+      "status": "PASS",
+      "count": 1
+    },
+    {
+      "account": "ykkareliadom",
+      "tool": "mail.search",
+      "phase": "post-connect-repair positive search",
+      "seconds": 10.788,
+      "status": "PASS",
+      "count": 0,
+      "known_message_matched": false
+    },
+    {
+      "account": "ykkareliadom",
+      "tool": "mail.read",
+      "phase": "post-connect-repair read",
+      "seconds": 10.705,
+      "status": "PASS"
+    },
+    {
+      "account": "dvabobra2014",
+      "tool": "mail.list",
+      "phase": "post-connect-repair list",
+      "seconds": 12.468,
+      "status": "BLOCKED",
+      "code": "NETWORK_ERROR",
+      "reason": "Network error: failed to connect to IMAP server imap.yandex.com:993: mail DNS resolution timed out"
+    }
+  ],
+  "checks": [
+    {
+      "check": "11-tool catalog, aliases/default/services/annotations",
+      "passed": true
+    },
+    {
+      "check": "omitted account resolves to dedts",
+      "passed": true,
+      "seconds": 10.6
+    },
+    {
+      "check": "dedts SMTP completion",
+      "passed": true,
+      "evidence": "successful RPC follows SMTP DATA 250; mail.send returns sent, not status; no send repeated"
+    },
+    {
+      "check": "dedts read own generated canary",
+      "passed": false
+    },
+    {
+      "check": "dedts upload/read exact bytes",
+      "passed": false
+    },
+    {
+      "check": "ykkareliadom SMTP completion",
+      "passed": true,
+      "evidence": "successful RPC follows SMTP DATA 250; mail.send returns sent, not status; no send repeated"
+    },
+    {
+      "check": "dvabobra2014 SMTP completion",
+      "passed": true,
+      "evidence": "successful RPC follows SMTP DATA 250; mail.send returns sent, not status; no send repeated"
+    },
+    {
+      "check": "dvabobra2014 read own generated canary",
+      "passed": false
+    },
+    {
+      "check": "dedts release read own generated canary",
+      "passed": true
+    },
+    {
+      "check": "dvabobra2014 release read own generated canary",
+      "passed": false
+    },
+    {
+      "check": "dedts release upload/read exact bytes",
+      "passed": false
+    },
+    {
+      "check": "dedts post-connect-repair list and read",
+      "passed": true
+    },
+    {
+      "check": "dedts positive search matches listed UID",
+      "passed": false
+    },
+    {
+      "check": "ykkareliadom post-connect-repair list and read",
+      "passed": true
+    },
+    {
+      "check": "ykkareliadom positive search matches listed UID",
+      "passed": false
+    },
+    {
+      "check": "dvabobra2014 positive search matches listed UID",
+      "passed": false
+    }
+  ],
+  "candidate_stopped": true,
+  "release_recheck_complete": true,
+  "release_candidate_stopped": true,
+  "connect_repair": {
+    "dns_timeout_s": 3,
+    "per_address_timeout_s": 2,
+    "dns_plus_tcp_budget_s": 8,
+    "release_sha256": "a80b0b7609462ead81ef53d45ff1051583d09fd366e2cd34380c734f18038b5c"
+  },
+  "positive_search_controls_complete": true,
+  "positive_search_candidate_stopped": true,
+  "state_meaning": "COMPLETE means historical traversal completed, not acceptance or deployment.",
+  "current_results": "devcat-recovery-results-2026-10-22.json",
+  "first_failures": {
+    "dedts/mail.read": {
+      "account": "dedts",
+      "tool": "mail.read",
+      "phase": "read",
+      "seconds": 35.029,
+      "status": "BLOCKED",
+      "code": "TRANSPORT_TimeoutError",
+      "reason": "bounded client failure; no mutation retry"
+    },
+    "dedts/disk.read": {
+      "account": "dedts",
+      "tool": "disk.read",
+      "phase": "read",
+      "seconds": 29.536,
+      "status": "BLOCKED",
+      "code": "NETWORK_ERROR",
+      "reason": "provider_or_validation_error"
+    },
+    "ykkareliadom/mail.list": {
+      "account": "ykkareliadom",
+      "tool": "mail.list",
+      "phase": "read",
+      "seconds": 35.035,
+      "status": "BLOCKED",
+      "code": "TRANSPORT_TimeoutError",
+      "reason": "bounded client failure; no mutation retry"
+    },
+    "ykkareliadom/mail.read": {
+      "account": "ykkareliadom",
+      "tool": "mail.read",
+      "phase": "dependency",
+      "status": "BLOCKED",
+      "reason": "no bounded UID available"
+    },
+    "ykkareliadom/disk.upload": {
+      "account": "ykkareliadom",
+      "tool": "disk.upload",
+      "phase": "dry_run",
+      "seconds": 0.004,
+      "status": "BLOCKED",
+      "code": "AUTH_ERROR",
+      "reason": "no credential configured for disk"
+    },
+    "dvabobra2014/disk.upload": {
+      "account": "dvabobra2014",
+      "tool": "disk.upload",
+      "phase": "dry_run",
+      "seconds": 0.007,
+      "status": "BLOCKED",
+      "code": "AUTH_ERROR",
+      "reason": "no credential configured for disk"
+    },
+    "dvabobra2014/mail.list": {
+      "account": "dvabobra2014",
+      "tool": "mail.list",
+      "phase": "post-connect-repair list",
+      "seconds": 12.468,
+      "status": "BLOCKED",
+      "code": "NETWORK_ERROR",
+      "reason": "Network error: failed to connect to IMAP server imap.yandex.com:993: mail DNS resolution timed out"
+    }
+  },
+  "historical_search_note": "PASS with count=0 establishes RPC completion only; it is not positive-search acceptance.",
+  "published_link_correction": "disk.publish is needed only to create a new public fixture in this environment; it is not required by mail.send_published_link, which accepts an already-published URL."
+}

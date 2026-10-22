@@ -22,6 +22,16 @@ pub const DISK_SCOPES: &[&str] = &[
     "cloud_api:disk.write",
 ];
 pub const MAIL_SCOPES: &[&str] = &["mail:imap_full", "mail:smtp"];
+const MAIL_READ_SCOPES: &[&str] = &["mail:imap_ro"];
+const MAIL_READ_SEND_SCOPES: &[&str] = &["mail:imap_ro", "mail:smtp"];
+const MAIL_SEND_SCOPES: &[&str] = &["mail:smtp"];
+const MAIL_FULL_SCOPES: &[&str] = &["mail:imap_full"];
+const DISK_READ_SCOPES: &[&str] = &["cloud_api:disk.info", "cloud_api:disk.read"];
+const DISK_READ_WRITE_SCOPES: &[&str] = &[
+    "cloud_api:disk.info",
+    "cloud_api:disk.read",
+    "cloud_api:disk.write",
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OauthService {
@@ -45,6 +55,41 @@ impl OauthService {
     }
 
     pub fn scopes(self) -> &'static [&'static str] {
+        if crate::mcp::devcat::enabled() {
+            return match self {
+                Self::Mail
+                    if std::env::var("YACLI_DEVCAT_OAUTH_MAIL_FULL").as_deref() == Ok("1") =>
+                {
+                    MAIL_SCOPES
+                }
+                Self::Mail
+                    if crate::mcp::devcat::has_capability("mail.mutate")
+                        || crate::mcp::devcat::has_capability("mail.delete") =>
+                {
+                    if crate::mcp::devcat::has_capability("mail.send") {
+                        MAIL_SCOPES
+                    } else {
+                        MAIL_FULL_SCOPES
+                    }
+                }
+                Self::Mail if crate::mcp::devcat::has_capability("mail.send") => {
+                    if crate::mcp::devcat::has_capability("mail.read") {
+                        MAIL_READ_SEND_SCOPES
+                    } else {
+                        MAIL_SEND_SCOPES
+                    }
+                }
+                Self::Mail => MAIL_READ_SCOPES,
+                Self::Disk
+                    if crate::mcp::devcat::has_capability("disk.write")
+                        || crate::mcp::devcat::has_capability("disk.delete")
+                        || crate::mcp::devcat::has_capability("disk.publish") =>
+                {
+                    DISK_READ_WRITE_SCOPES
+                }
+                Self::Disk => DISK_READ_SCOPES,
+            };
+        }
         match self {
             Self::Mail => MAIL_SCOPES,
             Self::Disk => DISK_SCOPES,

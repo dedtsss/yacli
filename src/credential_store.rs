@@ -79,6 +79,13 @@ pub fn configured_secret_backend_name() -> Result<&'static str> {
 
 impl CredentialStore {
     pub fn load() -> Result<Self> {
+        if crate::mcp::devcat::enabled() {
+            return Ok(Self {
+                backend: SecretBackendKind::File,
+                file: CredentialsFile::default(),
+                removed: BTreeSet::new(),
+            });
+        }
         let backend = configured_secret_backend()?;
         let file = if backend == SecretBackendKind::File {
             load_credentials_file()?
@@ -95,6 +102,11 @@ impl CredentialStore {
     }
 
     pub fn save(&mut self) -> Result<()> {
+        if crate::mcp::devcat::enabled() {
+            return Err(YacliError::Auth(
+                "DevCat mode forbids local credential storage".into(),
+            ));
+        }
         match self.backend {
             SecretBackendKind::File => {
                 let path = credentials_path()?;

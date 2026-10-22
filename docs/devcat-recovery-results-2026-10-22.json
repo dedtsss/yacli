@@ -1,0 +1,253 @@
+{
+  "date": "2026-10-22",
+  "route": "isolated candidate loopback",
+  "cases": [
+    {
+      "check": "catalog",
+      "count": 11,
+      "status": "PASS"
+    },
+    {
+      "check": "exact aliases and default in every schema",
+      "status": "PASS"
+    },
+    {
+      "check": "read annotations",
+      "status": "PASS"
+    },
+    {
+      "check": "outside",
+      "status": "EXPECTED_DENY"
+    },
+    {
+      "check": "account",
+      "status": "EXPECTED_DENY"
+    },
+    {
+      "check": "account",
+      "status": "EXPECTED_DENY"
+    },
+    {
+      "check": "no credential configured for disk",
+      "status": "EXPECTED_DENY"
+    },
+    {
+      "check": "no credential configured for disk",
+      "status": "EXPECTED_DENY"
+    },
+    {
+      "check": "capability denied",
+      "status": "EXPECTED_DENY"
+    },
+    {
+      "account": "dedts",
+      "tool": "mail.list",
+      "phase": "current list",
+      "status": "PASS",
+      "count": 1,
+      "seconds": 12.689
+    },
+    {
+      "account": "dedts",
+      "tool": "mail.folders",
+      "phase": "current folders",
+      "status": "PASS",
+      "count": 64,
+      "seconds": 10.061
+    },
+    {
+      "account": "dedts",
+      "tool": "mail.read",
+      "phase": "known listed UID",
+      "status": "PASS",
+      "seconds": 11.461
+    },
+    {
+      "account": "dedts",
+      "tool": "mail.search",
+      "phase": "positive indexed control",
+      "status": "PASS",
+      "count": 1,
+      "seconds": 23.08
+    },
+    {
+      "account": "dedts",
+      "tool": "mail.read",
+      "phase": "read search UID",
+      "status": "PASS",
+      "seconds": 10.831
+    },
+    {
+      "account": "dedts",
+      "tool": "mail.search",
+      "phase": "known readable UID positive search",
+      "status": "PASS",
+      "count": 10,
+      "seconds": 25.154
+    },
+    {
+      "account": "dedts",
+      "check": "known readable UID matched search",
+      "status": "PASS"
+    },
+    {
+      "account": "dedts",
+      "check": "positive search UID readable",
+      "status": "PASS"
+    },
+    {
+      "account": "ykkareliadom",
+      "tool": "mail.list",
+      "phase": "current list",
+      "status": "PASS",
+      "count": 1,
+      "seconds": 10.691
+    },
+    {
+      "account": "ykkareliadom",
+      "tool": "mail.folders",
+      "phase": "current folders",
+      "status": "PASS",
+      "count": 10,
+      "seconds": 10.717
+    },
+    {
+      "account": "ykkareliadom",
+      "tool": "mail.read",
+      "phase": "known listed UID",
+      "status": "PASS",
+      "seconds": 10.758
+    },
+    {
+      "account": "ykkareliadom",
+      "tool": "mail.search",
+      "phase": "positive indexed control",
+      "status": "PASS",
+      "count": 1,
+      "seconds": 11.075
+    },
+    {
+      "account": "ykkareliadom",
+      "tool": "mail.read",
+      "phase": "read search UID",
+      "status": "PASS",
+      "seconds": 10.762
+    },
+    {
+      "account": "ykkareliadom",
+      "tool": "mail.search",
+      "phase": "known readable UID positive search",
+      "status": "PASS",
+      "count": 10,
+      "seconds": 11.861
+    },
+    {
+      "account": "ykkareliadom",
+      "check": "known readable UID matched search",
+      "status": "PASS"
+    },
+    {
+      "account": "ykkareliadom",
+      "check": "positive search UID readable",
+      "status": "PASS"
+    },
+    {
+      "account": "dvabobra2014",
+      "tool": "mail.list",
+      "phase": "current list",
+      "status": "PASS",
+      "count": 1,
+      "seconds": 10.526
+    },
+    {
+      "account": "dvabobra2014",
+      "tool": "mail.folders",
+      "phase": "current folders",
+      "status": "PASS",
+      "count": 24,
+      "seconds": 10.212
+    },
+    {
+      "account": "dvabobra2014",
+      "tool": "mail.read",
+      "phase": "known listed UID",
+      "status": "PASS",
+      "seconds": 10.684
+    },
+    {
+      "account": "dvabobra2014",
+      "tool": "mail.search",
+      "phase": "positive indexed control",
+      "status": "PASS",
+      "count": 1,
+      "seconds": 10.663
+    },
+    {
+      "account": "dvabobra2014",
+      "tool": "mail.read",
+      "phase": "read search UID",
+      "status": "PASS",
+      "seconds": 15.682
+    },
+    {
+      "account": "dvabobra2014",
+      "tool": "mail.search",
+      "phase": "known readable UID positive search",
+      "status": "PASS",
+      "count": 10,
+      "seconds": 11.347
+    },
+    {
+      "account": "dvabobra2014",
+      "check": "known readable UID matched search",
+      "status": "PASS"
+    },
+    {
+      "account": "dvabobra2014",
+      "check": "positive search UID readable",
+      "status": "PASS"
+    },
+    {
+      "account": "dedts",
+      "tool": "disk.list",
+      "phase": "existing dedicated test directory",
+      "status": "PASS",
+      "seconds": 9.859
+    },
+    {
+      "account": "dedts",
+      "tool": "disk.read",
+      "phase": "existing uploaded checksum control",
+      "status": "PASS",
+      "seconds": 10.959
+    },
+    {
+      "account": "dedts",
+      "check": "upload/read checksum",
+      "status": "PASS",
+      "bytes": 64,
+      "sha256": "567c5857734748376f22492c59322ca1376057f09c1b4683c7d60da1b9643304",
+      "expected_sha256": "567c5857734748376f22492c59322ca1376057f09c1b4683c7d60da1b9643304"
+    }
+  ],
+  "ui_acceptance": false,
+  "binary_sha256": "b18d8690a1ec5f03f2dd3f90647560725c1524f229e2c7a154c83e7fad2b362e",
+  "catalog_sha256": "c3e09d8c12b179b7d743d53ef4553670f4bf3f57fa8c6d21adba2124bb743a50",
+  "response_shapes": {
+    "mail.list": [
+      "account",
+      "folder",
+      "items"
+    ],
+    "disk.list": [
+      "account",
+      "resource"
+    ]
+  },
+  "disk_item_count": 1,
+  "candidate_stopped": true,
+  "state": "PASS",
+  "scope": "repaired release candidate; not deployed or ChatGPT acceptance",
+  "no_new_sends": true,
+  "no_new_uploads": true
+}

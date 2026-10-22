@@ -1,0 +1,223 @@
+{
+  "source_head": "4e19741bd2eb4e2e8aa03ff4abe5f029cfa3c537",
+  "host_result": {
+    "source_head": "4e19741bd2eb4e2e8aa03ff4abe5f029cfa3c537",
+    "binary_sha256": "a0654c1958ab1d56e6d471d1d07c35f80053a82093ce999ac098109e7b9b7a37",
+    "previous": "/opt/yacli-devcat/releases/8af2b2fb7b36d7c08b5c867ba1faf11bbd351879",
+    "ui_acceptance": false,
+    "state": "ROLLED_BACK",
+    "failure_type": "CalledProcessError"
+  },
+  "postdeploy": {
+    "date": "2026-10-22",
+    "route": "existing service loopback",
+    "cases": [
+      {
+        "check": "catalog",
+        "count": 11,
+        "status": "PASS"
+      },
+      {
+        "check": "exact aliases and default in every schema",
+        "status": "PASS"
+      },
+      {
+        "check": "read annotations",
+        "status": "PASS"
+      },
+      {
+        "check": "outside",
+        "status": "EXPECTED_DENY"
+      },
+      {
+        "check": "account",
+        "status": "EXPECTED_DENY"
+      },
+      {
+        "check": "account",
+        "status": "EXPECTED_DENY"
+      },
+      {
+        "check": "no credential configured for disk",
+        "status": "EXPECTED_DENY"
+      },
+      {
+        "check": "no credential configured for disk",
+        "status": "EXPECTED_DENY"
+      },
+      {
+        "check": "capability denied",
+        "status": "EXPECTED_DENY"
+      },
+      {
+        "account": "dedts",
+        "tool": "mail.folders",
+        "phase": "current folders",
+        "status": "PASS",
+        "count": 64,
+        "seconds": 10.181
+      },
+      {
+        "account": "dedts",
+        "tool": "mail.list",
+        "phase": "current list",
+        "status": "BLOCKED",
+        "code": "NETWORK_ERROR",
+        "seconds": 12.02
+      },
+      {
+        "account": "dedts",
+        "tool": "mail.search",
+        "phase": "positive indexed control",
+        "status": "PASS",
+        "count": 1,
+        "seconds": 27.258
+      },
+      {
+        "account": "dedts",
+        "tool": "mail.read",
+        "phase": "read search UID",
+        "status": "PASS",
+        "seconds": 11.007
+      },
+      {
+        "account": "dedts",
+        "tool": "mail.search",
+        "phase": "known readable UID positive search",
+        "status": "PASS",
+        "count": 10,
+        "seconds": 22.217
+      },
+      {
+        "account": "dedts",
+        "check": "known readable UID matched search",
+        "status": "PASS"
+      },
+      {
+        "account": "dedts",
+        "check": "positive search UID readable",
+        "status": "PASS"
+      },
+      {
+        "account": "ykkareliadom",
+        "tool": "mail.folders",
+        "phase": "current folders",
+        "status": "PASS",
+        "count": 10,
+        "seconds": 10.449
+      },
+      {
+        "account": "ykkareliadom",
+        "tool": "mail.list",
+        "phase": "current list",
+        "status": "PASS",
+        "count": 1,
+        "seconds": 10.997
+      },
+      {
+        "account": "ykkareliadom",
+        "tool": "mail.read",
+        "phase": "known listed UID",
+        "status": "PASS",
+        "seconds": 11.288
+      },
+      {
+        "account": "ykkareliadom",
+        "tool": "mail.search",
+        "phase": "positive indexed control",
+        "status": "PASS",
+        "count": 1,
+        "seconds": 11.85
+      },
+      {
+        "account": "ykkareliadom",
+        "tool": "mail.read",
+        "phase": "read search UID",
+        "status": "PASS",
+        "seconds": 10.915
+      },
+      {
+        "account": "ykkareliadom",
+        "tool": "mail.search",
+        "phase": "known readable UID positive search",
+        "status": "PASS",
+        "count": 10,
+        "seconds": 11.719
+      },
+      {
+        "account": "ykkareliadom",
+        "check": "known readable UID matched search",
+        "status": "PASS"
+      },
+      {
+        "account": "ykkareliadom",
+        "check": "positive search UID readable",
+        "status": "PASS"
+      },
+      {
+        "account": "dvabobra2014",
+        "tool": "mail.folders",
+        "phase": "current folders",
+        "status": "PASS",
+        "count": 24,
+        "seconds": 10.463
+      },
+      {
+        "account": "dvabobra2014",
+        "tool": "mail.list",
+        "phase": "current list",
+        "status": "PASS",
+        "count": 1,
+        "seconds": 10.6
+      },
+      {
+        "account": "dvabobra2014",
+        "tool": "mail.read",
+        "phase": "known listed UID",
+        "status": "PASS",
+        "seconds": 11.265
+      },
+      {
+        "account": "dvabobra2014",
+        "tool": "mail.search",
+        "phase": "positive indexed control",
+        "status": "BLOCKED",
+        "code": "NETWORK_ERROR",
+        "seconds": 11.776
+      },
+      {
+        "account": "dedts",
+        "tool": "disk.list",
+        "phase": "existing dedicated test directory",
+        "status": "PASS",
+        "seconds": 9.955
+      },
+      {
+        "account": "dedts",
+        "tool": "disk.read",
+        "phase": "existing uploaded checksum control",
+        "status": "BLOCKED",
+        "code": "NETWORK_ERROR",
+        "seconds": 29.553
+      }
+    ],
+    "ui_acceptance": false,
+    "binary_sha256": "a0654c1958ab1d56e6d471d1d07c35f80053a82093ce999ac098109e7b9b7a37",
+    "catalog_sha256": "c3e09d8c12b179b7d743d53ef4553670f4bf3f57fa8c6d21adba2124bb743a50",
+    "response_shapes": {
+      "mail.list": [
+        "account",
+        "folder",
+        "items"
+      ],
+      "disk.list": [
+        "account",
+        "resource"
+      ]
+    },
+    "disk_item_count": 1,
+    "candidate_stopped": false,
+    "state": "BLOCKED"
+  },
+  "failure_detail_note": "Original verifier retained code and timing only; exact network stage was not captured. Preserve these first failures unchanged."
+}

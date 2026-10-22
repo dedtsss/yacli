@@ -33,6 +33,7 @@ pub struct CalendarConnectionContext {
 enum CredentialReference<'a> {
     Env(&'a str),
     Store(&'a str),
+    Vault(&'a str),
 }
 
 pub fn auth_state(
@@ -101,6 +102,11 @@ pub fn auth_state(
                     },
                 }
             }
+            Some(CredentialReference::Vault(key)) => CredentialState {
+                credential_ref: Some(raw.to_string()),
+                credential_state: "vault_ref",
+                detail: format!("Bruce vault key {key}; checked at use time"),
+            },
             None => CredentialState {
                 credential_ref: Some(raw.to_string()),
                 credential_state: "unsupported_reference",
@@ -220,6 +226,7 @@ pub fn resolve_oauth_access_token(
 
     match parse_credential_ref(reference) {
         Some(CredentialReference::Env(var_name)) => required_env(var_name),
+        Some(CredentialReference::Vault(key)) => vault_secret(key),
         Some(CredentialReference::Store(store_service)) => {
             if store_service != service.as_str() {
                 return Err(YacliError::Config(format!(
@@ -270,6 +277,7 @@ pub fn resolve_app_password_secret(
 
     match parse_credential_ref(reference) {
         Some(CredentialReference::Env(var_name)) => required_env(var_name),
+        Some(CredentialReference::Vault(key)) => vault_secret(key),
         Some(CredentialReference::Store(store_service)) => {
             if store_service != service {
                 return Err(YacliError::Config(format!(
@@ -302,6 +310,9 @@ fn required_env(name: &str) -> Result<String> {
 }
 
 fn parse_credential_ref(raw: &str) -> Option<CredentialReference<'_>> {
+    if let Some(value) = raw.strip_prefix("vault:") {
+        return Some(CredentialReference::Vault(value));
+    }
     if let Some(value) = raw.strip_prefix("env:") {
         return Some(CredentialReference::Env(value));
     }
@@ -309,4 +320,194 @@ fn parse_credential_ref(raw: &str) -> Option<CredentialReference<'_>> {
         return Some(CredentialReference::Store(value));
     }
     None
+}
+
+pub(crate) fn vault_secret(key: &str) -> Result<String> {
+    if !crate::mcp::devcat::enabled() {
+        return Err(YacliError::Auth(
+            "vault reference requires DevCat mode".into(),
+        ));
+    }
+    if key.is_empty()
+        || !key
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+    {
+        return Err(YacliError::Config("invalid vault key name".into()));
+    }
+    let helper = vault_helper_path()?;
+    let output = read_vault_helper(&helper, key, std::time::Duration::from_secs(15))?;
+    if !output.status.success() {
+        return Err(YacliError::Auth(format!("vault key unavailable: {key}")));
+    }
+    let value = String::from_utf8(output.stdout)
+        .map_err(|_| YacliError::Auth("invalid vault response".into()))?;
+    let value = value.trim_end_matches(['\r', '\n']).to_string();
+    if value.is_empty() {
+        return Err(YacliError::Auth(format!("Bruce vault key empty: {key}")));
+    }
+    Ok(value)
+}
+
+// A helper may itself wait on a remote vault. Bound both process execution and
+// pipe EOF, and terminate its process group on Unix (including SSH descendants).
+fn read_vault_helper(
+    helper: &std::path::Path,
+    key: &str,
+    timeout: std::time::Duration,
+) -> Result<std::process::Output> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    let mut command = Command::new(helper);
+    command
+        .args(["get", key])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|_| YacliError::Auth("vault helper unavailable".into()))?;
+    let stdout = child.stdout.take().expect("piped vault stdout");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = stdout.take(65537).read_to_end(&mut bytes).map(|_| bytes);
+        let _ = tx.send(result);
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    let result = (|| {
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(YacliError::Network("vault helper timed out".into()));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let stdout = rx
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .map_err(|_| YacliError::Network("vault helper output timed out".into()))??;
+        if stdout.len() > 65536 {
+            return Err(YacliError::Auth("vault response too large".into()));
+        }
+        Ok(std::process::Output {
+            status,
+            stdout,
+            stderr: Vec::new(),
+        })
+    })();
+    if result.is_err() {
+        #[cfg(unix)]
+        // SAFETY: the child was placed in its own process group at spawn.
+        unsafe {
+            libc::kill(-(child.id() as i32), libc::SIGKILL);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    result
+}
+
+pub(crate) fn vault_store_token(key: &str, value: &str) -> Result<()> {
+    if !crate::mcp::devcat::enabled() {
+        return Err(YacliError::Auth("vault write requires DevCat mode".into()));
+    }
+    if key.is_empty()
+        || !key
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+    {
+        return Err(YacliError::Config("invalid vault key name".into()));
+    }
+    let helper = vault_helper_path()?;
+    let status = std::process::Command::new(&helper)
+        .arg("exists")
+        .arg(key)
+        .output()
+        .map_err(|_| YacliError::Auth("vault helper unavailable".into()))?
+        .status;
+    let action = match status.code() {
+        Some(0) => "replace",
+        Some(10) => "put",
+        _ => {
+            return Err(YacliError::Auth(format!(
+                "Bruce vault preflight failed: {key}"
+            )));
+        }
+    };
+    let mut child = std::process::Command::new(helper)
+        .arg(action)
+        .arg(key)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|_| YacliError::Auth("vault write helper unavailable".into()))?;
+    use std::io::Write;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| YacliError::Auth("Bruce vault stdin unavailable".into()))?
+        .write_all(value.as_bytes())?;
+    if !child.wait()?.success() {
+        return Err(YacliError::Auth(format!(
+            "Bruce vault token write failed: {key}"
+        )));
+    }
+    Ok(())
+}
+
+fn vault_helper_path() -> Result<std::path::PathBuf> {
+    let configured = std::env::var_os("YACLI_DEVCAT_VAULT_HELPER")
+        .unwrap_or_else(|| std::ffi::OsString::from("bruce-secret"));
+    if configured.is_empty() {
+        return Err(YacliError::Config(
+            "YACLI_DEVCAT_VAULT_HELPER must name a vault helper".into(),
+        ));
+    }
+    Ok(configured.into())
+}
+
+#[cfg(all(test, unix))]
+mod vault_deadline_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn vault_deadline_bounds_helper_and_descendant_holding_stdout() {
+        let temp = tempfile::tempdir().unwrap();
+        let helper = temp.path().join("helper");
+        for body in ["sleep 30", "sleep 30 &\nexit 0"] {
+            std::fs::write(&helper, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let start = Instant::now();
+            let error =
+                read_vault_helper(&helper, "TEST_KEY", Duration::from_millis(100)).unwrap_err();
+            assert_eq!(error.code(), "NETWORK_ERROR");
+            assert!(error.to_string().contains("timed out"));
+            assert!(start.elapsed() < Duration::from_secs(1));
+        }
+    }
+
+    #[test]
+    fn vault_nonzero_and_oversize_responses_fail_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let helper = temp.path().join("helper");
+        std::fs::write(
+            &helper,
+            "#!/bin/sh\nprintf 'not-an-authorized-token'\nexit 10\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let output = read_vault_helper(&helper, "TEST_KEY", Duration::from_secs(1)).unwrap();
+        assert!(!output.status.success());
+        std::fs::write(&helper, "#!/bin/sh\nhead -c 65537 /dev/zero\n").unwrap();
+        assert!(read_vault_helper(&helper, "TEST_KEY", Duration::from_secs(1)).is_err());
+    }
 }
