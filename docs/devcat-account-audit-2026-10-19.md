@@ -23,3 +23,18 @@ The repair moves DevCat tools into blocking workers after checking the initializ
 Discovery loads account metadata once and fails explicitly for unreadable/malformed/missing metadata or an allowlisted account missing from it. Every tool describes exact account identifiers, default dedts and service configuration; configured does not assert current authorization. Non-string accounts fail validation. Read annotations are explicit; upload is destructive because overwrite is supported; only Mail sending has openWorldHint=true.
 
 No production deployment, service restart, capability expansion, OAuth repetition, user-data deletion or historical tool-disappearance attribution is part of this repair. The complete candidate matrix and final verification will be recorded below and in the companion JSON checkpoint.
+
+## Recovery result — 2026-10-22
+
+The original 80-case traversal is retained in the companion JSON, including the
+first failures. `COMPLETE` describes traversal, not acceptance. Current results
+are separate: [recovery report](devcat-recovery-2026-10-22.md) and
+[final candidate matrix](devcat-recovery-results-2026-10-22.json).
+
+All three Mail aliases now pass folders/list/read and positive search with a known
+readable UID. Reading the previously uploaded main Disk fixture succeeds and
+matches all 64 bytes by SHA-256. SMTP successes were not repeated. Additional Disk
+accounts remain NOT_CONFIGURED and publication remains disabled. All 411 tests
+pass. Production is unchanged: the exact verified artifact and one atomic
+install/verify/rollback action are prepared, blocked only by the unavailable
+privileged host route. ChatGPT UI acceptance is not established.

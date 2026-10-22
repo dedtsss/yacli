@@ -1,8 +1,8 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -21,6 +21,88 @@ use crate::error::{Result, YacliError};
 const IMAP_TIMEOUT_SECS: u64 = 20;
 const SMTP_TIMEOUT_SECS: u64 = 20;
 const SMTP_SAFE_MESSAGE_BYTES: usize = 25 * 1024 * 1024;
+
+// TcpStream::connect has an OS-sized per-address wait (minutes on Linux).
+// Bound address failover independently of the subsequent TLS/socket I/O waits.
+fn connect_mail_tcp(host: &str, port: u16) -> std::io::Result<TcpStream> {
+    let started = Instant::now();
+    let key = (host.to_owned(), port);
+    let cached = mail_address_cache().lock().ok().and_then(|cache| {
+        cache
+            .get(&key)
+            .filter(|(at, _)| at.elapsed() < Duration::from_secs(30))
+            .map(|(_, addresses)| addresses.clone())
+    });
+    let addresses = if let Some(addresses) = cached {
+        addresses
+    } else {
+        let host = host.to_owned();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new().spawn(move || {
+            let result = (host.as_str(), port)
+                .to_socket_addrs()
+                .map(|a| a.collect::<Vec<_>>());
+            let _ = tx.send(result);
+        })?;
+        let addresses = rx.recv_timeout(Duration::from_secs(8)).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "mail DNS resolution timed out",
+            )
+        })??;
+        if !addresses.is_empty() {
+            if let Ok(mut cache) = mail_address_cache().lock() {
+                cache.insert(key.clone(), (Instant::now(), addresses.clone()));
+            }
+        }
+        addresses
+    };
+    let result = connect_mail_addresses(
+        addresses,
+        Duration::from_secs(12).saturating_sub(started.elapsed()),
+        |address, timeout| TcpStream::connect_timeout(&address, timeout),
+    );
+    if result.is_err() {
+        if let Ok(mut cache) = mail_address_cache().lock() {
+            cache.remove(&key);
+        }
+    }
+    result
+}
+
+type MailAddressCache =
+    std::sync::Mutex<std::collections::HashMap<(String, u16), (Instant, Vec<SocketAddr>)>>;
+
+fn mail_address_cache() -> &'static MailAddressCache {
+    static CACHE: std::sync::OnceLock<MailAddressCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+fn connect_mail_addresses<T>(
+    addresses: impl IntoIterator<Item = SocketAddr>,
+    budget: Duration,
+    mut connect: impl FnMut(SocketAddr, Duration) -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    let deadline = Instant::now() + budget;
+    let mut last = std::io::Error::new(
+        std::io::ErrorKind::AddrNotAvailable,
+        "no mail server addresses",
+    );
+    for address in addresses {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "mail connection deadline exceeded",
+            ));
+        }
+        match connect(address, remaining.min(Duration::from_secs(2))) {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last = error,
+        }
+    }
+    Err(last)
+}
 
 pub fn smtp_safe_message_bytes() -> u64 {
     SMTP_SAFE_MESSAGE_BYTES as u64
@@ -738,7 +820,7 @@ enum TaggedErrorKind {
 impl SmtpSession<native_tls::TlsStream<TcpStream>> {
     fn connect(smtp_host: &str, smtp_port: u16) -> Result<Self> {
         let address = format!("{smtp_host}:{smtp_port}");
-        let tcp = TcpStream::connect(&address).map_err(|err| {
+        let tcp = connect_mail_tcp(smtp_host, smtp_port).map_err(|err| {
             YacliError::Network(format!("failed to connect to SMTP server {address}: {err}"))
         })?;
         tcp.set_read_timeout(Some(Duration::from_secs(SMTP_TIMEOUT_SECS)))?;
@@ -760,7 +842,7 @@ impl SmtpSession<native_tls::TlsStream<TcpStream>> {
 impl ImapSession {
     fn connect(imap_host: &str, imap_port: u16) -> Result<Self> {
         let address = format!("{imap_host}:{imap_port}");
-        let tcp = TcpStream::connect(&address).map_err(|err| {
+        let tcp = connect_mail_tcp(imap_host, imap_port).map_err(|err| {
             YacliError::Network(format!("failed to connect to IMAP server {address}: {err}"))
         })?;
         tcp.set_read_timeout(Some(Duration::from_secs(IMAP_TIMEOUT_SECS)))?;
@@ -2860,6 +2942,88 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
+
+    #[test]
+    fn mail_connect_falls_back_after_a_stalled_address() {
+        use std::net::{SocketAddr, TcpListener, TcpStream};
+        use std::time::Duration;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let good = listener.local_addr().unwrap();
+        let stalled: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let mut attempts = 0;
+        let stream = super::connect_mail_addresses(
+            [stalled, good],
+            Duration::from_secs(1),
+            |address, timeout| {
+                attempts += 1;
+                assert!(timeout <= Duration::from_secs(1));
+                if address == stalled {
+                    std::thread::sleep(Duration::from_millis(10));
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "simulated blackhole",
+                    ));
+                }
+                TcpStream::connect_timeout(&address, timeout)
+            },
+        )
+        .unwrap();
+        assert_eq!(attempts, 2);
+        assert_eq!(stream.peer_addr().unwrap(), good);
+        assert!(listener.accept().is_ok());
+    }
+
+    #[test]
+    fn mail_connect_enforces_total_budget_before_trying_more_addresses() {
+        use std::net::SocketAddr;
+        use std::time::{Duration, Instant};
+        let address: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let started = Instant::now();
+        let mut attempts = 0;
+        let result = super::connect_mail_addresses::<()>(
+            [address; 20],
+            Duration::from_millis(30),
+            |_, timeout| {
+                attempts += 1;
+                std::thread::sleep(timeout);
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "simulated blackhole",
+                ))
+            },
+        );
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(attempts, 1);
+        assert!(started.elapsed() < Duration::from_millis(300));
+    }
+
+    #[test]
+    fn mail_dns_cache_expires_and_is_evicted_after_connection_failure() {
+        use std::net::{SocketAddr, TcpListener};
+        use std::time::{Duration, Instant};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let key = ("localhost".to_owned(), port);
+        let stale: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        super::mail_address_cache().lock().unwrap().insert(
+            key.clone(),
+            (Instant::now() - Duration::from_secs(31), vec![stale]),
+        );
+        let stream = super::connect_mail_tcp("localhost", port).unwrap();
+        let cached = super::mail_address_cache().lock().unwrap()[&key].1.clone();
+        assert!(cached.iter().all(|a| a.port() == port));
+        let (accepted, _) = listener.accept().unwrap();
+        drop(accepted);
+        drop(stream);
+        drop(listener);
+        assert!(super::connect_mail_tcp("localhost", port).is_err());
+        assert!(
+            !super::mail_address_cache()
+                .lock()
+                .unwrap()
+                .contains_key(&key)
+        );
+    }
 
     #[derive(Clone)]
     struct FakeStream {
