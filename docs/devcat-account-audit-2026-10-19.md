@@ -26,15 +26,14 @@ No production deployment, service restart, capability expansion, OAuth repetitio
 
 ## Recovery result — 2026-10-22
 
-The original 80-case traversal is retained in the companion JSON, including the
-first failures. `COMPLETE` describes traversal, not acceptance. Current results
-are separate: [recovery report](devcat-recovery-2026-10-22.md) and
-[final candidate matrix](devcat-recovery-results-2026-10-22.json).
+The 80-case historical traversal, including first failures, remains in the JSON.
+`COMPLETE` means traversal, not acceptance. See the [working snapshot](devcat-recovery-2026-10-22.md)
+for the first candidate, failed deployment/automatic rollback, exact network
+replay, bounded repair, cold-start checks and current candidate matrix. The first
+real deployment failed three read calls; earlier checksum success was candidate-only.
 
-All three Mail aliases now pass folders/list/read and positive search with a known
-readable UID. Reading the previously uploaded main Disk fixture succeeds and
-matches all 64 bytes by SHA-256. SMTP successes were not repeated. Additional Disk
-accounts remain NOT_CONFIGURED and publication remains disabled. All 411 tests
-pass. Production is unchanged: the exact verified artifact and one atomic
-install/verify/rollback action are prepared, blocked only by the unavailable
-privileged host route. ChatGPT UI acceptance is not established.
+`mail.send_published_link` requires `mail.send` and review, not `disk.publish`.
+Positive live execution is blocked only by the absence of a known safe existing
+public test-object URL. The closed publication gate prevents creating a new
+fixture. No new sends, uploads, scopes or additional Disk accounts were used.
+Actual deployed/ChatGPT acceptance is still distinct from candidate verification.

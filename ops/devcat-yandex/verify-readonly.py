@@ -60,6 +60,10 @@ try:
             if 'error' in x:
                 err = x['error']
                 row.update(status='BLOCKED', code=err.get('data', {}).get('code', 'RPC_ERROR'))
+                if row['code'] == 'NETWORK_ERROR':
+                    detail = re.sub(r'https?://[^\s)]+', '<url-redacted>', err.get('message', ''))
+                    row['network_detail'] = detail[:400]
+                    row['network_stage'] = next((stage for marker, stage in [('DNS resolution', 'dns'), ('connect to IMAP', 'tcp'), ('TLS session', 'tls'), ('vault helper', 'vault'), ('request for url', 'http')] if marker in detail), 'unknown')
                 return None
             x = x['result']
             v = x.get('structuredContent')
@@ -102,8 +106,8 @@ try:
     deny('disk.publish', {'account': 'dedts', 'path': 'disk:/DevCat'}, 'capability denied')
     for alias in aliases:
         a = {'account': alias, 'folder': 'INBOX'}
-        call('mail.folders', {'account': alias}, 'current folders')
         v = call('mail.list', dict(a, limit=1), 'current list')
+        call('mail.folders', {'account': alias}, 'current folders')
         if v:
             state.setdefault('response_shapes', {})['mail.list'] = list(v)
             msgs = v.get('items', [])

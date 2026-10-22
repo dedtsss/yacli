@@ -84,21 +84,40 @@ fn connect_mail_addresses<T>(
     mut connect: impl FnMut(SocketAddr, Duration) -> std::io::Result<T>,
 ) -> std::io::Result<T> {
     let deadline = Instant::now() + budget;
+    let addresses = addresses.into_iter().collect::<Vec<_>>();
     let mut last = std::io::Error::new(
         std::io::ErrorKind::AddrNotAvailable,
         "no mail server addresses",
     );
-    for address in addresses {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "mail connection deadline exceeded",
-            ));
+    // A failed SYN can be transient even when DNS returns only one usable IPv4
+    // address. Retry the connection, never authentication or message submission,
+    // once after failover, using the same absolute deadline.
+    for _ in 0..2 {
+        let mut transient = false;
+        for &address in &addresses {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "mail connection deadline exceeded",
+                ));
+            }
+            match connect(address, remaining.min(Duration::from_secs(2))) {
+                Ok(stream) => return Ok(stream),
+                Err(error) => {
+                    transient |= matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::Interrupted
+                    );
+                    last = error;
+                }
+            }
         }
-        match connect(address, remaining.min(Duration::from_secs(2))) {
-            Ok(stream) => return Ok(stream),
-            Err(error) => last = error,
+        if !transient {
+            break;
         }
     }
     Err(last)
@@ -2942,6 +2961,44 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
+
+    #[test]
+    fn mail_connect_retries_transient_ipv4_after_unreachable_ipv6() {
+        let v4: std::net::SocketAddr = "127.0.0.1:993".parse().unwrap();
+        let v6: std::net::SocketAddr = "[::1]:993".parse().unwrap();
+        let mut attempts = Vec::new();
+        let connected = super::connect_mail_addresses(
+            [v4, v6],
+            std::time::Duration::from_secs(1),
+            |address, _| {
+                attempts.push(address);
+                match attempts.len() {
+                    1 => Err(std::io::Error::from(std::io::ErrorKind::TimedOut)),
+                    2 => Err(std::io::Error::from(std::io::ErrorKind::NetworkUnreachable)),
+                    _ => Ok(address),
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(attempts, [v4, v6, v4]);
+        assert_eq!(connected, v4);
+    }
+
+    #[test]
+    fn mail_connect_does_not_retry_permanent_failures() {
+        let address = "127.0.0.1:993".parse().unwrap();
+        let mut attempts = 0;
+        let result = super::connect_mail_addresses::<()>(
+            [address],
+            std::time::Duration::from_secs(1),
+            |_, _| {
+                attempts += 1;
+                Err(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(attempts, 1);
+    }
 
     #[test]
     fn mail_connect_falls_back_after_a_stalled_address() {

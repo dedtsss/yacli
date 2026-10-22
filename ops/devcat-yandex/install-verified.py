@@ -90,7 +90,9 @@ def verify_manifest(manifest):
     require(re.fullmatch('[0-9a-f]{40}', source), 'invalid source SHA')
     require(git('rev-parse', 'HEAD') == source, 'repository HEAD mismatch')
     require(not git('status', '--porcelain', '--untracked-files=no'), 'tracked tree changed')
-    binary = REPO / 'target/devcat-delivery/yacli-2026-10-22'
+    artifact = manifest.get('artifact', 'yacli-2026-10-22')
+    require(re.fullmatch(r'yacli-[A-Za-z0-9-]+', artifact), 'invalid artifact filename')
+    binary = REPO / 'target/devcat-delivery' / artifact
     require(sha256(binary) == manifest['binary_sha256'], 'artifact hash mismatch')
     report = REPO / 'docs/devcat-recovery-results-2026-10-22.json'
     require(sha256(report) == manifest['verification_sha256'], 'verification report changed')

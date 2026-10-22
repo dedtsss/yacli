@@ -81,7 +81,8 @@
       "phase": "preview only; no public URL",
       "seconds": 9.553,
       "status": "PASS",
-      "positive_execution": "BLOCKED: disk.publish capability absent; no audit public URL"
+      "positive_execution": "BLOCKED_FIXTURE: no known safe already-published test-object URL. Tool requires mail.send plus review digest, not disk.publish.",
+      "historical_blocker_wording": "BLOCKED: disk.publish capability absent; no audit public URL"
     },
     {
       "account": "dedts",
@@ -239,7 +240,8 @@
       "phase": "preview only; no public URL",
       "seconds": 9.732,
       "status": "PASS",
-      "positive_execution": "BLOCKED: disk.publish capability absent; no audit public URL"
+      "positive_execution": "BLOCKED_FIXTURE: no known safe already-published test-object URL. Tool requires mail.send plus review digest, not disk.publish.",
+      "historical_blocker_wording": "BLOCKED: disk.publish capability absent; no audit public URL"
     },
     {
       "account": "ykkareliadom",
@@ -401,7 +403,8 @@
       "phase": "preview only; no public URL",
       "seconds": 9.64,
       "status": "PASS",
-      "positive_execution": "BLOCKED: disk.publish capability absent; no audit public URL"
+      "positive_execution": "BLOCKED_FIXTURE: no known safe already-published test-object URL. Tool requires mail.send plus review digest, not disk.publish.",
+      "historical_blocker_wording": "BLOCKED: disk.publish capability absent; no audit public URL"
     },
     {
       "account": "dvabobra2014",
@@ -819,5 +822,6 @@
       "reason": "Network error: failed to connect to IMAP server imap.yandex.com:993: mail DNS resolution timed out"
     }
   },
-  "historical_search_note": "PASS with count=0 establishes RPC completion only; it is not positive-search acceptance."
+  "historical_search_note": "PASS with count=0 establishes RPC completion only; it is not positive-search acceptance.",
+  "published_link_correction": "disk.publish is needed only to create a new public fixture in this environment; it is not required by mail.send_published_link, which accepts an already-published URL."
 }
