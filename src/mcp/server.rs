@@ -38,8 +38,8 @@ use crate::mail_invite_flow::{
 };
 use crate::mail_link::{
     MailSendLinkOutcome, MailSendLinkRequest, MailSendPublishedLinkRequest, review_mail_send_link,
-    review_mail_send_published_link, send_link_via_mail, send_published_link_command,
-    send_published_link_via_mail,
+    review_mail_send_published_link, send_link_via_mail_with_sent_copy,
+    send_published_link_command, send_published_link_via_mail_with_sent_copy,
 };
 use crate::next_actions::next_actions_payload;
 use crate::onboarding::onboarding_resource_payload;
@@ -68,7 +68,7 @@ use crate::{
         MailAttachmentExportRequest, MailAttachmentSelector, MailInviteInspectRequest,
         export_mail_attachment, inspect_mail_invite, list_mail_folders, list_mail_messages,
         load_mail_attachments, read_mail_message, review_mail_submission, search_mail_messages,
-        send_mail_message,
+        send_mail_message_with_sent_copy,
     },
 };
 use chrono::{DateTime, Utc};
@@ -2731,7 +2731,14 @@ fn mail_send(account: Option<&str>, request: MailSendToolRequest) -> Result<Valu
             }
         }))
     } else {
-        let sent = send_mail_message(&context.smtp_host, context.smtp_port, auth, send_request)?;
+        let sent = send_mail_message_with_sent_copy(
+            &context.smtp_host,
+            context.smtp_port,
+            &context.imap_host,
+            context.imap_port,
+            auth,
+            send_request,
+        )?;
         let mut replay = format!(
             "yacli mail send {} {} {} --dry-run",
             shell_quote(sent.to.first().map(String::as_str).unwrap_or("")),
@@ -2753,6 +2760,8 @@ fn mail_send(account: Option<&str>, request: MailSendToolRequest) -> Result<Valu
         Ok(json!({
             "account": resolved_account,
             "attachments": request.attachment_paths,
+            "status": sent.delivery_status(),
+            "warning": sent.delivery_warning(),
             "sent": sent,
         }))
     }
@@ -2788,11 +2797,13 @@ fn mail_send_link(account: Option<&str>, request: MailSendLinkToolRequest) -> Re
             }
         }))
     } else {
-        let outcome = send_link_via_mail(
+        let outcome = send_link_via_mail_with_sent_copy(
             &disk_base_url,
             &access_token,
             &context.smtp_host,
             context.smtp_port,
+            &context.imap_host,
+            context.imap_port,
             auth,
             &send_link_request,
         )?;
@@ -2823,7 +2834,8 @@ fn mail_send_link(account: Option<&str>, request: MailSendLinkToolRequest) -> Re
                 });
                 Ok(json!({
                     "account": resolved_account,
-                    "status": "completed",
+                    "status": result.sent.delivery_status(),
+                    "warning": result.sent.delivery_warning(),
                     "result": result,
                 }))
             }
@@ -2876,9 +2888,11 @@ fn mail_send_published_link(
             }
         }))
     } else {
-        let sent = send_published_link_via_mail(
+        let sent = send_published_link_via_mail_with_sent_copy(
             &context.smtp_host,
             context.smtp_port,
+            &context.imap_host,
+            context.imap_port,
             auth,
             &send_request,
         )?;
@@ -2895,7 +2909,8 @@ fn mail_send_published_link(
         });
         Ok(json!({
             "account": resolved_account,
-            "status": "completed",
+            "status": sent.delivery_status(),
+            "warning": sent.delivery_warning(),
             "public_url": send_request.public_url,
             "sent": sent,
         }))
@@ -2928,6 +2943,8 @@ fn mail_reply(
     Ok(json!({
         "account": resolved_account,
         "folder": folder,
+        "status": reply.sent.delivery_status(),
+        "warning": reply.sent.delivery_warning(),
         "reply": reply,
     }))
 }
@@ -2954,6 +2971,8 @@ fn mail_forward(account: Option<&str>, request: MailForwardToolRequest) -> Resul
     Ok(json!({
         "account": resolved_account,
         "folder": request.folder,
+        "status": forward.sent.delivery_status(),
+        "warning": forward.sent.delivery_warning(),
         "forward": forward,
     }))
 }

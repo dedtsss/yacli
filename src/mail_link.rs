@@ -10,7 +10,7 @@ use crate::disk::{
 use crate::error::{Result, YacliError};
 use crate::mail::{
     MailSendRequest, MailSendReview, MailSessionAuth, SentMail, review_mail_submission,
-    send_mail_message,
+    send_mail_message, send_mail_message_with_sent_copy,
 };
 
 const PUBLIC_LINK_PLACEHOLDER: &str = "<публичная ссылка на файл>";
@@ -185,6 +185,33 @@ pub fn send_published_link_via_mail(
     auth: MailSessionAuth,
     request: &MailSendPublishedLinkRequest,
 ) -> Result<SentMail> {
+    send_published_link_internal(smtp_host, smtp_port, None, auth, request)
+}
+
+pub fn send_published_link_via_mail_with_sent_copy(
+    smtp_host: &str,
+    smtp_port: u16,
+    imap_host: &str,
+    imap_port: u16,
+    auth: MailSessionAuth,
+    request: &MailSendPublishedLinkRequest,
+) -> Result<SentMail> {
+    send_published_link_internal(
+        smtp_host,
+        smtp_port,
+        Some((imap_host, imap_port)),
+        auth,
+        request,
+    )
+}
+
+fn send_published_link_internal(
+    smtp_host: &str,
+    smtp_port: u16,
+    imap: Option<(&str, u16)>,
+    auth: MailSessionAuth,
+    request: &MailSendPublishedLinkRequest,
+) -> Result<SentMail> {
     let send_request = MailSendRequest {
         to: request.to.clone(),
         cc: request.cc.clone(),
@@ -204,14 +231,67 @@ pub fn send_published_link_via_mail(
         thread_headers: None,
     };
 
-    send_mail_message(smtp_host, smtp_port, auth, send_request)
+    match imap {
+        Some((imap_host, imap_port)) => send_mail_message_with_sent_copy(
+            smtp_host,
+            smtp_port,
+            imap_host,
+            imap_port,
+            auth,
+            send_request,
+        ),
+        None => send_mail_message(smtp_host, smtp_port, auth, send_request),
+    }
 }
 
+#[allow(dead_code)]
 pub fn send_link_via_mail(
     disk_base_url: &str,
     access_token: &str,
     smtp_host: &str,
     smtp_port: u16,
+    auth: MailSessionAuth,
+    request: &MailSendLinkRequest,
+) -> Result<MailSendLinkOutcome> {
+    send_link_internal(
+        disk_base_url,
+        access_token,
+        smtp_host,
+        smtp_port,
+        None,
+        auth,
+        request,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn send_link_via_mail_with_sent_copy(
+    disk_base_url: &str,
+    access_token: &str,
+    smtp_host: &str,
+    smtp_port: u16,
+    imap_host: &str,
+    imap_port: u16,
+    auth: MailSessionAuth,
+    request: &MailSendLinkRequest,
+) -> Result<MailSendLinkOutcome> {
+    send_link_internal(
+        disk_base_url,
+        access_token,
+        smtp_host,
+        smtp_port,
+        Some((imap_host, imap_port)),
+        auth,
+        request,
+    )
+}
+
+fn send_link_internal(
+    disk_base_url: &str,
+    access_token: &str,
+    smtp_host: &str,
+    smtp_port: u16,
+    imap: Option<(&str, u16)>,
     auth: MailSessionAuth,
     request: &MailSendLinkRequest,
 ) -> Result<MailSendLinkOutcome> {
@@ -248,7 +328,17 @@ pub fn send_link_via_mail(
         public_url: public_url.to_string(),
     };
 
-    let sent = match send_published_link_via_mail(smtp_host, smtp_port, auth, &send_request) {
+    let sent = match match imap {
+        Some((imap_host, imap_port)) => send_published_link_via_mail_with_sent_copy(
+            smtp_host,
+            smtp_port,
+            imap_host,
+            imap_port,
+            auth,
+            &send_request,
+        ),
+        None => send_published_link_via_mail(smtp_host, smtp_port, auth, &send_request),
+    } {
         Ok(sent) => sent,
         Err(err) => {
             return Ok(MailSendLinkOutcome::Partial {

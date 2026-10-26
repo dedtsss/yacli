@@ -231,6 +231,31 @@ pub struct SentMail {
     pub subject: String,
     pub message_id: String,
     pub body_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sent_copy: Option<SentCopyOutcome>,
+}
+
+#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
+pub struct SentCopyOutcome {
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mailbox: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl SentMail {
+    pub fn delivery_status(&self) -> &'static str {
+        match self.sent_copy.as_ref().map(|copy| copy.status.as_str()) {
+            Some("not_confirmed") => "partial",
+            _ => "completed",
+        }
+    }
+
+    pub fn delivery_warning(&self) -> Option<&'static str> {
+        (self.delivery_status() == "partial")
+            .then_some("Письмо отправлено; сохранение копии в Sent не подтверждено. SMTP повторно не запускался.")
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Eq, PartialEq)]
@@ -536,6 +561,33 @@ pub fn send_mail_message(
     auth: MailSessionAuth,
     request: MailSendRequest,
 ) -> Result<SentMail> {
+    send_mail_message_internal(smtp_host, smtp_port, None, auth, request)
+}
+
+pub fn send_mail_message_with_sent_copy(
+    smtp_host: &str,
+    smtp_port: u16,
+    imap_host: &str,
+    imap_port: u16,
+    auth: MailSessionAuth,
+    request: MailSendRequest,
+) -> Result<SentMail> {
+    send_mail_message_internal(
+        smtp_host,
+        smtp_port,
+        Some((imap_host, imap_port)),
+        auth,
+        request,
+    )
+}
+
+fn send_mail_message_internal(
+    smtp_host: &str,
+    smtp_port: u16,
+    sent_copy_server: Option<(&str, u16)>,
+    auth: MailSessionAuth,
+    request: MailSendRequest,
+) -> Result<SentMail> {
     let prepared = prepare_mail_submission(auth, request)?;
     ensure_smtp_safe_submission(&prepared)?;
     let mut session = SmtpSession::connect(smtp_host, smtp_port)?;
@@ -557,7 +609,56 @@ pub fn send_mail_message(
         &prepared.message,
     )?;
     let _ = session.quit();
-    Ok(prepared.sent)
+    let mut sent = prepared.sent;
+    if let Some((imap_host, imap_port)) = sent_copy_server {
+        sent.sent_copy = Some(
+            match append_sent_copy(
+                imap_host,
+                imap_port,
+                prepared.auth.into_session_auth(),
+                &prepared.message,
+            ) {
+                Ok(mailbox) => SentCopyOutcome {
+                    status: "saved".to_string(),
+                    mailbox: Some(mailbox),
+                    error: None,
+                },
+                Err(error) => SentCopyOutcome {
+                    status: "not_confirmed".to_string(),
+                    mailbox: None,
+                    error: Some(format!(
+                        "{}: Sent copy could not be confirmed; provider details omitted",
+                        error.code()
+                    )),
+                },
+            },
+        );
+    }
+    Ok(sent)
+}
+
+fn append_sent_copy(
+    imap_host: &str,
+    imap_port: u16,
+    auth: MailSessionAuth,
+    message: &str,
+) -> Result<String> {
+    let mut session = open_authenticated_session(imap_host, imap_port, auth)?;
+    let mailbox = session
+        .list_folders()?
+        .into_iter()
+        .find(|folder| {
+            folder
+                .attributes
+                .iter()
+                .any(|attr| attr.eq_ignore_ascii_case("\\Sent"))
+        })
+        .ok_or_else(|| {
+            YacliError::Api("IMAP server did not advertise a \\Sent mailbox".to_string())
+        })?;
+    session.append_message(&mailbox.raw_name, message.as_bytes())?;
+    let _ = session.logout();
+    Ok(mailbox.name)
 }
 
 pub fn review_mail_submission(
@@ -663,9 +764,11 @@ pub fn reply_to_mail_message(
         mailbox_name,
         request.uid,
     )?;
-    let sent = send_mail_message(
+    let sent = send_mail_message_with_sent_copy(
         smtp_host,
         smtp_port,
+        imap_host,
+        imap_port,
         auth,
         MailSendRequest {
             to: vec![target.recipient.clone()],
@@ -720,9 +823,11 @@ pub fn forward_mail_message(
         normalized.intro_text.as_deref(),
         normalized.intro_html.as_deref(),
     );
-    let sent = send_mail_message(
+    let sent = send_mail_message_with_sent_copy(
         smtp_host,
         smtp_port,
+        imap_host,
+        imap_port,
         auth,
         MailSendRequest {
             to: normalized.to,
@@ -799,6 +904,27 @@ enum MailSmtpAuth {
     },
 }
 
+impl MailSmtpAuth {
+    fn into_session_auth(self) -> MailSessionAuth {
+        match self {
+            Self::OauthXoauth2 {
+                account,
+                access_token,
+            } => MailSessionAuth::OauthXoauth2 {
+                account,
+                access_token,
+            },
+            Self::AppPassword {
+                account,
+                app_password,
+            } => MailSessionAuth::AppPassword {
+                account,
+                app_password,
+            },
+        }
+    }
+}
+
 #[derive(Debug)]
 struct PreparedMailSubmission {
     auth: MailSmtpAuth,
@@ -825,8 +951,8 @@ struct SmtpResponse {
     lines: Vec<String>,
 }
 
-struct ImapSession {
-    reader: BufReader<native_tls::TlsStream<TcpStream>>,
+struct ImapSession<S = native_tls::TlsStream<TcpStream>> {
+    reader: BufReader<S>,
     next_tag: u32,
 }
 
@@ -858,7 +984,7 @@ impl SmtpSession<native_tls::TlsStream<TcpStream>> {
     }
 }
 
-impl ImapSession {
+impl ImapSession<native_tls::TlsStream<TcpStream>> {
     fn connect(imap_host: &str, imap_port: u16) -> Result<Self> {
         let address = format!("{imap_host}:{imap_port}");
         let tcp = connect_mail_tcp(imap_host, imap_port).map_err(|err| {
@@ -876,10 +1002,7 @@ impl ImapSession {
             ))
         })?;
 
-        let mut session = Self {
-            reader: BufReader::new(tls),
-            next_tag: 1,
-        };
+        let mut session = Self::from_stream(tls);
         let greeting = session.read_line()?;
         if !greeting.starts_with("* OK") {
             return Err(YacliError::Api(format!(
@@ -889,6 +1012,15 @@ impl ImapSession {
         }
 
         Ok(session)
+    }
+}
+
+impl<S: Read + Write> ImapSession<S> {
+    fn from_stream(stream: S) -> Self {
+        Self {
+            reader: BufReader::new(stream),
+            next_tag: 1,
+        }
     }
 
     fn authenticate_xoauth2(&mut self, account: &str, access_token: &str) -> Result<()> {
@@ -945,6 +1077,25 @@ impl ImapSession {
             "IMAP SELECT",
             TaggedErrorKind::Api,
         )
+    }
+
+    fn append_message(&mut self, mailbox_name: &str, message: &[u8]) -> Result<()> {
+        let tag = self.next_tag();
+        self.write_line(&format!(
+            "{tag} APPEND {} {{{}}}",
+            quote_imap_string(mailbox_name),
+            message.len()
+        ))?;
+        let continuation = self.read_line()?;
+        if !continuation.starts_with('+') {
+            return Err(YacliError::Api(format!(
+                "IMAP APPEND literal was not accepted: {continuation}"
+            )));
+        }
+        self.write_bytes(message)?;
+        self.write_line("")?;
+        let tagged = self.read_line()?;
+        parse_tagged_status(&tag, &tagged, "IMAP APPEND", TaggedErrorKind::Api)
     }
 
     fn search_all_uids(&mut self) -> Result<Vec<u64>> {
@@ -1535,6 +1686,7 @@ fn prepare_mail_submission(
             subject,
             message_id,
             body_kind,
+            sent_copy: None,
         },
     })
 }
@@ -2943,11 +3095,12 @@ struct ExportedBytes {
 #[cfg(test)]
 mod tests {
     use super::{
-        FetchMetadata, MailAttachmentExportRequest, MailAttachmentPart, MailAttachmentPayload,
-        MailAttachmentSelector, MailAttachmentSummary, MailMessage, MailSendRequest,
-        MailSessionAuth, MailThreadHeaders, OutgoingMessage, SMTP_SAFE_MESSAGE_BYTES, SmtpSession,
-        build_forward_body, build_message_summary, build_outgoing_message, build_read_message,
-        build_reply_target, build_xoauth2_payload, decode_modified_utf7, encode_modified_utf7,
+        FetchMetadata, ImapSession, MailAttachmentExportRequest, MailAttachmentPart,
+        MailAttachmentPayload, MailAttachmentSelector, MailAttachmentSummary, MailMessage,
+        MailSendRequest, MailSessionAuth, MailSmtpAuth, MailThreadHeaders, OutgoingMessage,
+        SMTP_SAFE_MESSAGE_BYTES, SentCopyOutcome, SentMail, SmtpSession, build_forward_body,
+        build_message_summary, build_outgoing_message, build_read_message, build_reply_target,
+        build_xoauth2_payload, decode_modified_utf7, encode_modified_utf7,
         export_attachment_from_message, extract_message_content, inspect_invite_from_message,
         load_mail_attachments, normalize_forward_subject, normalize_reply_subject,
         normalize_search_query, parse_fetch_metadata, parse_imap_token, parse_list_line,
@@ -3175,6 +3328,76 @@ mod tests {
     fn quote_imap_string_escapes_quotes_and_backslashes() {
         let quoted = quote_imap_string(r#"my"user\name"#);
         assert_eq!(quoted, r#""my\"user\\name""#);
+    }
+
+    #[test]
+    fn imap_append_sends_rfc822_literal_once_to_utf7_sent_mailbox() {
+        let fake = FakeStream::new("+ continue\r\nA0001 OK appended\r\n");
+        let observer = fake.clone();
+        let mut session = ImapSession::from_stream(fake);
+        let message = b"Subject: hello\r\n\r\nbody";
+
+        session
+            .append_message("&BB4EQgQ,BEAEMAQyBDsENQQ9BD0ESwQ1-", message)
+            .expect("append");
+
+        let writes = observer.written();
+        assert!(writes.contains("A0001 APPEND \"&BB4EQgQ,BEAEMAQyBDsENQQ9BD0ESwQ1-\" {22}\r\n"));
+        assert!(writes.ends_with("Subject: hello\r\n\r\nbody\r\n"));
+        assert_eq!(writes.matches("APPEND ").count(), 1);
+    }
+
+    #[test]
+    fn imap_append_rejection_is_reported_without_retry() {
+        let fake = FakeStream::new("+ continue\r\nA0001 NO [TRYCREATE] missing mailbox\r\n");
+        let observer = fake.clone();
+        let mut session = ImapSession::from_stream(fake);
+        let error = session
+            .append_message("Sent", b"Subject: hello\r\n\r\nbody")
+            .expect_err("server rejection");
+
+        assert!(error.to_string().contains("IMAP APPEND failed"));
+        assert_eq!(observer.written().matches("APPEND ").count(), 1);
+    }
+
+    #[test]
+    fn sent_copy_failure_is_reported_as_partial_delivery() {
+        let sent = SentMail {
+            from: "sender@example.test".to_string(),
+            to: vec!["sender@example.test".to_string()],
+            cc: Vec::new(),
+            bcc_count: 0,
+            subject: "canary".to_string(),
+            message_id: "m-1@example.test".to_string(),
+            body_kind: "text".to_string(),
+            sent_copy: Some(SentCopyOutcome {
+                status: "not_confirmed".to_string(),
+                mailbox: None,
+                error: Some("APPEND rejected".to_string()),
+            }),
+        };
+
+        assert_eq!(sent.delivery_status(), "partial");
+        assert!(
+            sent.delivery_warning()
+                .unwrap()
+                .contains("SMTP повторно не запускался")
+        );
+    }
+
+    #[test]
+    fn append_authentication_retains_the_selected_mailbox_identity() {
+        let auth = MailSmtpAuth::OauthXoauth2 {
+            account: "ykkareliadom@yandex.ru".to_string(),
+            access_token: "test-token".to_string(),
+        }
+        .into_session_auth();
+
+        assert!(matches!(
+            auth,
+            MailSessionAuth::OauthXoauth2 { account, access_token }
+                if account == "ykkareliadom@yandex.ru" && access_token == "test-token"
+        ));
     }
 
     #[test]

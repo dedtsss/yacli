@@ -50,7 +50,7 @@ use crate::mail::{
     MailSendReview, RepliedMail, SentMail, export_mail_attachment, forward_mail_message,
     inspect_mail_invite, list_mail_folders, list_mail_messages, load_mail_attachments,
     read_mail_message, reply_to_mail_message, review_mail_submission, search_mail_messages,
-    send_mail_message,
+    send_mail_message_with_sent_copy,
 };
 use crate::mail_invite_flow::{
     MailInviteCreateEventPartialFailure, invite_create_event_command,
@@ -59,8 +59,8 @@ use crate::mail_invite_flow::{
 use crate::mail_link::{
     MailSendLinkOutcome, MailSendLinkPartialFailure, MailSendLinkRequest, MailSendLinkResult,
     MailSendLinkReview, MailSendPublishedLinkRequest, MailSendPublishedLinkReview,
-    review_mail_send_link, review_mail_send_published_link, send_link_via_mail,
-    send_published_link_command, send_published_link_via_mail,
+    review_mail_send_link, review_mail_send_published_link, send_link_via_mail_with_sent_copy,
+    send_published_link_command, send_published_link_via_mail_with_sent_copy,
 };
 use crate::mcp::install::execute_install;
 use crate::model::{AccountConfig, CalendarAuthMode, DiskAuthMode, MailAuthMode, NewAccountInput};
@@ -2618,7 +2618,14 @@ fn execute_mail(format: OutputFormat, action: MailCommand) -> Result<RenderedOut
                     render_mail_send_review_table(&resolved_account, &review),
                 )
             } else {
-                let sent = send_mail_message(&context.smtp_host, context.smtp_port, auth, request)?;
+                let sent = send_mail_message_with_sent_copy(
+                    &context.smtp_host,
+                    context.smtp_port,
+                    &context.imap_host,
+                    context.imap_port,
+                    auth,
+                    request,
+                )?;
 
                 ok_output(
                     format,
@@ -2630,6 +2637,8 @@ fn execute_mail(format: OutputFormat, action: MailCommand) -> Result<RenderedOut
                             "host": context.smtp_host,
                             "port": context.smtp_port,
                         },
+                        "status": sent.delivery_status(),
+                        "warning": sent.delivery_warning(),
                         "sent": sent,
                     }),
                     render_mail_send_table(&resolved_account, &sent),
@@ -2705,11 +2714,13 @@ fn execute_mail(format: OutputFormat, action: MailCommand) -> Result<RenderedOut
                     render_mail_send_link_review_table(&resolved_account, &review),
                 )
             } else {
-                let outcome = send_link_via_mail(
+                let outcome = send_link_via_mail_with_sent_copy(
                     &disk_base_url,
                     &access_token,
                     &context.smtp_host,
                     context.smtp_port,
+                    &context.imap_host,
+                    context.imap_port,
                     auth,
                     &request,
                 )?;
@@ -2719,7 +2730,8 @@ fn execute_mail(format: OutputFormat, action: MailCommand) -> Result<RenderedOut
                         "mail.send_link",
                         json!({
                             "account": resolved_account,
-                            "status": "completed",
+                            "status": result.sent.delivery_status(),
+                            "warning": result.sent.delivery_warning(),
                             "result": result,
                         }),
                         render_mail_send_link_table(&resolved_account, &result),
@@ -2824,9 +2836,11 @@ fn execute_mail(format: OutputFormat, action: MailCommand) -> Result<RenderedOut
                     render_mail_send_published_link_review_table(&resolved_account, &review),
                 )
             } else {
-                let sent = send_published_link_via_mail(
+                let sent = send_published_link_via_mail_with_sent_copy(
                     &context.smtp_host,
                     context.smtp_port,
+                    &context.imap_host,
+                    context.imap_port,
                     auth,
                     &request,
                 )?;
@@ -2835,7 +2849,8 @@ fn execute_mail(format: OutputFormat, action: MailCommand) -> Result<RenderedOut
                     "mail.send_published_link",
                     json!({
                         "account": resolved_account,
-                        "status": "completed",
+                        "status": sent.delivery_status(),
+                        "warning": sent.delivery_warning(),
                         "public_url": request.public_url,
                         "sent": sent,
                     }),
@@ -2892,6 +2907,8 @@ fn execute_mail(format: OutputFormat, action: MailCommand) -> Result<RenderedOut
                     "account": resolved_account,
                     "email": context.email,
                     "folder": folder,
+                    "status": replied.sent.delivery_status(),
+                    "warning": replied.sent.delivery_warning(),
                     "reply": replied_mail_json(&replied),
                 }),
                 render_mail_reply_table(&resolved_account, &folder, &replied),
@@ -2935,6 +2952,8 @@ fn execute_mail(format: OutputFormat, action: MailCommand) -> Result<RenderedOut
                     "account": resolved_account,
                     "email": context.email,
                     "folder": folder,
+                    "status": forwarded.sent.delivery_status(),
+                    "warning": forwarded.sent.delivery_warning(),
                     "forward": forwarded_mail_json(&forwarded),
                 }),
                 render_mail_forward_table(&resolved_account, &folder, &forwarded),
@@ -5818,6 +5837,7 @@ fn sent_mail_json(sent: &SentMail) -> serde_json::Value {
         "subject": sent.subject,
         "message_id": sent.message_id,
         "body_kind": sent.body_kind,
+        "sent_copy": sent.sent_copy,
     })
 }
 
