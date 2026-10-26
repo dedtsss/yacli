@@ -49,6 +49,14 @@ def require(condition, message):
         raise RuntimeError(message)
 
 
+def repo_file(relative, label):
+    require(isinstance(relative, str) and relative, f'invalid {label} path')
+    path = (REPO / relative).resolve(strict=True)
+    require(path.is_relative_to(REPO), f'{label} path escapes repository')
+    require(path.is_file(), f'{label} is not a regular file')
+    return path
+
+
 def tunnel_ready():
     # Probe only sockets owned by the existing tunnel service's cgroup. Do not
     # read its profile, credentials or journal, and do not expose raw output.
@@ -88,19 +96,34 @@ def health():
 def verify_manifest(manifest):
     source = manifest['source_head']
     require(re.fullmatch('[0-9a-f]{40}', source), 'invalid source SHA')
-    require(git('rev-parse', 'HEAD') == source, 'repository HEAD mismatch')
     require(not git('status', '--porcelain', '--untracked-files=no'), 'tracked tree changed')
-    artifact = manifest.get('artifact', 'yacli-2026-10-22')
-    require(re.fullmatch(r'yacli-[A-Za-z0-9-]+', artifact), 'invalid artifact filename')
-    binary = REPO / 'target/devcat-delivery' / artifact
+    require(git('cat-file', '-e', f'{source}^{{commit}}') == '', 'source commit unavailable')
+    require(git('merge-base', '--is-ancestor', source, 'HEAD') == '',
+            'source commit is not an ancestor of repository HEAD')
+    binary = repo_file(manifest['artifact'], 'artifact')
+    require(re.fullmatch('[0-9a-f]{64}', manifest['binary_sha256']),
+            'invalid artifact SHA-256')
     require(sha256(binary) == manifest['binary_sha256'], 'artifact hash mismatch')
-    report = REPO / 'docs/devcat-recovery-results-2026-10-22.json'
+    report = repo_file(manifest['verification_report'], 'verification report')
+    require(re.fullmatch('[0-9a-f]{64}', manifest['verification_sha256']),
+            'invalid verification report SHA-256')
     require(sha256(report) == manifest['verification_sha256'], 'verification report changed')
     evidence = json.loads(report.read_text())
     require(evidence['state'] == 'PASS', 'candidate verification did not pass')
+    require(evidence['scope'] == 'candidate_build', 'verification report scope mismatch')
+    require(evidence['source_head'] == source, 'verification source mismatch')
     require(evidence['binary_sha256'] == manifest['binary_sha256'], 'verified binary mismatch')
-    expected = '/opt/yacli-devcat/releases/8af2b2fb7b36d7c08b5c867ba1faf11bbd351879'
-    require(manifest['expected_previous_target'] == expected, 'unexpected deployment baseline')
+    checks = evidence['checks']
+    required_checks = {'fmt', 'clippy', 'locked_tests', 'release_build', 'smoke'}
+    require(isinstance(checks, dict) and set(checks) == required_checks
+            and all(status == 'PASS' for status in checks.values()),
+            'candidate verification checks did not pass')
+    expected = manifest['expected_previous_target']
+    release_root = re.escape(str(BASE / 'releases'))
+    require(re.fullmatch(release_root + r'/[0-9a-f]{40}', expected),
+            'invalid deployment baseline target')
+    require(re.fullmatch('[0-9a-f]{64}', manifest['expected_previous_sha256']),
+            'invalid deployment baseline SHA-256')
     current = BASE / 'current'
     require(str(current.resolve()) == expected, 'deployed HEAD mismatch; no install attempted')
     require(sha256(current / 'yacli') == manifest['expected_previous_sha256'],

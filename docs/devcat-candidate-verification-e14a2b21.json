@@ -1,0 +1,31 @@
+{
+  "date": "2026-10-27",
+  "scope": "candidate_build",
+  "state": "PASS",
+  "source_head": "e14a2b21c532f5314392e35843aa58aa5ffecc18",
+  "artifact": "target/devcat-delivery/yacli-e14a2b21c532f5314392e35843aa58aa5ffecc18",
+  "binary_sha256": "af14969c2b526e4d5b15dcd761f0e192a78eaff34f001761a40e8db88061a13e",
+  "checks": {
+    "fmt": "PASS",
+    "clippy": "PASS",
+    "locked_tests": "PASS",
+    "release_build": "PASS",
+    "smoke": "PASS"
+  },
+  "commands": [
+    "cargo fmt --all -- --check",
+    "YACLI_SECRET_BACKEND=keyring cargo clippy --locked --workspace --all-targets -- -D warnings",
+    "YACLI_SECRET_BACKEND=keyring cargo test --locked --workspace -- --test-threads=1",
+    "YACLI_SECRET_BACKEND=keyring cargo build --locked --release",
+    "YACLI_EXPECT_SECRET_BACKEND=keyring sh ./scripts/smoke-product-surface.sh target/release/yacli",
+    "python3 -m unittest ops/devcat-yandex/test_install_verified.py -v"
+  ],
+  "installer_unit_tests": {
+    "state": "PASS",
+    "passed": 7
+  },
+  "deployment_applied": false,
+  "live_acceptance": false,
+  "emails_sent": false,
+  "note": "Candidate build verification only; no deployment, live mailbox canary, or ChatGPT acceptance is claimed."
+}
