@@ -340,7 +340,7 @@ pub fn download_public_resource_with_progress(
 }
 
 pub fn fetch_disk_info(base_url: &str, access_token: &str) -> Result<DiskInfo> {
-    let client = build_http_client()?;
+    let client = build_read_http_client(base_url)?;
     let endpoint = disk_info_endpoint(base_url)?;
     let response = client
         .get(endpoint)
@@ -374,7 +374,7 @@ pub fn fetch_private_resource(
         ));
     }
 
-    let client = build_http_client()?;
+    let client = build_read_http_client(base_url)?;
     let endpoint = disk_resources_endpoint(base_url)?;
     let response = client
         .get(endpoint)
@@ -782,7 +782,7 @@ pub fn download_private_resource_with_progress(
         )));
     }
 
-    let client = build_http_client()?;
+    let client = build_read_http_client(base_url)?;
     let endpoint = disk_download_endpoint(base_url)?;
     let response = client
         .get(endpoint)
@@ -1013,6 +1013,34 @@ fn build_http_client() -> Result<Client> {
         .user_agent(format!("yacli/{}", env!("CARGO_PKG_VERSION")))
         .connect_timeout(Duration::from_secs(DEFAULT_HTTP_TIMEOUT_SECS))
         .timeout(Duration::from_secs(DEFAULT_HTTP_TIMEOUT_SECS))
+        .build()
+        .map_err(Into::into)
+}
+
+fn build_read_http_client(base_url: &str) -> Result<Client> {
+    let host = Url::parse(base_url)
+        .map_err(|err| YacliError::Config(format!("invalid Disk base URL: {err}")))?
+        .host_str()
+        .ok_or_else(|| YacliError::Config("Disk base URL has no host".into()))?
+        .to_owned();
+    // Use reqwest's bounded retry policy only for these metadata/ticket GETs.
+    // Its request timeout includes retries. Writes and transfer clients retain
+    // their existing policies; no upload or other mutation is replayed here.
+    let retry = reqwest::retry::for_host(host)
+        .no_budget()
+        .max_retries_per_request(1)
+        .classify_fn(|response| {
+            if response.method() == reqwest::Method::GET && response.error().is_some() {
+                response.retryable()
+            } else {
+                response.success()
+            }
+        });
+    Client::builder()
+        .user_agent(format!("yacli/{}", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(Duration::from_secs(4))
+        .timeout(Duration::from_secs(DEFAULT_HTTP_TIMEOUT_SECS))
+        .retry(retry)
         .build()
         .map_err(Into::into)
 }
@@ -1393,6 +1421,114 @@ mod tests {
         parse_transfer_timeout_env, review_private_upload,
     };
     use crate::error::YacliError;
+
+    fn disk_read_retry_fixture(
+        responses: Vec<Option<&'static str>>,
+    ) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for response in responses {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            if std::time::Instant::now() >= deadline {
+                                return requests;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                        Err(e) => panic!("accept failed: {e}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+                    .unwrap();
+                let mut headers = Vec::new();
+                while !headers.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).unwrap();
+                    headers.push(byte[0]);
+                }
+                requests.push(
+                    String::from_utf8(headers)
+                        .unwrap()
+                        .lines()
+                        .next()
+                        .unwrap()
+                        .to_owned(),
+                );
+                if let Some(response) = response {
+                    stream.write_all(response.as_bytes()).unwrap();
+                }
+            }
+            requests
+        });
+        (url, server)
+    }
+
+    #[test]
+    fn disk_read_client_recovers_one_dropped_get() {
+        let (url, server) = disk_read_retry_fixture(vec![
+            None,
+            Some("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"),
+        ]);
+        let response = super::build_read_http_client(&url)
+            .unwrap()
+            .get(&url)
+            .send()
+            .unwrap();
+        assert_eq!(response.text().unwrap(), "ok");
+        assert_eq!(server.join().unwrap(), ["GET / HTTP/1.1", "GET / HTTP/1.1"]);
+    }
+
+    #[test]
+    fn disk_read_client_stops_after_one_retry() {
+        let (url, server) = disk_read_retry_fixture(vec![
+            None,
+            None,
+            Some("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
+        ]);
+        assert!(
+            super::build_read_http_client(&url)
+                .unwrap()
+                .get(&url)
+                .send()
+                .is_err()
+        );
+        assert_eq!(server.join().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn disk_read_client_does_not_retry_post_or_provider_denial() {
+        let (url, server) = disk_read_retry_fixture(vec![
+            None,
+            Some("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
+        ]);
+        assert!(
+            super::build_read_http_client(&url)
+                .unwrap()
+                .post(&url)
+                .send()
+                .is_err()
+        );
+        assert_eq!(server.join().unwrap(), ["POST / HTTP/1.1"]);
+        let (url, server) = disk_read_retry_fixture(vec![
+            Some("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
+            None,
+        ]);
+        let response = super::build_read_http_client(&url)
+            .unwrap()
+            .get(&url)
+            .send()
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
 
     #[test]
     fn review_private_upload_reports_file_metadata_without_network() {

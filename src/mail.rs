@@ -1,8 +1,8 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -21,6 +21,107 @@ use crate::error::{Result, YacliError};
 const IMAP_TIMEOUT_SECS: u64 = 20;
 const SMTP_TIMEOUT_SECS: u64 = 20;
 const SMTP_SAFE_MESSAGE_BYTES: usize = 25 * 1024 * 1024;
+
+// TcpStream::connect has an OS-sized per-address wait (minutes on Linux).
+// Bound address failover independently of the subsequent TLS/socket I/O waits.
+fn connect_mail_tcp(host: &str, port: u16) -> std::io::Result<TcpStream> {
+    let started = Instant::now();
+    let key = (host.to_owned(), port);
+    let cached = mail_address_cache().lock().ok().and_then(|cache| {
+        cache
+            .get(&key)
+            .filter(|(at, _)| at.elapsed() < Duration::from_secs(30))
+            .map(|(_, addresses)| addresses.clone())
+    });
+    let addresses = if let Some(addresses) = cached {
+        addresses
+    } else {
+        let host = host.to_owned();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new().spawn(move || {
+            let result = (host.as_str(), port)
+                .to_socket_addrs()
+                .map(|a| a.collect::<Vec<_>>());
+            let _ = tx.send(result);
+        })?;
+        let addresses = rx.recv_timeout(Duration::from_secs(8)).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "mail DNS resolution timed out",
+            )
+        })??;
+        if !addresses.is_empty() {
+            if let Ok(mut cache) = mail_address_cache().lock() {
+                cache.insert(key.clone(), (Instant::now(), addresses.clone()));
+            }
+        }
+        addresses
+    };
+    let result = connect_mail_addresses(
+        addresses,
+        Duration::from_secs(12).saturating_sub(started.elapsed()),
+        |address, timeout| TcpStream::connect_timeout(&address, timeout),
+    );
+    if result.is_err() {
+        if let Ok(mut cache) = mail_address_cache().lock() {
+            cache.remove(&key);
+        }
+    }
+    result
+}
+
+type MailAddressCache =
+    std::sync::Mutex<std::collections::HashMap<(String, u16), (Instant, Vec<SocketAddr>)>>;
+
+fn mail_address_cache() -> &'static MailAddressCache {
+    static CACHE: std::sync::OnceLock<MailAddressCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+fn connect_mail_addresses<T>(
+    addresses: impl IntoIterator<Item = SocketAddr>,
+    budget: Duration,
+    mut connect: impl FnMut(SocketAddr, Duration) -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    let deadline = Instant::now() + budget;
+    let addresses = addresses.into_iter().collect::<Vec<_>>();
+    let mut last = std::io::Error::new(
+        std::io::ErrorKind::AddrNotAvailable,
+        "no mail server addresses",
+    );
+    // A failed SYN can be transient even when DNS returns only one usable IPv4
+    // address. Retry the connection, never authentication or message submission,
+    // once after failover, using the same absolute deadline.
+    for _ in 0..2 {
+        let mut transient = false;
+        for &address in &addresses {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "mail connection deadline exceeded",
+                ));
+            }
+            match connect(address, remaining.min(Duration::from_secs(2))) {
+                Ok(stream) => return Ok(stream),
+                Err(error) => {
+                    transient |= matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::Interrupted
+                    );
+                    last = error;
+                }
+            }
+        }
+        if !transient {
+            break;
+        }
+    }
+    Err(last)
+}
 
 pub fn smtp_safe_message_bytes() -> u64 {
     SMTP_SAFE_MESSAGE_BYTES as u64
@@ -130,6 +231,31 @@ pub struct SentMail {
     pub subject: String,
     pub message_id: String,
     pub body_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sent_copy: Option<SentCopyOutcome>,
+}
+
+#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
+pub struct SentCopyOutcome {
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mailbox: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl SentMail {
+    pub fn delivery_status(&self) -> &'static str {
+        match self.sent_copy.as_ref().map(|copy| copy.status.as_str()) {
+            Some("not_confirmed") => "partial",
+            _ => "completed",
+        }
+    }
+
+    pub fn delivery_warning(&self) -> Option<&'static str> {
+        (self.delivery_status() == "partial")
+            .then_some("Письмо отправлено; сохранение копии в Sent не подтверждено. SMTP повторно не запускался.")
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Eq, PartialEq)]
@@ -435,6 +561,33 @@ pub fn send_mail_message(
     auth: MailSessionAuth,
     request: MailSendRequest,
 ) -> Result<SentMail> {
+    send_mail_message_internal(smtp_host, smtp_port, None, auth, request)
+}
+
+pub fn send_mail_message_with_sent_copy(
+    smtp_host: &str,
+    smtp_port: u16,
+    imap_host: &str,
+    imap_port: u16,
+    auth: MailSessionAuth,
+    request: MailSendRequest,
+) -> Result<SentMail> {
+    send_mail_message_internal(
+        smtp_host,
+        smtp_port,
+        Some((imap_host, imap_port)),
+        auth,
+        request,
+    )
+}
+
+fn send_mail_message_internal(
+    smtp_host: &str,
+    smtp_port: u16,
+    sent_copy_server: Option<(&str, u16)>,
+    auth: MailSessionAuth,
+    request: MailSendRequest,
+) -> Result<SentMail> {
     let prepared = prepare_mail_submission(auth, request)?;
     ensure_smtp_safe_submission(&prepared)?;
     let mut session = SmtpSession::connect(smtp_host, smtp_port)?;
@@ -450,13 +603,75 @@ pub fn send_mail_message(
             app_password,
         } => session.authenticate_plain(account, app_password)?,
     }
-    session.send_message(
-        &prepared.envelope_from,
-        &prepared.envelope_recipients,
-        &prepared.message,
-    )?;
-    let _ = session.quit();
-    Ok(prepared.sent)
+    let sent_result = session
+        .send_message(
+            &prepared.envelope_from,
+            &prepared.envelope_recipients,
+            &prepared.message,
+        )
+        .map(|()| prepared.sent);
+    if sent_result.is_ok() {
+        let _ = session.quit();
+    }
+    if let Some((imap_host, imap_port)) = sent_copy_server {
+        finish_sent_copy(sent_result, || {
+            append_sent_copy(
+                imap_host,
+                imap_port,
+                prepared.auth.into_session_auth(),
+                &prepared.message,
+            )
+        })
+    } else {
+        sent_result
+    }
+}
+
+fn finish_sent_copy(
+    sent_result: Result<SentMail>,
+    append: impl FnOnce() -> Result<String>,
+) -> Result<SentMail> {
+    let mut sent = sent_result?;
+    sent.sent_copy = Some(match append() {
+        Ok(mailbox) => SentCopyOutcome {
+            status: "saved".to_string(),
+            mailbox: Some(mailbox),
+            error: None,
+        },
+        Err(error) => SentCopyOutcome {
+            status: "not_confirmed".to_string(),
+            mailbox: None,
+            error: Some(format!(
+                "{}: Sent copy could not be confirmed; provider details omitted",
+                error.code()
+            )),
+        },
+    });
+    Ok(sent)
+}
+
+fn append_sent_copy(
+    imap_host: &str,
+    imap_port: u16,
+    auth: MailSessionAuth,
+    message: &str,
+) -> Result<String> {
+    let mut session = open_authenticated_session(imap_host, imap_port, auth)?;
+    let mailbox = session
+        .list_folders()?
+        .into_iter()
+        .find(|folder| {
+            folder
+                .attributes
+                .iter()
+                .any(|attr| attr.eq_ignore_ascii_case("\\Sent"))
+        })
+        .ok_or_else(|| {
+            YacliError::Api("IMAP server did not advertise a \\Sent mailbox".to_string())
+        })?;
+    session.append_message(&mailbox.raw_name, message.as_bytes())?;
+    let _ = session.logout();
+    Ok(mailbox.name)
 }
 
 pub fn review_mail_submission(
@@ -562,9 +777,11 @@ pub fn reply_to_mail_message(
         mailbox_name,
         request.uid,
     )?;
-    let sent = send_mail_message(
+    let sent = send_mail_message_with_sent_copy(
         smtp_host,
         smtp_port,
+        imap_host,
+        imap_port,
         auth,
         MailSendRequest {
             to: vec![target.recipient.clone()],
@@ -619,9 +836,11 @@ pub fn forward_mail_message(
         normalized.intro_text.as_deref(),
         normalized.intro_html.as_deref(),
     );
-    let sent = send_mail_message(
+    let sent = send_mail_message_with_sent_copy(
         smtp_host,
         smtp_port,
+        imap_host,
+        imap_port,
         auth,
         MailSendRequest {
             to: normalized.to,
@@ -698,6 +917,27 @@ enum MailSmtpAuth {
     },
 }
 
+impl MailSmtpAuth {
+    fn into_session_auth(self) -> MailSessionAuth {
+        match self {
+            Self::OauthXoauth2 {
+                account,
+                access_token,
+            } => MailSessionAuth::OauthXoauth2 {
+                account,
+                access_token,
+            },
+            Self::AppPassword {
+                account,
+                app_password,
+            } => MailSessionAuth::AppPassword {
+                account,
+                app_password,
+            },
+        }
+    }
+}
+
 #[derive(Debug)]
 struct PreparedMailSubmission {
     auth: MailSmtpAuth,
@@ -724,8 +964,8 @@ struct SmtpResponse {
     lines: Vec<String>,
 }
 
-struct ImapSession {
-    reader: BufReader<native_tls::TlsStream<TcpStream>>,
+struct ImapSession<S = native_tls::TlsStream<TcpStream>> {
+    reader: BufReader<S>,
     next_tag: u32,
 }
 
@@ -738,7 +978,7 @@ enum TaggedErrorKind {
 impl SmtpSession<native_tls::TlsStream<TcpStream>> {
     fn connect(smtp_host: &str, smtp_port: u16) -> Result<Self> {
         let address = format!("{smtp_host}:{smtp_port}");
-        let tcp = TcpStream::connect(&address).map_err(|err| {
+        let tcp = connect_mail_tcp(smtp_host, smtp_port).map_err(|err| {
             YacliError::Network(format!("failed to connect to SMTP server {address}: {err}"))
         })?;
         tcp.set_read_timeout(Some(Duration::from_secs(SMTP_TIMEOUT_SECS)))?;
@@ -757,10 +997,10 @@ impl SmtpSession<native_tls::TlsStream<TcpStream>> {
     }
 }
 
-impl ImapSession {
+impl ImapSession<native_tls::TlsStream<TcpStream>> {
     fn connect(imap_host: &str, imap_port: u16) -> Result<Self> {
         let address = format!("{imap_host}:{imap_port}");
-        let tcp = TcpStream::connect(&address).map_err(|err| {
+        let tcp = connect_mail_tcp(imap_host, imap_port).map_err(|err| {
             YacliError::Network(format!("failed to connect to IMAP server {address}: {err}"))
         })?;
         tcp.set_read_timeout(Some(Duration::from_secs(IMAP_TIMEOUT_SECS)))?;
@@ -775,10 +1015,7 @@ impl ImapSession {
             ))
         })?;
 
-        let mut session = Self {
-            reader: BufReader::new(tls),
-            next_tag: 1,
-        };
+        let mut session = Self::from_stream(tls);
         let greeting = session.read_line()?;
         if !greeting.starts_with("* OK") {
             return Err(YacliError::Api(format!(
@@ -788,6 +1025,15 @@ impl ImapSession {
         }
 
         Ok(session)
+    }
+}
+
+impl<S: Read + Write> ImapSession<S> {
+    fn from_stream(stream: S) -> Self {
+        Self {
+            reader: BufReader::new(stream),
+            next_tag: 1,
+        }
     }
 
     fn authenticate_xoauth2(&mut self, account: &str, access_token: &str) -> Result<()> {
@@ -844,6 +1090,25 @@ impl ImapSession {
             "IMAP SELECT",
             TaggedErrorKind::Api,
         )
+    }
+
+    fn append_message(&mut self, mailbox_name: &str, message: &[u8]) -> Result<()> {
+        let tag = self.next_tag();
+        self.write_line(&format!(
+            "{tag} APPEND {} {{{}}}",
+            quote_imap_string(mailbox_name),
+            message.len()
+        ))?;
+        let continuation = self.read_line()?;
+        if !continuation.starts_with('+') {
+            return Err(YacliError::Api(format!(
+                "IMAP APPEND literal was not accepted: {continuation}"
+            )));
+        }
+        self.write_bytes(message)?;
+        self.write_line("")?;
+        let tagged = self.read_line()?;
+        parse_tagged_status(&tag, &tagged, "IMAP APPEND", TaggedErrorKind::Api)
     }
 
     fn search_all_uids(&mut self) -> Result<Vec<u64>> {
@@ -1434,6 +1699,7 @@ fn prepare_mail_submission(
             subject,
             message_id,
             body_kind,
+            sent_copy: None,
         },
     })
 }
@@ -2842,12 +3108,13 @@ struct ExportedBytes {
 #[cfg(test)]
 mod tests {
     use super::{
-        FetchMetadata, MailAttachmentExportRequest, MailAttachmentPart, MailAttachmentPayload,
-        MailAttachmentSelector, MailAttachmentSummary, MailMessage, MailSendRequest,
-        MailSessionAuth, MailThreadHeaders, OutgoingMessage, SMTP_SAFE_MESSAGE_BYTES, SmtpSession,
-        build_forward_body, build_message_summary, build_outgoing_message, build_read_message,
-        build_reply_target, build_xoauth2_payload, decode_modified_utf7, encode_modified_utf7,
-        export_attachment_from_message, extract_message_content, inspect_invite_from_message,
+        FetchMetadata, ImapSession, MailAttachmentExportRequest, MailAttachmentPart,
+        MailAttachmentPayload, MailAttachmentSelector, MailAttachmentSummary, MailMessage,
+        MailSendRequest, MailSessionAuth, MailSmtpAuth, MailThreadHeaders, OutgoingMessage,
+        SMTP_SAFE_MESSAGE_BYTES, SentMail, SmtpSession, build_forward_body, build_message_summary,
+        build_outgoing_message, build_read_message, build_reply_target, build_xoauth2_payload,
+        decode_modified_utf7, encode_modified_utf7, export_attachment_from_message,
+        extract_message_content, finish_sent_copy, inspect_invite_from_message,
         load_mail_attachments, normalize_forward_subject, normalize_reply_subject,
         normalize_search_query, parse_fetch_metadata, parse_imap_token, parse_list_line,
         parse_search_uids, prepare_mail_submission, quote_imap_string, review_mail_submission,
@@ -2860,6 +3127,126 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
+
+    #[test]
+    fn mail_connect_retries_transient_ipv4_after_unreachable_ipv6() {
+        let v4: std::net::SocketAddr = "127.0.0.1:993".parse().unwrap();
+        let v6: std::net::SocketAddr = "[::1]:993".parse().unwrap();
+        let mut attempts = Vec::new();
+        let connected = super::connect_mail_addresses(
+            [v4, v6],
+            std::time::Duration::from_secs(1),
+            |address, _| {
+                attempts.push(address);
+                match attempts.len() {
+                    1 => Err(std::io::Error::from(std::io::ErrorKind::TimedOut)),
+                    2 => Err(std::io::Error::from(std::io::ErrorKind::NetworkUnreachable)),
+                    _ => Ok(address),
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(attempts, [v4, v6, v4]);
+        assert_eq!(connected, v4);
+    }
+
+    #[test]
+    fn mail_connect_does_not_retry_permanent_failures() {
+        let address = "127.0.0.1:993".parse().unwrap();
+        let mut attempts = 0;
+        let result = super::connect_mail_addresses::<()>(
+            [address],
+            std::time::Duration::from_secs(1),
+            |_, _| {
+                attempts += 1;
+                Err(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn mail_connect_falls_back_after_a_stalled_address() {
+        use std::net::{SocketAddr, TcpListener, TcpStream};
+        use std::time::Duration;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let good = listener.local_addr().unwrap();
+        let stalled: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let mut attempts = 0;
+        let stream = super::connect_mail_addresses(
+            [stalled, good],
+            Duration::from_secs(1),
+            |address, timeout| {
+                attempts += 1;
+                assert!(timeout <= Duration::from_secs(1));
+                if address == stalled {
+                    std::thread::sleep(Duration::from_millis(10));
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "simulated blackhole",
+                    ));
+                }
+                TcpStream::connect_timeout(&address, timeout)
+            },
+        )
+        .unwrap();
+        assert_eq!(attempts, 2);
+        assert_eq!(stream.peer_addr().unwrap(), good);
+        assert!(listener.accept().is_ok());
+    }
+
+    #[test]
+    fn mail_connect_enforces_total_budget_before_trying_more_addresses() {
+        use std::net::SocketAddr;
+        use std::time::{Duration, Instant};
+        let address: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let started = Instant::now();
+        let mut attempts = 0;
+        let result = super::connect_mail_addresses::<()>(
+            [address; 20],
+            Duration::from_millis(30),
+            |_, timeout| {
+                attempts += 1;
+                std::thread::sleep(timeout);
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "simulated blackhole",
+                ))
+            },
+        );
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(attempts, 1);
+        assert!(started.elapsed() < Duration::from_millis(300));
+    }
+
+    #[test]
+    fn mail_dns_cache_expires_and_is_evicted_after_connection_failure() {
+        use std::net::{SocketAddr, TcpListener};
+        use std::time::{Duration, Instant};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let key = ("localhost".to_owned(), port);
+        let stale: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        super::mail_address_cache().lock().unwrap().insert(
+            key.clone(),
+            (Instant::now() - Duration::from_secs(31), vec![stale]),
+        );
+        let stream = super::connect_mail_tcp("localhost", port).unwrap();
+        let cached = super::mail_address_cache().lock().unwrap()[&key].1.clone();
+        assert!(cached.iter().all(|a| a.port() == port));
+        let (accepted, _) = listener.accept().unwrap();
+        drop(accepted);
+        drop(stream);
+        drop(listener);
+        assert!(super::connect_mail_tcp("localhost", port).is_err());
+        assert!(
+            !super::mail_address_cache()
+                .lock()
+                .unwrap()
+                .contains_key(&key)
+        );
+    }
 
     #[derive(Clone)]
     struct FakeStream {
@@ -2954,6 +3341,96 @@ mod tests {
     fn quote_imap_string_escapes_quotes_and_backslashes() {
         let quoted = quote_imap_string(r#"my"user\name"#);
         assert_eq!(quoted, r#""my\"user\\name""#);
+    }
+
+    #[test]
+    fn imap_append_sends_rfc822_literal_once_to_utf7_sent_mailbox() {
+        let fake = FakeStream::new("+ continue\r\nA0001 OK appended\r\n");
+        let observer = fake.clone();
+        let mut session = ImapSession::from_stream(fake);
+        let message = b"Subject: hello\r\n\r\nbody";
+
+        session
+            .append_message("&BB4EQgQ,BEAEMAQyBDsENQQ9BD0ESwQ1-", message)
+            .expect("append");
+
+        let writes = observer.written();
+        assert!(writes.contains("A0001 APPEND \"&BB4EQgQ,BEAEMAQyBDsENQQ9BD0ESwQ1-\" {22}\r\n"));
+        assert!(writes.ends_with("Subject: hello\r\n\r\nbody\r\n"));
+        assert_eq!(writes.matches("APPEND ").count(), 1);
+    }
+
+    #[test]
+    fn imap_append_rejection_is_reported_without_retry() {
+        let fake = FakeStream::new("+ continue\r\nA0001 NO [TRYCREATE] missing mailbox\r\n");
+        let observer = fake.clone();
+        let mut session = ImapSession::from_stream(fake);
+        let error = session
+            .append_message("Sent", b"Subject: hello\r\n\r\nbody")
+            .expect_err("server rejection");
+
+        assert!(error.to_string().contains("IMAP APPEND failed"));
+        assert_eq!(observer.written().matches("APPEND ").count(), 1);
+    }
+
+    #[test]
+    fn sent_copy_failure_is_reported_as_partial_delivery() {
+        let sent = SentMail {
+            from: "sender@example.test".to_string(),
+            to: vec!["sender@example.test".to_string()],
+            cc: Vec::new(),
+            bcc_count: 0,
+            subject: "canary".to_string(),
+            message_id: "m-1@example.test".to_string(),
+            body_kind: "text".to_string(),
+            sent_copy: None,
+        };
+        let mut append_attempts = 0;
+        let sent = finish_sent_copy(Ok(sent), || {
+            append_attempts += 1;
+            Err(crate::error::YacliError::Api("APPEND rejected".to_string()))
+        })
+        .expect("SMTP accepted; append failure is partial success");
+
+        assert_eq!(sent.delivery_status(), "partial");
+        assert_eq!(append_attempts, 1);
+        assert!(
+            sent.delivery_warning()
+                .unwrap()
+                .contains("SMTP повторно не запускался")
+        );
+    }
+
+    #[test]
+    fn smtp_failure_never_attempts_sent_copy_append() {
+        let mut append_attempts = 0;
+        let result = finish_sent_copy(
+            Err(crate::error::YacliError::Network(
+                "SMTP DATA failed".to_string(),
+            )),
+            || {
+                append_attempts += 1;
+                Ok("Sent".to_string())
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(append_attempts, 0);
+    }
+
+    #[test]
+    fn append_authentication_retains_the_selected_mailbox_identity() {
+        let auth = MailSmtpAuth::OauthXoauth2 {
+            account: "ykkareliadom@yandex.ru".to_string(),
+            access_token: "test-token".to_string(),
+        }
+        .into_session_auth();
+
+        assert!(matches!(
+            auth,
+            MailSessionAuth::OauthXoauth2 { account, access_token }
+                if account == "ykkareliadom@yandex.ru" && access_token == "test-token"
+        ));
     }
 
     #[test]

@@ -23,6 +23,8 @@ pub struct PendingOauthSession {
     pub account: String,
     pub services: Vec<String>,
     pub client_id: String,
+    #[serde(default)]
+    pub scopes: Vec<String>,
     pub created_at_epoch_secs: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub login_hint: Option<String>,
@@ -52,6 +54,7 @@ impl PendingOauthSession {
                 .map(|service| service.as_str().to_string())
                 .collect(),
             client_id: session.client_id.clone(),
+            scopes: desired_scopes(services),
             created_at_epoch_secs: unix_timestamp_now(),
             login_hint,
             authorization: PendingAuthorizationRequest::from_request(session.request),
@@ -78,6 +81,7 @@ impl PendingOauthSession {
                     .iter()
                     .map(|service| service.as_str().to_string())
                     .collect::<Vec<_>>()
+            && self.scopes == desired_scopes(services)
     }
 
     fn matches_service_names(&self, account: &str, client_id: &str) -> bool {
@@ -160,6 +164,18 @@ impl PendingOauthSessionStore {
     }
 }
 
+fn desired_scopes(services: &[OauthService]) -> Vec<String> {
+    let mut scopes = Vec::new();
+    for service in services {
+        for scope in service.scopes() {
+            if !scopes.iter().any(|existing| existing == scope) {
+                scopes.push((*scope).to_string());
+            }
+        }
+    }
+    scopes
+}
+
 const fn default_version() -> u32 {
     1
 }
@@ -199,6 +215,7 @@ mod tests {
             account: account.to_string(),
             services: vec!["mail".to_string(), "disk".to_string()],
             client_id: "client-123".to_string(),
+            scopes: desired_scopes(&[OauthService::Mail, OauthService::Disk]),
             created_at_epoch_secs: unix_timestamp_now(),
             login_hint: Some("me@yandex.ru".to_string()),
             authorization: PendingAuthorizationRequest {
@@ -236,6 +253,33 @@ mod tests {
             "https://example.test/authorize"
         );
         assert_eq!(saved.code_verifier, "verifier-123");
+    }
+
+    #[test]
+    fn store_does_not_reuse_session_with_different_scopes() {
+        let _guard = OAUTH_SESSIONS_TEST_LOCK
+            .lock()
+            .expect("oauth sessions test lock");
+        let temp = tempdir().expect("tempdir");
+        let path = temp.path().join("oauth_sessions.toml");
+
+        let mut stale = sample_session("mock");
+        stale.scopes = vec!["mail:imap_ro".to_string()];
+
+        let mut store = PendingOauthSessionStore::load_from_path(&path).expect("load");
+        store.replace_matching(stale);
+        store.save_to_path(&path).expect("save");
+
+        let store = PendingOauthSessionStore::load_from_path(&path).expect("reload");
+        assert!(
+            store
+                .get_matching(
+                    "mock",
+                    &[OauthService::Mail, OauthService::Disk],
+                    "client-123"
+                )
+                .is_none()
+        );
     }
 
     #[test]

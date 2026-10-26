@@ -1,0 +1,120 @@
+{
+  "state": "PASS",
+  "independent_processes": 4,
+  "reports": [
+    {
+      "date": "2026-10-22",
+      "route": "isolated candidate loopback",
+      "cases": [
+        {
+          "check": "catalog",
+          "count": 11,
+          "status": "PASS"
+        },
+        {
+          "account": "dedts",
+          "tool": "mail.list",
+          "phase": "first provider request after cold start",
+          "status": "PASS",
+          "count": 1,
+          "seconds": 12.812
+        },
+        {
+          "account": "dedts",
+          "tool": "mail.read",
+          "phase": "read cold-listed UID",
+          "status": "PASS",
+          "seconds": 10.77
+        }
+      ],
+      "ui_acceptance": false,
+      "binary_sha256": "b18d8690a1ec5f03f2dd3f90647560725c1524f229e2c7a154c83e7fad2b362e",
+      "cold_case": "dedts-list",
+      "candidate_stopped": true,
+      "state": "PASS"
+    },
+    {
+      "date": "2026-10-22",
+      "route": "isolated candidate loopback",
+      "cases": [
+        {
+          "check": "catalog",
+          "count": 11,
+          "status": "PASS"
+        },
+        {
+          "account": "dvabobra2014",
+          "tool": "mail.search",
+          "phase": "first provider request after cold start",
+          "status": "PASS",
+          "count": 1,
+          "seconds": 11.405
+        },
+        {
+          "account": "dvabobra2014",
+          "tool": "mail.read",
+          "phase": "read cold-search UID",
+          "status": "PASS",
+          "seconds": 10.738
+        }
+      ],
+      "ui_acceptance": false,
+      "binary_sha256": "b18d8690a1ec5f03f2dd3f90647560725c1524f229e2c7a154c83e7fad2b362e",
+      "cold_case": "dvabobra-search",
+      "candidate_stopped": true,
+      "state": "PASS"
+    },
+    {
+      "date": "2026-10-22",
+      "route": "isolated candidate loopback",
+      "cases": [
+        {
+          "check": "catalog",
+          "count": 11,
+          "status": "PASS"
+        },
+        {
+          "account": "dedts",
+          "tool": "disk.list",
+          "phase": "first provider request after cold start",
+          "status": "PASS",
+          "seconds": 9.795
+        }
+      ],
+      "ui_acceptance": false,
+      "binary_sha256": "b18d8690a1ec5f03f2dd3f90647560725c1524f229e2c7a154c83e7fad2b362e",
+      "cold_case": "disk-list",
+      "candidate_stopped": true,
+      "state": "PASS"
+    },
+    {
+      "date": "2026-10-22",
+      "route": "isolated candidate loopback",
+      "cases": [
+        {
+          "check": "catalog",
+          "count": 11,
+          "status": "PASS"
+        },
+        {
+          "account": "dedts",
+          "tool": "disk.read",
+          "phase": "first provider request after cold start",
+          "status": "PASS",
+          "seconds": 11.231
+        },
+        {
+          "check": "cold upload/read checksum",
+          "status": "PASS",
+          "bytes": 64,
+          "sha256": "567c5857734748376f22492c59322ca1376057f09c1b4683c7d60da1b9643304"
+        }
+      ],
+      "ui_acceptance": false,
+      "binary_sha256": "b18d8690a1ec5f03f2dd3f90647560725c1524f229e2c7a154c83e7fad2b362e",
+      "cold_case": "disk-read",
+      "candidate_stopped": true,
+      "state": "PASS"
+    }
+  ]
+}

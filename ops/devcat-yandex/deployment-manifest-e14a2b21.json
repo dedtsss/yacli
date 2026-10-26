@@ -1,0 +1,9 @@
+{
+  "source_head": "e14a2b21c532f5314392e35843aa58aa5ffecc18",
+  "artifact": "target/devcat-delivery/yacli-e14a2b21c532f5314392e35843aa58aa5ffecc18",
+  "binary_sha256": "af14969c2b526e4d5b15dcd761f0e192a78eaff34f001761a40e8db88061a13e",
+  "verification_report": "docs/devcat-candidate-verification-e14a2b21.json",
+  "verification_sha256": "71c01d23e7b83e9798ab05e219405e33bc02033a1464406d5285dd40cfec10a8",
+  "expected_previous_target": "/opt/yacli-devcat/releases/e1121ee1a38246a5ada8dc9e036b7489bcca6183",
+  "expected_previous_sha256": "b18d8690a1ec5f03f2dd3f90647560725c1524f229e2c7a154c83e7fad2b362e"
+}

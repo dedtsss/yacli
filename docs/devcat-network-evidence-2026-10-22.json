@@ -1,0 +1,146 @@
+{
+  "first_deployment": "devcat-first-deployment-2026-10-22.json",
+  "replay": {
+    "date": "2026-10-22",
+    "route": "isolated candidate loopback",
+    "cases": [
+      {
+        "tool": "mail.list",
+        "status": "PASS",
+        "seconds": 17.785
+      },
+      {
+        "tool": "disk.list",
+        "status": "PASS",
+        "seconds": 10.336
+      },
+      {
+        "tool": "disk.read",
+        "status": "BLOCKED",
+        "seconds": 30.684,
+        "error": "Network error: error sending request for url (<url-redacted>)"
+      }
+    ],
+    "ui_acceptance": false,
+    "binary_sha256": "a0654c1958ab1d56e6d471d1d07c35f80053a82093ce999ac098109e7b9b7a37",
+    "candidate_stopped": true,
+    "state": "BLOCKED"
+  },
+  "imap_transport_samples": [
+    {
+      "sample": 1,
+      "family": "IPv4",
+      "dns_seconds": 0.004,
+      "tcp_seconds": 0.044,
+      "status": "PASS",
+      "error": null
+    },
+    {
+      "sample": 1,
+      "family": "IPv6",
+      "dns_seconds": 0.004,
+      "tcp_seconds": 0.0,
+      "status": "FAIL",
+      "error": "OSError: [Errno 101] Network is unreachable"
+    },
+    {
+      "sample": 2,
+      "family": "IPv4",
+      "dns_seconds": 0.001,
+      "tcp_seconds": 0.043,
+      "status": "PASS",
+      "error": null
+    },
+    {
+      "sample": 2,
+      "family": "IPv6",
+      "dns_seconds": 0.001,
+      "tcp_seconds": 0.0,
+      "status": "FAIL",
+      "error": "OSError: [Errno 101] Network is unreachable"
+    },
+    {
+      "sample": 3,
+      "family": "IPv4",
+      "dns_seconds": 0.001,
+      "tcp_seconds": 0.036,
+      "status": "PASS",
+      "error": null
+    },
+    {
+      "sample": 3,
+      "family": "IPv6",
+      "dns_seconds": 0.001,
+      "tcp_seconds": 0.0,
+      "status": "FAIL",
+      "error": "OSError: [Errno 101] Network is unreachable"
+    },
+    {
+      "sample": 4,
+      "family": "IPv4",
+      "dns_seconds": 0.001,
+      "tcp_seconds": 0.041,
+      "status": "PASS",
+      "error": null
+    },
+    {
+      "sample": 4,
+      "family": "IPv6",
+      "dns_seconds": 0.001,
+      "tcp_seconds": 0.0,
+      "status": "FAIL",
+      "error": "OSError: [Errno 101] Network is unreachable"
+    },
+    {
+      "sample": 5,
+      "family": "IPv4",
+      "dns_seconds": 0.001,
+      "tcp_seconds": 0.041,
+      "status": "PASS",
+      "error": null
+    },
+    {
+      "sample": 5,
+      "family": "IPv6",
+      "dns_seconds": 0.001,
+      "tcp_seconds": 0.0,
+      "status": "FAIL",
+      "error": "OSError: [Errno 101] Network is unreachable"
+    },
+    {
+      "sample": 6,
+      "family": "IPv4",
+      "dns_seconds": 0.001,
+      "tcp_seconds": 0.04,
+      "status": "PASS",
+      "error": null
+    },
+    {
+      "sample": 6,
+      "family": "IPv6",
+      "dns_seconds": 0.001,
+      "tcp_seconds": 0.0,
+      "status": "FAIL",
+      "error": "OSError: [Errno 101] Network is unreachable"
+    }
+  ],
+  "trace_summary": {
+    "captured_syscalls": [
+      "connect",
+      "getsockopt",
+      "poll",
+      "ppoll"
+    ],
+    "disk_api_dns": "Immediate replies through local stub before the failing request; no DNS stall on this failing connect.",
+    "failed_ipv4_tcp_connect": {
+      "host": "cloud-api.yandex.net",
+      "port": 443,
+      "started": "22:51:07.621160",
+      "result": "EINPROGRESS; no completion before 20-second request deadline"
+    },
+    "ipv6_fallback": "ENETUNREACH at 22:51:07.923191",
+    "request_deadline": "22:51:27.618487",
+    "mail_replay": "PASS after a separate 5-second DNS delay; original two Mail failures did not retain stage details."
+  },
+  "scope": "No credentials, headers, payload buffers, emails or signed URLs were captured in the syscall trace. No sends, uploads, or production changes."
+}
