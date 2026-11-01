@@ -635,8 +635,9 @@ credential_ref = "vault:DEVCAT_TEST_DISK"
         .match_header("authorization", "OAuth disk-token")
         .match_query(Matcher::AllOf(vec![Matcher::UrlEncoded("path".into(), "disk:/safe".into()), Matcher::UrlEncoded("limit".into(), "100".into()), Matcher::UrlEncoded("offset".into(), "0".into())]))
         .with_status(200).with_header("content-type", "application/json")
-        .with_body(r#"{"name":"safe","path":"disk:/safe","type":"dir","_embedded":{"limit":100,"offset":0,"total":1,"items":[{"name":"note.txt","path":"disk:/safe/note.txt","type":"file","size":4}]}}"#).create();
-    let metadata = r#"{"name":"note.txt","path":"disk:/safe/note.txt","type":"file","size":4}"#;
+        .with_body(r#"{"name":"safe","path":"disk:/safe","type":"dir","_embedded":{"limit":100,"offset":0,"total":1,"items":[{"name":"note.txt","path":"disk:/safe/note.txt","type":"file","size":2097152}]}}"#).create();
+    let body = vec![b'x'; 2 * 1024 * 1024];
+    let metadata = r#"{"name":"note.txt","path":"disk:/safe/note.txt","type":"file","size":2097152}"#;
     let _read_meta = provider
         .mock("GET", "/v1/disk/resources")
         .match_query(Matcher::AllOf(vec![
@@ -675,7 +676,7 @@ credential_ref = "vault:DEVCAT_TEST_DISK"
     let _body = provider
         .mock("GET", "/download/note.txt")
         .with_status(200)
-        .with_body("test")
+        .with_body(body.as_slice())
         .create();
     let server = TestHttpServer::spawn_with_envs(&[
         ("PATH", &path),
@@ -713,7 +714,8 @@ credential_ref = "vault:DEVCAT_TEST_DISK"
         "disk:/safe"
     );
     let read = call(3, "yacli.disk.read", "disk:/safe/note.txt");
-    assert_eq!(read["result"]["structuredContent"]["data"], "dGVzdA==");
+    assert_eq!(read["result"]["structuredContent"]["bytes"], 2 * 1024 * 1024);
+    assert_eq!(read["result"]["structuredContent"]["data"].as_str().unwrap().len(), 2_796_204);
     let denied = call(4, "yacli.disk.mkdir", "disk:/safe/new");
     assert!(denied["error"].is_object() || denied["result"]["isError"].as_bool().unwrap_or(false));
 }
