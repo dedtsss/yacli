@@ -1640,7 +1640,7 @@ fn tool_definitions(ui_enabled: bool, roots_enabled: bool) -> Result<Vec<Value>>
         ),
         tool(
             "yacli.disk.read",
-            "Read a Yandex Disk file up to 1 MiB as base64.",
+            "Read a Yandex Disk file up to 4 MiB as base64.",
             json!({
                 "type": "object",
                 "properties": { "account": {"type":"string"}, "path": {"type":"string"} },
@@ -3275,9 +3275,9 @@ fn disk_read(account: Option<&str>, path: &str) -> Result<Value> {
             offset: 0,
         },
     )?;
-    if resource.resource_type != "file" || resource.size.unwrap_or(u64::MAX) > 1024 * 1024 {
+    if resource.resource_type != "file" || resource.size.unwrap_or(u64::MAX) > 4 * 1024 * 1024 {
         return Err(YacliError::Validation(
-            "Disk read requires a file of at most 1 MiB".into(),
+            "Disk read requires a file of at most 4 MiB".into(),
         ));
     }
     let temp = tempfile::NamedTempFile::new()?;
@@ -3290,8 +3290,8 @@ fn disk_read(account: Option<&str>, path: &str) -> Result<Value> {
             force: true,
         },
     )?;
-    if download.bytes_written > 1024 * 1024 {
-        return Err(YacliError::Validation("Disk read exceeded 1 MiB".into()));
+    if download.bytes_written > 4 * 1024 * 1024 {
+        return Err(YacliError::Validation("Disk read exceeded 4 MiB".into()));
     }
     let bytes = std::fs::read(temp.path())?;
     Ok(json!({"account": resolved_account, "path": path,

@@ -18,7 +18,7 @@ If the granted OAuth scopes change, repeat the matching OAuth login. MCP capabil
 
 Risky tools require two calls: first `dry_run=true`; inspect the review output and retain `review_sha256`; then repeat the identical arguments with `dry_run=false` and the returned `review_sha256`. The digest also binds local source file bytes, expires after five minutes, and is consumed once. The service emits content-free JSON mutation audit records to the systemd journal (`journalctl -u yacli-devcat`). The general yacli activity store is disabled in DevCat mode. Restrict journal access to operators.
 
-`yacli.disk.read` returns at most 1 MiB as base64; larger files need a separately reviewed transfer workflow. Mail read/search and Disk list/read do not require mutation capabilities. Calendar, dashboard, activity undo, prompts, resources, and other broad upstream MCP surfaces are disabled by the DevCat profile.
+`yacli.disk.read` returns at most 4 MiB as base64 (about 5.3 MiB of response data) to keep MCP payloads bounded; larger files need a separately reviewed transfer workflow. Mail read/search and Disk list/read do not require mutation capabilities. Calendar, dashboard, activity undo, prompts, resources, and other broad upstream MCP surfaces are disabled by the DevCat profile.
 
 ## Update and rollback
 
