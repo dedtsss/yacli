@@ -3,6 +3,7 @@ use std::convert::Infallible;
 use std::hash::{Hash, Hasher};
 use std::io::Read;
 use std::io::{self, BufRead, BufReader, Write};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -165,6 +166,7 @@ struct NativeMailFile {
     file_name: Option<String>,
 }
 
+#[derive(Debug)]
 struct DownloadedNativeMailFile {
     file_id: String,
     filename: String,
@@ -2868,12 +2870,18 @@ fn validate_native_attachment_url(raw: &str) -> Result<Url> {
 
 fn download_native_mail_files(files: &[NativeMailFile]) -> Result<Vec<DownloadedNativeMailFile>> {
     const MAX_FILE_BYTES: usize = 10 * 1024 * 1024;
-    let client = reqwest::blocking::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|_| YacliError::Network("native attachment client unavailable".into()))?;
     download_native_mail_files_with(files, |url| {
+        let host = url.host_str().ok_or_else(|| {
+            YacliError::Validation("native attachment URL must include a host".into())
+        })?;
+        let addresses = resolve_public_download_addresses(url)?;
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(30))
+            .resolve_to_addrs(host, &addresses)
+            .build()
+            .map_err(|_| YacliError::Network("native attachment client unavailable".into()))?;
         let response = client
             .get(url.clone())
             .send()
@@ -2885,6 +2893,75 @@ fn download_native_mail_files(files: &[NativeMailFile]) -> Result<Vec<Downloaded
         }
         read_limited_native_content(response, MAX_FILE_BYTES)
     })
+}
+
+fn resolve_public_download_addresses(url: &Url) -> Result<Vec<SocketAddr>> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| YacliError::Validation("native attachment URL must include a host".into()))?
+        .to_string();
+    let port = url.port_or_known_default().unwrap_or(443);
+    let addresses = if let Ok(ip) = host.parse::<IpAddr>() {
+        vec![SocketAddr::new(ip, port)]
+    } else {
+        let (sender, receiver) = mpsc::channel();
+        thread::Builder::new()
+            .name("native-file-dns".into())
+            .spawn(move || {
+                let result = (host.as_str(), port)
+                    .to_socket_addrs()
+                    .map(|addresses| addresses.collect::<Vec<_>>());
+                let _ = sender.send(result);
+            })
+            .map_err(|_| YacliError::Network("native attachment DNS lookup failed".into()))?;
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(8))
+            .map_err(|_| YacliError::Network("native attachment DNS lookup timed out".into()))?
+            .map_err(|_| YacliError::Network("native attachment DNS lookup failed".into()))?
+    };
+    if addresses.is_empty() || addresses.iter().any(|address| !is_public_ip(address.ip())) {
+        return Err(YacliError::Validation(
+            "native attachment host resolves to a non-public address".into(),
+        ));
+    }
+    Ok(addresses)
+}
+
+fn is_public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let value = u32::from(ip);
+            let in_cidr = |network: u32, prefix: u32| {
+                let mask = u32::MAX << (32 - prefix);
+                value & mask == network & mask
+            };
+            !(in_cidr(0x00000000, 8)
+                || in_cidr(0x0a000000, 8)
+                || in_cidr(0x64400000, 10)
+                || in_cidr(0x7f000000, 8)
+                || in_cidr(0xa9fe0000, 16)
+                || in_cidr(0xac100000, 12)
+                || in_cidr(0xc0000000, 24)
+                || in_cidr(0xc0000200, 24)
+                || in_cidr(0xc0586300, 24)
+                || in_cidr(0xc0a80000, 16)
+                || in_cidr(0xc6120000, 15)
+                || in_cidr(0xc6336400, 24)
+                || in_cidr(0xcb007100, 24)
+                || in_cidr(0xe0000000, 4)
+                || in_cidr(0xf0000000, 4))
+        }
+        IpAddr::V6(ip) => {
+            if let Some(mapped) = ip.to_ipv4_mapped() {
+                return is_public_ip(IpAddr::V4(mapped));
+            }
+            let segments = ip.segments();
+            (segments[0] & 0xe000) == 0x2000
+                && !(segments[0] == 0x2001 && segments[1] <= 0x01ff)
+                && segments[0] != 0x2002
+                && !(segments[0] == 0x3fff && segments[1] <= 0x0fff)
+        }
+    }
 }
 
 fn download_native_mail_files_with(
@@ -4995,9 +5072,10 @@ fn canonical_base_url(server_url: &str) -> Result<String> {
 #[cfg(test)]
 mod native_attachment_schema_tests {
     use super::{
-        Digest, NativeMailFile, Sha256, download_native_mail_files,
-        download_native_mail_files_with, native_mime_type, read_limited_native_content,
-        safe_native_filename, tool_definitions, validate_native_attachment_url,
+        Digest, NativeMailFile, Sha256, Url, download_native_mail_files,
+        download_native_mail_files_with, is_public_ip, native_mime_type,
+        read_limited_native_content, resolve_public_download_addresses, safe_native_filename,
+        tool_definitions, validate_native_attachment_url,
     };
     use serde_json::json;
 
@@ -5037,6 +5115,16 @@ mod native_attachment_schema_tests {
                 .scheme(),
             "https"
         );
+        assert!(
+            resolve_public_download_addresses(&Url::parse("https://127.0.0.1/secret").unwrap())
+                .is_err()
+        );
+        assert!(!is_public_ip("10.1.2.3".parse().unwrap()));
+        assert!(!is_public_ip("fd00::1".parse().unwrap()));
+        assert!(!is_public_ip("3fff::1".parse().unwrap()));
+        assert!(!is_public_ip("198.19.0.1".parse().unwrap()));
+        assert!(is_public_ip("8.8.8.8".parse().unwrap()));
+        assert!(is_public_ip("2606:4700:4700::1111".parse().unwrap()));
     }
 
     #[test]
@@ -5138,5 +5226,38 @@ mod native_attachment_schema_tests {
         });
         assert!(result.is_err());
         assert_eq!(fetches, 3);
+    }
+
+    #[test]
+    fn native_download_enforces_per_file_limit() {
+        let file = NativeMailFile {
+            download_url: "https://mock.invalid/oversized.pdf".into(),
+            file_id: "synthetic-large".into(),
+            mime_type: None,
+            file_name: None,
+        };
+        let result =
+            download_native_mail_files_with(&[file], |_| Ok(vec![0u8; 10 * 1024 * 1024 + 1]));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn native_download_errors_do_not_echo_url_or_file_id() {
+        let file = NativeMailFile {
+            download_url: "https://mock.invalid/path?token=secret-url-token".into(),
+            file_id: "secret-file-id".into(),
+            mime_type: None,
+            file_name: None,
+        };
+        let error = download_native_mail_files_with(&[file], |_| {
+            Err(crate::error::YacliError::Network(
+                "native attachment download failed".into(),
+            ))
+        })
+        .expect_err("mock download failure");
+        let message = error.to_string();
+        assert!(!message.contains("secret-url-token"));
+        assert!(!message.contains("secret-file-id"));
+        assert!(!message.contains("mock.invalid"));
     }
 }

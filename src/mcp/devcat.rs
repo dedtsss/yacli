@@ -249,15 +249,20 @@ pub fn check_tool(name: &str, arguments: &serde_json::Value) -> Result<()> {
             .and_then(serde_json::Value::as_bool)
             != Some(true)
     {
-        let supplied = arguments
-            .get("review_sha256")
-            .and_then(serde_json::Value::as_str);
-        let expected = review_hash(name, arguments)?;
-        if supplied != Some(expected.as_str()) || !consume_review(&expected) {
-            return Err(YacliError::Auth(format!(
-                "{name} requires review_sha256 from its dry run"
-            )));
-        }
+        check_review_binding(name, arguments)?;
+    }
+    Ok(())
+}
+
+fn check_review_binding(name: &str, arguments: &serde_json::Value) -> Result<()> {
+    let supplied = arguments
+        .get("review_sha256")
+        .and_then(serde_json::Value::as_str);
+    let expected = review_hash(name, arguments)?;
+    if supplied != Some(expected.as_str()) || !consume_review(&expected) {
+        return Err(YacliError::Auth(format!(
+            "{name} requires review_sha256 from its dry run"
+        )));
     }
     Ok(())
 }
@@ -493,6 +498,24 @@ mod tests {
             review_hash("yacli.mail.send", &one).unwrap(),
             review_hash("yacli.mail.send", &changed_content).unwrap()
         );
+    }
+
+    #[test]
+    fn changed_native_file_after_preview_is_rejected_by_review_gate() {
+        let mut preview = serde_json::json!({
+            "to": "self@example.test",
+            "subject": "synthetic preview",
+            "dry_run": true,
+            "attachment_files": [{"file_id":"file-a", "download_url":"https://files.example/a.pdf"}],
+            "_native_attachment_sha256": ["digest-before"]
+        });
+        let binding = review_hash("yacli.mail.send", &preview).unwrap();
+        record_review(binding.clone());
+
+        preview["dry_run"] = serde_json::Value::Bool(false);
+        preview["review_sha256"] = serde_json::Value::String(binding);
+        preview["_native_attachment_sha256"] = serde_json::json!(["digest-after"]);
+        assert!(check_review_binding("yacli.mail.send", &preview).is_err());
     }
 
     #[test]
