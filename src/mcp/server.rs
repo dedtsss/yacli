@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, hash_map::DefaultHasher};
 use std::convert::Infallible;
 use std::hash::{Hash, Hasher};
+use std::io::Read;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -153,6 +154,23 @@ struct MailSendToolRequest {
     html: Option<String>,
     attachment_paths: Vec<String>,
     dry_run: bool,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeMailFile {
+    download_url: String,
+    file_id: String,
+    mime_type: Option<String>,
+    file_name: Option<String>,
+}
+
+struct DownloadedNativeMailFile {
+    file_id: String,
+    filename: String,
+    mime_type: String,
+    sha256: String,
+    content: Vec<u8>,
 }
 
 struct MailSendLinkToolRequest {
@@ -1365,6 +1383,10 @@ fn tool_definitions(ui_enabled: bool, roots_enabled: bool) -> Result<Vec<Value>>
                         "type": "array",
                         "items": { "type": "string" }
                     },
+                    "attachment_files": { "type": "array", "items": { "type": "object", "properties": {
+                        "download_url": { "type": "string" }, "file_id": { "type": "string" },
+                        "mime_type": { "type": "string" }, "file_name": { "type": "string" }
+                    }, "required": ["download_url", "file_id"], "additionalProperties": false } },
                     "dry_run": { "type": "boolean" }
                 },
                 "required": ["to", "subject"],
@@ -1814,6 +1836,14 @@ fn tool(
     {
         object.insert("_meta".to_string(), app_meta(visibility));
     }
+    if name == "yacli.mail.send" {
+        object
+            .entry("_meta")
+            .or_insert_with(|| Value::Object(Map::new()))
+            .as_object_mut()
+            .expect("tool _meta must be an object")
+            .insert("openai/fileParams".into(), json!(["attachment_files"]));
+    }
     Value::Object(object)
 }
 
@@ -1833,6 +1863,32 @@ fn call_tool(params: Value, ui_enabled: bool) -> Result<Value> {
             }
         }
     }
+    devcat::check_tool_access(name, &arguments)?;
+    let native_attachments = if name == "yacli.mail.send" {
+        let files: Vec<NativeMailFile> = arguments
+            .get("attachment_files")
+            .map(|value| {
+                serde_json::from_value(value.clone())
+                    .map_err(|error| YacliError::Validation(error.to_string()))
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let downloaded = download_native_mail_files(&files)?;
+        if let Some(object) = arguments.as_object_mut() {
+            object.insert(
+                "_native_attachment_sha256".into(),
+                json!(
+                    downloaded
+                        .iter()
+                        .map(|file| &file.sha256)
+                        .collect::<Vec<_>>()
+                ),
+            );
+        }
+        downloaded
+    } else {
+        Vec::new()
+    };
     devcat::check_tool(name, &arguments)?;
     if devcat::enabled()
         && devcat::is_risky(name)
@@ -1903,6 +1959,7 @@ fn call_tool(params: Value, ui_enabled: bool) -> Result<Value> {
                 attachment_paths: string_list(&arguments, "attachments")?,
                 dry_run: optional_bool(&arguments, "dry_run").unwrap_or(false),
             },
+            native_attachments,
         )?,
         "yacli.mail.send_link" => mail_send_link(
             arguments.get("account").and_then(Value::as_str),
@@ -2698,15 +2755,40 @@ fn activity_undo(id: &str) -> Result<Value> {
     }))
 }
 
-fn mail_send(account: Option<&str>, request: MailSendToolRequest) -> Result<Value> {
+fn mail_send(
+    account: Option<&str>,
+    request: MailSendToolRequest,
+    native_files: Vec<DownloadedNativeMailFile>,
+) -> Result<Value> {
     let (resolved_account, auth, context) = resolve_mail_private_context(account)?;
-    let attachments = load_mail_attachments(
+    let mut attachments = load_mail_attachments(
         &request
             .attachment_paths
             .iter()
             .map(PathBuf::from)
             .collect::<Vec<_>>(),
     )?;
+    let native_meta: Vec<_> = native_files
+        .iter()
+        .map(|file| {
+            json!({
+                "file_id": file.file_id,
+                "filename": file.filename,
+                "mime_type": file.mime_type,
+                "size": file.content.len(),
+                "sha256": file.sha256,
+            })
+        })
+        .collect();
+    for file in native_files {
+        attachments.push(crate::mail::MailAttachmentPayload {
+            filename: Some(file.filename),
+            mime_type: file.mime_type,
+            content_id: None,
+            inline: false,
+            content: file.content,
+        });
+    }
     let send_request = crate::mail::MailSendRequest {
         to: vec![request.to],
         cc: request.cc,
@@ -2723,6 +2805,7 @@ fn mail_send(account: Option<&str>, request: MailSendToolRequest) -> Result<Valu
         Ok(json!({
             "account": resolved_account,
             "attachments": request.attachment_paths,
+            "native_attachments": native_meta,
             "dry_run": true,
             "review": review,
             "smtp": {
@@ -2765,6 +2848,127 @@ fn mail_send(account: Option<&str>, request: MailSendToolRequest) -> Result<Valu
             "sent": sent,
         }))
     }
+}
+
+fn validate_native_attachment_url(raw: &str) -> Result<Url> {
+    let url = Url::parse(raw)
+        .map_err(|_| YacliError::Validation("native attachment URL is invalid".into()))?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(YacliError::Validation(
+            "native attachment URL must be an HTTPS URL without credentials or fragment".into(),
+        ));
+    }
+    Ok(url)
+}
+
+fn download_native_mail_files(files: &[NativeMailFile]) -> Result<Vec<DownloadedNativeMailFile>> {
+    const MAX_FILE_BYTES: usize = 10 * 1024 * 1024;
+    let client = reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|_| YacliError::Network("native attachment client unavailable".into()))?;
+    download_native_mail_files_with(files, |url| {
+        let response = client
+            .get(url.clone())
+            .send()
+            .map_err(|_| YacliError::Network("native attachment download failed".into()))?;
+        if !response.status().is_success() {
+            return Err(YacliError::Network(
+                "native attachment download failed".into(),
+            ));
+        }
+        read_limited_native_content(response, MAX_FILE_BYTES)
+    })
+}
+
+fn download_native_mail_files_with(
+    files: &[NativeMailFile],
+    mut fetch: impl FnMut(&Url) -> Result<Vec<u8>>,
+) -> Result<Vec<DownloadedNativeMailFile>> {
+    const MAX_FILES: usize = 5;
+    const MAX_FILE_BYTES: usize = 10 * 1024 * 1024;
+    const MAX_TOTAL_BYTES: usize = 25 * 1024 * 1024;
+    if files.len() > MAX_FILES {
+        return Err(YacliError::Validation(
+            "attachment_files accepts at most 5 files".into(),
+        ));
+    }
+    let mut total_bytes = 0usize;
+    let mut downloaded = Vec::with_capacity(files.len());
+    for file in files {
+        let url = validate_native_attachment_url(&file.download_url)?;
+        let fallback_name = url
+            .path_segments()
+            .and_then(Iterator::last)
+            .unwrap_or("")
+            .to_string();
+        let content = fetch(&url)?;
+        total_bytes = total_bytes.checked_add(content.len()).ok_or_else(|| {
+            YacliError::Validation("native attachment size limit exceeded".into())
+        })?;
+        if content.len() > MAX_FILE_BYTES || total_bytes > MAX_TOTAL_BYTES {
+            return Err(YacliError::Validation(
+                "native attachment size limit exceeded".into(),
+            ));
+        }
+        let filename = safe_native_filename(file.file_name.as_deref().unwrap_or(&fallback_name));
+        let mime_type = native_mime_type(file.mime_type.as_deref(), &filename);
+        let sha256 = format!("{:x}", Sha256::digest(&content));
+        downloaded.push(DownloadedNativeMailFile {
+            file_id: file.file_id.clone(),
+            filename,
+            mime_type,
+            sha256,
+            content,
+        });
+    }
+    Ok(downloaded)
+}
+
+fn read_limited_native_content(reader: impl Read, limit: usize) -> Result<Vec<u8>> {
+    let mut content = Vec::new();
+    reader
+        .take((limit + 1) as u64)
+        .read_to_end(&mut content)
+        .map_err(|_| YacliError::Network("native attachment download failed".into()))?;
+    if content.len() > limit {
+        return Err(YacliError::Validation(
+            "native attachment size limit exceeded".into(),
+        ));
+    }
+    Ok(content)
+}
+
+fn safe_native_filename(name: &str) -> String {
+    let basename = name.rsplit(['/', '\\']).next().unwrap_or_default();
+    if basename.is_empty()
+        || basename == "."
+        || basename == ".."
+        || basename.chars().any(char::is_control)
+    {
+        "attachment.pdf".into()
+    } else {
+        basename.to_string()
+    }
+}
+
+fn native_mime_type(declared: Option<&str>, filename: &str) -> String {
+    declared
+        .filter(|mime| {
+            mime.parse::<mime_guess::mime::Mime>().is_ok() && !mime.chars().any(char::is_control)
+        })
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            mime_guess::from_path(filename)
+                .first_or_octet_stream()
+                .to_string()
+        })
 }
 
 fn mail_send_link(account: Option<&str>, request: MailSendLinkToolRequest) -> Result<Value> {
@@ -4786,4 +4990,153 @@ fn canonical_base_url(server_url: &str) -> Result<String> {
     parsed.set_query(None);
     parsed.set_fragment(None);
     Ok(parsed.to_string().trim_end_matches('/').to_string())
+}
+
+#[cfg(test)]
+mod native_attachment_schema_tests {
+    use super::{
+        Digest, NativeMailFile, Sha256, download_native_mail_files,
+        download_native_mail_files_with, native_mime_type, read_limited_native_content,
+        safe_native_filename, tool_definitions, validate_native_attachment_url,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn mail_send_exposes_native_chatgpt_file_contract() {
+        let tools = tool_definitions(false, false).expect("tool definitions");
+        let send = tools
+            .iter()
+            .find(|tool| tool["name"] == "yacli.mail.send")
+            .expect("mail.send tool");
+        let schema = &send["inputSchema"];
+        let native = &schema["properties"]["attachment_files"]["items"];
+        assert_eq!(native["required"], json!(["download_url", "file_id"]));
+        assert_eq!(native["properties"]["download_url"]["type"], "string");
+        assert_eq!(native["properties"]["file_id"]["type"], "string");
+        assert_eq!(native["properties"]["mime_type"]["type"], "string");
+        assert_eq!(native["properties"]["file_name"]["type"], "string");
+        assert_eq!(native["additionalProperties"], false);
+        assert_eq!(
+            schema["properties"]["attachments"]["items"]["type"],
+            "string"
+        );
+        assert_eq!(
+            send["_meta"]["openai/fileParams"],
+            json!(["attachment_files"])
+        );
+    }
+
+    #[test]
+    fn native_attachment_rejects_non_https_and_url_credentials() {
+        assert!(validate_native_attachment_url("http://example.test/file.pdf").is_err());
+        assert!(validate_native_attachment_url("https://user@example.test/file.pdf").is_err());
+        assert!(validate_native_attachment_url("https://example.test/file.pdf#fragment").is_err());
+        assert_eq!(
+            validate_native_attachment_url("https://files.example.test/file.pdf")
+                .expect("valid HTTPS URL")
+                .scheme(),
+            "https"
+        );
+    }
+
+    #[test]
+    fn native_filename_and_mime_are_sanitized_with_fallbacks() {
+        assert_eq!(safe_native_filename("../../report.pdf"), "report.pdf");
+        assert_eq!(
+            safe_native_filename("C:\\private\\report.pdf"),
+            "report.pdf"
+        );
+        assert_eq!(safe_native_filename("../\r\nX: bad"), "attachment.pdf");
+        assert_eq!(native_mime_type(None, "report.pdf"), "application/pdf");
+        assert_eq!(
+            native_mime_type(Some(&format!("text/plain{}X: bad", '\r')), "report.pdf"),
+            "application/pdf"
+        );
+        assert_eq!(
+            native_mime_type(Some("application/x-report"), "report.pdf"),
+            "application/x-report"
+        );
+    }
+
+    #[test]
+    fn native_download_limits_count_and_reader_bytes() {
+        let files = (0..6)
+            .map(|index| NativeMailFile {
+                download_url: format!("http://invalid.test/{index}"),
+                file_id: index.to_string(),
+                mime_type: None,
+                file_name: None,
+            })
+            .collect::<Vec<_>>();
+        assert!(download_native_mail_files(&files).is_err());
+        assert!(read_limited_native_content(&b"12345"[..], 4).is_err());
+        assert_eq!(
+            read_limited_native_content(&b"1234"[..], 4).expect("within limit"),
+            b"1234"
+        );
+    }
+
+    #[test]
+    fn native_download_mock_handles_two_pdf_like_files_without_mail_transport() {
+        let files = vec![
+            NativeMailFile {
+                download_url: "https://mock.invalid/first".into(),
+                file_id: "synthetic-1".into(),
+                mime_type: None,
+                file_name: Some("../first.pdf".into()),
+            },
+            NativeMailFile {
+                download_url: "https://mock.invalid/second.pdf".into(),
+                file_id: "synthetic-2".into(),
+                mime_type: Some("application/pdf".into()),
+                file_name: None,
+            },
+        ];
+        let bodies = [
+            b"%PDF-1.7 synthetic one".to_vec(),
+            b"%PDF-1.7 synthetic two".to_vec(),
+        ];
+        let mut index = 0;
+        let downloaded = download_native_mail_files_with(&files, |url| {
+            assert_eq!(url.scheme(), "https");
+            index += 1;
+            Ok(bodies[index - 1].clone())
+        })
+        .expect("mock native downloads");
+        assert_eq!(index, 2);
+        assert_eq!(downloaded.len(), 2);
+        assert_eq!(downloaded[0].filename, "first.pdf");
+        assert_eq!(downloaded[0].mime_type, "application/pdf");
+        assert_eq!(downloaded[1].filename, "second.pdf");
+        assert_eq!(downloaded[1].mime_type, "application/pdf");
+        assert_eq!(downloaded[0].content, bodies[0]);
+        assert_eq!(downloaded[1].content, bodies[1]);
+        assert_eq!(
+            downloaded[0].sha256,
+            format!("{:x}", Sha256::digest(&bodies[0]))
+        );
+        assert_eq!(
+            downloaded[1].sha256,
+            format!("{:x}", Sha256::digest(&bodies[1]))
+        );
+    }
+
+    #[test]
+    fn native_download_enforces_total_size_limit() {
+        let files = (0..3)
+            .map(|index| NativeMailFile {
+                download_url: format!("https://mock.invalid/{index}.pdf"),
+                file_id: format!("synthetic-{index}"),
+                mime_type: Some("application/pdf".into()),
+                file_name: None,
+            })
+            .collect::<Vec<_>>();
+        let mut fetches = 0;
+        let result = download_native_mail_files_with(&files, |_| {
+            fetches += 1;
+            Ok(vec![0u8; 9 * 1024 * 1024])
+        });
+        assert!(result.is_err());
+        assert_eq!(fetches, 3);
+    }
 }

@@ -168,7 +168,7 @@ pub fn tool_allowed(name: &str) -> bool {
         .is_some_and(|required| required.iter().all(|cap| capabilities().contains(*cap)))
 }
 
-pub fn check_tool(name: &str, arguments: &serde_json::Value) -> Result<()> {
+pub fn check_tool_access(name: &str, arguments: &serde_json::Value) -> Result<()> {
     if !enabled() {
         return Ok(());
     }
@@ -191,6 +191,14 @@ pub fn check_tool(name: &str, arguments: &serde_json::Value) -> Result<()> {
         {
             return Err(YacliError::Auth("MCP account denied".into()));
         }
+    }
+    Ok(())
+}
+
+pub fn check_tool(name: &str, arguments: &serde_json::Value) -> Result<()> {
+    check_tool_access(name, arguments)?;
+    if !enabled() {
+        return Ok(());
     }
     if name.starts_with("yacli.disk.")
         && name != "yacli.disk.info"
@@ -468,6 +476,22 @@ mod tests {
         assert_ne!(
             review_hash("yacli.disk.publish", &one).unwrap(),
             review_hash("yacli.disk.publish", &changed).unwrap()
+        );
+    }
+
+    #[test]
+    fn review_hash_binds_native_attachment_content_digests() {
+        let one = serde_json::json!({
+            "attachment_files": [{"file_id":"file-a", "download_url":"https://files.example/a.pdf"}],
+            "_native_attachment_sha256": ["aaaa"]
+        });
+        let changed_content = serde_json::json!({
+            "attachment_files": [{"file_id":"file-a", "download_url":"https://files.example/a.pdf"}],
+            "_native_attachment_sha256": ["bbbb"]
+        });
+        assert_ne!(
+            review_hash("yacli.mail.send", &one).unwrap(),
+            review_hash("yacli.mail.send", &changed_content).unwrap()
         );
     }
 
