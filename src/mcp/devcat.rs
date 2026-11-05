@@ -168,7 +168,7 @@ pub fn tool_allowed(name: &str) -> bool {
         .is_some_and(|required| required.iter().all(|cap| capabilities().contains(*cap)))
 }
 
-pub fn check_tool(name: &str, arguments: &serde_json::Value) -> Result<()> {
+pub fn check_tool_access(name: &str, arguments: &serde_json::Value) -> Result<()> {
     if !enabled() {
         return Ok(());
     }
@@ -191,6 +191,14 @@ pub fn check_tool(name: &str, arguments: &serde_json::Value) -> Result<()> {
         {
             return Err(YacliError::Auth("MCP account denied".into()));
         }
+    }
+    Ok(())
+}
+
+pub fn check_tool(name: &str, arguments: &serde_json::Value) -> Result<()> {
+    check_tool_access(name, arguments)?;
+    if !enabled() {
+        return Ok(());
     }
     if name.starts_with("yacli.disk.")
         && name != "yacli.disk.info"
@@ -241,15 +249,25 @@ pub fn check_tool(name: &str, arguments: &serde_json::Value) -> Result<()> {
             .and_then(serde_json::Value::as_bool)
             != Some(true)
     {
-        let supplied = arguments
-            .get("review_sha256")
-            .and_then(serde_json::Value::as_str);
-        let expected = review_hash(name, arguments)?;
-        if supplied != Some(expected.as_str()) || !consume_review(&expected) {
-            return Err(YacliError::Auth(format!(
-                "{name} requires review_sha256 from its dry run"
-            )));
-        }
+        check_review_binding(name, arguments)?;
+    }
+    Ok(())
+}
+
+pub fn run_after_tool_check<T>(check: Result<()>, action: impl FnOnce() -> Result<T>) -> Result<T> {
+    check?;
+    action()
+}
+
+fn check_review_binding(name: &str, arguments: &serde_json::Value) -> Result<()> {
+    let supplied = arguments
+        .get("review_sha256")
+        .and_then(serde_json::Value::as_str);
+    let expected = review_hash(name, arguments)?;
+    if supplied != Some(expected.as_str()) || !consume_review(&expected) {
+        return Err(YacliError::Auth(format!(
+            "{name} requires review_sha256 from its dry run"
+        )));
     }
     Ok(())
 }
@@ -469,6 +487,47 @@ mod tests {
             review_hash("yacli.disk.publish", &one).unwrap(),
             review_hash("yacli.disk.publish", &changed).unwrap()
         );
+    }
+
+    #[test]
+    fn review_hash_binds_native_attachment_content_digests() {
+        let one = serde_json::json!({
+            "attachment_files": [{"file_id":"file-a", "download_url":"https://files.example/a.pdf"}],
+            "_native_attachment_sha256": ["aaaa"]
+        });
+        let changed_content = serde_json::json!({
+            "attachment_files": [{"file_id":"file-a", "download_url":"https://files.example/a.pdf"}],
+            "_native_attachment_sha256": ["bbbb"]
+        });
+        assert_ne!(
+            review_hash("yacli.mail.send", &one).unwrap(),
+            review_hash("yacli.mail.send", &changed_content).unwrap()
+        );
+    }
+
+    #[test]
+    fn changed_native_file_after_preview_is_rejected_before_send_action() {
+        let mut preview = serde_json::json!({
+            "to": "self@example.test",
+            "subject": "synthetic preview",
+            "dry_run": true,
+            "attachment_files": [{"file_id":"file-a", "download_url":"https://files.example/a.pdf"}],
+            "_native_attachment_sha256": ["digest-before"]
+        });
+        let binding = review_hash("yacli.mail.send", &preview).unwrap();
+        record_review(binding.clone());
+
+        preview["dry_run"] = serde_json::Value::Bool(false);
+        preview["review_sha256"] = serde_json::Value::String(binding);
+        preview["_native_attachment_sha256"] = serde_json::json!(["digest-after"]);
+        let mut smtp_attempts = 0;
+        let result =
+            run_after_tool_check(check_review_binding("yacli.mail.send", &preview), || {
+                smtp_attempts += 1;
+                Ok(())
+            });
+        assert!(result.is_err());
+        assert_eq!(smtp_attempts, 0);
     }
 
     #[test]
