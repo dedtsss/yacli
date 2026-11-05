@@ -6,6 +6,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::Duration;
@@ -78,6 +79,7 @@ use chrono::{DateTime, Utc};
 use super::{devcat, prompts, skills};
 
 const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
+static NATIVE_FILE_DNS_LOOKUP_ACTIVE: AtomicBool = AtomicBool::new(false);
 const APP_RESOURCE_URI: &str = "ui://yacli/dashboard";
 const APP_RESOURCE_URI_TEMPLATE: &str =
     "ui://yacli/dashboard{?account,section,resource,tool,skill,prompt,workflow,activity,goal}";
@@ -2913,20 +2915,14 @@ fn resolve_public_download_addresses(url: &Url) -> Result<Vec<SocketAddr>> {
     let addresses = if let Ok(ip) = host.parse::<IpAddr>() {
         vec![SocketAddr::new(ip, port)]
     } else {
-        let (sender, receiver) = mpsc::channel();
-        thread::Builder::new()
-            .name("native-file-dns".into())
-            .spawn(move || {
-                let result = (host.as_str(), port)
+        resolve_dns_addresses_with(
+            move || {
+                (host.as_str(), port)
                     .to_socket_addrs()
-                    .map(|addresses| addresses.collect::<Vec<_>>());
-                let _ = sender.send(result);
-            })
-            .map_err(|_| YacliError::Network("native attachment DNS lookup failed".into()))?;
-        receiver
-            .recv_timeout(std::time::Duration::from_secs(8))
-            .map_err(|_| YacliError::Network("native attachment DNS lookup timed out".into()))?
-            .map_err(|_| YacliError::Network("native attachment DNS lookup failed".into()))?
+                    .map(|addresses| addresses.collect::<Vec<_>>())
+            },
+            std::time::Duration::from_secs(8),
+        )?
     };
     if addresses.is_empty() || addresses.iter().any(|address| !is_public_ip(address.ip())) {
         return Err(YacliError::Validation(
@@ -2934,6 +2930,46 @@ fn resolve_public_download_addresses(url: &Url) -> Result<Vec<SocketAddr>> {
         ));
     }
     Ok(addresses)
+}
+
+fn resolve_dns_addresses_with(
+    lookup: impl FnOnce() -> std::io::Result<Vec<SocketAddr>> + Send + 'static,
+    timeout: std::time::Duration,
+) -> Result<Vec<SocketAddr>> {
+    if NATIVE_FILE_DNS_LOOKUP_ACTIVE
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        return Err(YacliError::Network(
+            "native attachment DNS resolver is busy".into(),
+        ));
+    }
+    let (sender, receiver) = mpsc::channel();
+    if thread::Builder::new()
+        .name("native-file-dns".into())
+        .spawn(move || {
+            let result = lookup();
+            NATIVE_FILE_DNS_LOOKUP_ACTIVE.store(false, Ordering::Release);
+            let _ = sender.send(result);
+        })
+        .is_err()
+    {
+        NATIVE_FILE_DNS_LOOKUP_ACTIVE.store(false, Ordering::Release);
+        return Err(YacliError::Network(
+            "native attachment DNS lookup failed".into(),
+        ));
+    }
+    receiver
+        .recv_timeout(timeout)
+        .map_err(|error| match error {
+            RecvTimeoutError::Timeout => {
+                YacliError::Network("native attachment DNS lookup timed out".into())
+            }
+            RecvTimeoutError::Disconnected => {
+                YacliError::Network("native attachment DNS lookup failed".into())
+            }
+        })?
+        .map_err(|_| YacliError::Network("native attachment DNS lookup failed".into()))
 }
 
 fn is_public_ip(ip: IpAddr) -> bool {
@@ -5083,8 +5119,8 @@ mod native_attachment_schema_tests {
     use super::{
         Digest, NativeMailFile, Sha256, Url, download_native_mail_files,
         download_native_mail_files_with, is_public_ip, native_mime_type,
-        read_limited_native_content, resolve_public_download_addresses, safe_native_filename,
-        tool_definitions, validate_native_attachment_url,
+        read_limited_native_content, resolve_dns_addresses_with, resolve_public_download_addresses,
+        safe_native_filename, tool_definitions, validate_native_attachment_url,
     };
     use serde_json::json;
 
@@ -5134,6 +5170,63 @@ mod native_attachment_schema_tests {
         assert!(!is_public_ip("198.19.0.1".parse().unwrap()));
         assert!(is_public_ip("8.8.8.8".parse().unwrap()));
         assert!(is_public_ip("2606:4700:4700::1111".parse().unwrap()));
+    }
+
+    #[test]
+    fn native_dns_timeout_bounds_stuck_resolver_threads() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let pending = std::thread::spawn(move || {
+            resolve_dns_addresses_with(
+                move || {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(vec!["8.8.8.8:443".parse().unwrap()])
+                },
+                Duration::from_millis(50),
+            )
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("resolver thread started");
+        assert!(pending.join().unwrap().is_err());
+
+        let second_lookup_ran = Arc::new(AtomicBool::new(false));
+        let second_lookup_started = Arc::clone(&second_lookup_ran);
+        let second = resolve_dns_addresses_with(
+            move || {
+                second_lookup_started.store(true, Ordering::Relaxed);
+                Ok(Vec::new())
+            },
+            Duration::from_millis(50),
+        );
+        assert!(second.is_err());
+        assert!(!second_lookup_ran.load(Ordering::Relaxed));
+
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let lookup_ran = Arc::new(AtomicBool::new(false));
+            let lookup_started = Arc::clone(&lookup_ran);
+            let result = resolve_dns_addresses_with(
+                move || {
+                    lookup_started.store(true, Ordering::Relaxed);
+                    Ok(vec!["8.8.8.8:443".parse().unwrap()])
+                },
+                Duration::from_millis(100),
+            );
+            if lookup_ran.load(Ordering::Relaxed) {
+                assert_eq!(result.unwrap(), vec!["8.8.8.8:443".parse().unwrap()]);
+                break;
+            }
+            assert!(Instant::now() < deadline, "resolver slot was not released");
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     #[test]
