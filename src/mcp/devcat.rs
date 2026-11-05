@@ -254,6 +254,11 @@ pub fn check_tool(name: &str, arguments: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
+pub fn run_after_tool_check<T>(check: Result<()>, action: impl FnOnce() -> Result<T>) -> Result<T> {
+    check?;
+    action()
+}
+
 fn check_review_binding(name: &str, arguments: &serde_json::Value) -> Result<()> {
     let supplied = arguments
         .get("review_sha256")
@@ -501,7 +506,7 @@ mod tests {
     }
 
     #[test]
-    fn changed_native_file_after_preview_is_rejected_by_review_gate() {
+    fn changed_native_file_after_preview_is_rejected_before_send_action() {
         let mut preview = serde_json::json!({
             "to": "self@example.test",
             "subject": "synthetic preview",
@@ -515,7 +520,14 @@ mod tests {
         preview["dry_run"] = serde_json::Value::Bool(false);
         preview["review_sha256"] = serde_json::Value::String(binding);
         preview["_native_attachment_sha256"] = serde_json::json!(["digest-after"]);
-        assert!(check_review_binding("yacli.mail.send", &preview).is_err());
+        let mut smtp_attempts = 0;
+        let result =
+            run_after_tool_check(check_review_binding("yacli.mail.send", &preview), || {
+                smtp_attempts += 1;
+                Ok(())
+            });
+        assert!(result.is_err());
+        assert_eq!(smtp_attempts, 0);
     }
 
     #[test]

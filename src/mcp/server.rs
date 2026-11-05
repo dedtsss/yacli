@@ -1891,267 +1891,276 @@ fn call_tool(params: Value, ui_enabled: bool) -> Result<Value> {
     } else {
         Vec::new()
     };
-    devcat::check_tool(name, &arguments)?;
-    if devcat::enabled()
-        && devcat::is_risky(name)
-        && optional_bool(&arguments, "dry_run") != Some(true)
-    {
-        eprintln!(
-            "{}",
-            json!({"event":"devcat_mcp_mutation", "tool":name,
-            "account": arguments.get("account").and_then(Value::as_str),
-            "timestamp": chrono::Utc::now().to_rfc3339(), "result":"attempt"})
-        );
-    }
-
-    let mut structured = match name {
-        "yacli.app.snapshot" => app_snapshot()?,
-        "yacli.account.list" => account_list()?,
-        "yacli.account.current" => account_current()?,
-        "yacli.auth.status" => auth_status(arguments.get("account").and_then(Value::as_str))?,
-        DASHBOARD_TOOL_UPDATE_CHECK => {
-            update_check(arguments.get("version").and_then(Value::as_str))?
-        }
-        DASHBOARD_TOOL_GOAL_ROUTE => goal_route_payload(
-            required_string(&arguments, "goal")?,
-            arguments.get("account").and_then(Value::as_str),
-        )?,
-        DASHBOARD_TOOL_DOCTOR_APPLY_SAFE => {
-            let structured = apply_safe_doctor_remediation(
-                arguments.get("account").and_then(Value::as_str),
-                arguments.get("goal").and_then(Value::as_str),
-            )?;
-            if let Some(entry) = doctor_safe_remediation_activity_entry(
-                "mcp",
-                &structured,
-                arguments.get("account").and_then(Value::as_str),
-                arguments.get("goal").and_then(Value::as_str),
-            ) {
-                record_activity_mcp(entry);
+    let mut structured =
+        devcat::run_after_tool_check(devcat::check_tool(name, &arguments), || {
+            if devcat::enabled()
+                && devcat::is_risky(name)
+                && optional_bool(&arguments, "dry_run") != Some(true)
+            {
+                eprintln!(
+                    "{}",
+                    json!({"event":"devcat_mcp_mutation", "tool":name,
+                "account": arguments.get("account").and_then(Value::as_str),
+                "timestamp": chrono::Utc::now().to_rfc3339(), "result":"attempt"})
+                );
             }
-            structured
-        }
-        "yacli.mail.folders" => mail_folders(arguments.get("account").and_then(Value::as_str))?,
-        "yacli.mail.list" => mail_list(
-            arguments.get("account").and_then(Value::as_str),
-            optional_string(&arguments, "folder").unwrap_or("INBOX"),
-            optional_usize(&arguments, "limit").unwrap_or(20),
-        )?,
-        "yacli.mail.search" => mail_search(
-            arguments.get("account").and_then(Value::as_str),
-            optional_string(&arguments, "folder").unwrap_or("INBOX"),
-            required_string(&arguments, "query")?,
-            optional_usize(&arguments, "limit").unwrap_or(20),
-        )?,
-        "yacli.mail.read" => mail_read(
-            arguments.get("account").and_then(Value::as_str),
-            optional_string(&arguments, "folder").unwrap_or("INBOX"),
-            required_u64(&arguments, "uid")?,
-            optional_u64(&arguments, "max_bytes").unwrap_or(15 * 1024 * 1024),
-        )?,
-        "yacli.mail.send" => mail_send(
-            arguments.get("account").and_then(Value::as_str),
-            MailSendToolRequest {
-                to: required_string(&arguments, "to")?.to_string(),
-                cc: string_list(&arguments, "cc")?,
-                bcc: string_list(&arguments, "bcc")?,
-                subject: required_string(&arguments, "subject")?.to_string(),
-                text: optional_string_owned(&arguments, "text"),
-                html: optional_string_owned(&arguments, "html"),
-                attachment_paths: string_list(&arguments, "attachments")?,
-                dry_run: optional_bool(&arguments, "dry_run").unwrap_or(false),
-            },
-            native_attachments,
-        )?,
-        "yacli.mail.send_link" => mail_send_link(
-            arguments.get("account").and_then(Value::as_str),
-            MailSendLinkToolRequest {
-                to: required_string(&arguments, "to")?.to_string(),
-                cc: string_list(&arguments, "cc")?,
-                bcc: string_list(&arguments, "bcc")?,
-                subject: required_string(&arguments, "subject")?.to_string(),
-                text: optional_string_owned(&arguments, "text"),
-                html: optional_string_owned(&arguments, "html"),
-                source_path: required_string(&arguments, "source_path")?.to_string(),
-                disk_path: required_string(&arguments, "disk_path")?.to_string(),
-                overwrite: optional_bool(&arguments, "overwrite").unwrap_or(false),
-                dry_run: optional_bool(&arguments, "dry_run").unwrap_or(false),
-            },
-        )?,
-        "yacli.mail.send_published_link" => mail_send_published_link(
-            arguments.get("account").and_then(Value::as_str),
-            MailSendPublishedLinkToolRequest {
-                to: required_string(&arguments, "to")?.to_string(),
-                cc: string_list(&arguments, "cc")?,
-                bcc: string_list(&arguments, "bcc")?,
-                subject: required_string(&arguments, "subject")?.to_string(),
-                text: optional_string_owned(&arguments, "text"),
-                html: optional_string_owned(&arguments, "html"),
-                public_url: required_string(&arguments, "public_url")?.to_string(),
-                dry_run: optional_bool(&arguments, "dry_run").unwrap_or(false),
-            },
-        )?,
-        "yacli.mail.reply" => mail_reply(
-            arguments.get("account").and_then(Value::as_str),
-            optional_string(&arguments, "folder").unwrap_or("INBOX"),
-            required_u64(&arguments, "uid")?,
-            string_list(&arguments, "cc")?,
-            optional_string_owned(&arguments, "text"),
-            optional_string_owned(&arguments, "html"),
-        )?,
-        "yacli.mail.forward" => mail_forward(
-            arguments.get("account").and_then(Value::as_str),
-            MailForwardToolRequest {
-                folder: optional_string(&arguments, "folder")
-                    .unwrap_or("INBOX")
-                    .to_string(),
-                uid: required_u64(&arguments, "uid")?,
-                to: required_string(&arguments, "to")?.to_string(),
-                cc: string_list(&arguments, "cc")?,
-                bcc: string_list(&arguments, "bcc")?,
-                text: optional_string_owned(&arguments, "text"),
-                html: optional_string_owned(&arguments, "html"),
-                max_source_bytes: optional_u64(&arguments, "max_source_bytes")
-                    .unwrap_or(15 * 1024 * 1024),
-            },
-        )?,
-        "yacli.mail.attachment.export" => mail_attachment_export(
-            arguments.get("account").and_then(Value::as_str),
-            MailAttachmentExportToolRequest {
-                folder: optional_string(&arguments, "folder")
-                    .unwrap_or("INBOX")
-                    .to_string(),
-                uid: required_u64(&arguments, "uid")?,
-                selector: mail_attachment_selector(&arguments)?,
-                output: required_string(&arguments, "output_path")?.to_string(),
-                force: optional_bool(&arguments, "force").unwrap_or(false),
-                max_bytes: optional_u64(&arguments, "max_bytes").unwrap_or(15 * 1024 * 1024),
-            },
-        )?,
-        "yacli.mail.invite.inspect" => mail_invite_inspect(
-            arguments.get("account").and_then(Value::as_str),
-            MailInviteInspectToolRequest {
-                folder: optional_string(&arguments, "folder")
-                    .unwrap_or("INBOX")
-                    .to_string(),
-                uid: required_u64(&arguments, "uid")?,
-                selector: mail_attachment_selector_with_context(
-                    &arguments,
-                    "yacli.mail.invite.inspect",
+
+            Ok(match name {
+                "yacli.app.snapshot" => app_snapshot()?,
+                "yacli.account.list" => account_list()?,
+                "yacli.account.current" => account_current()?,
+                "yacli.auth.status" => {
+                    auth_status(arguments.get("account").and_then(Value::as_str))?
+                }
+                DASHBOARD_TOOL_UPDATE_CHECK => {
+                    update_check(arguments.get("version").and_then(Value::as_str))?
+                }
+                DASHBOARD_TOOL_GOAL_ROUTE => goal_route_payload(
+                    required_string(&arguments, "goal")?,
+                    arguments.get("account").and_then(Value::as_str),
                 )?,
-                max_bytes: optional_u64(&arguments, "max_bytes").unwrap_or(15 * 1024 * 1024),
-            },
-        )?,
-        "yacli.mail.invite.create_event" => mail_invite_create_event(
-            arguments.get("account").and_then(Value::as_str),
-            MailInviteCreateEventToolRequest {
-                folder: optional_string(&arguments, "folder")
-                    .unwrap_or("INBOX")
-                    .to_string(),
-                uid: required_u64(&arguments, "uid")?,
-                selector: mail_attachment_selector_with_context(
-                    &arguments,
-                    "yacli.mail.invite.create_event",
+                DASHBOARD_TOOL_DOCTOR_APPLY_SAFE => {
+                    let structured = apply_safe_doctor_remediation(
+                        arguments.get("account").and_then(Value::as_str),
+                        arguments.get("goal").and_then(Value::as_str),
+                    )?;
+                    if let Some(entry) = doctor_safe_remediation_activity_entry(
+                        "mcp",
+                        &structured,
+                        arguments.get("account").and_then(Value::as_str),
+                        arguments.get("goal").and_then(Value::as_str),
+                    ) {
+                        record_activity_mcp(entry);
+                    }
+                    structured
+                }
+                "yacli.mail.folders" => {
+                    mail_folders(arguments.get("account").and_then(Value::as_str))?
+                }
+                "yacli.mail.list" => mail_list(
+                    arguments.get("account").and_then(Value::as_str),
+                    optional_string(&arguments, "folder").unwrap_or("INBOX"),
+                    optional_usize(&arguments, "limit").unwrap_or(20),
                 )?,
-                calendar: optional_string(&arguments, "calendar")
-                    .unwrap_or("default")
-                    .to_string(),
-                event_index: optional_usize(&arguments, "event_index").unwrap_or(1),
-                max_bytes: optional_u64(&arguments, "max_bytes").unwrap_or(15 * 1024 * 1024),
-            },
-        )?,
-        "yacli.activity.undo" => activity_undo(required_string(&arguments, "id")?)?,
-        "yacli.calendar.calendars" => {
-            calendar_calendars(arguments.get("account").and_then(Value::as_str))?
-        }
-        "yacli.calendar.events" => calendar_events(
-            arguments.get("account").and_then(Value::as_str),
-            optional_string(&arguments, "calendar").unwrap_or("default"),
-            optional_string(&arguments, "from"),
-            optional_string(&arguments, "to"),
-            optional_usize(&arguments, "limit").unwrap_or(20),
-        )?,
-        "yacli.calendar.create" => calendar_create(
-            arguments.get("account").and_then(Value::as_str),
-            CalendarCreateToolRequest {
-                calendar: optional_string(&arguments, "calendar")
-                    .unwrap_or("default")
-                    .to_string(),
-                summary: required_string(&arguments, "summary")?.to_string(),
-                start: required_string(&arguments, "start")?.to_string(),
-                end: required_string(&arguments, "end")?.to_string(),
-                description: optional_string_owned(&arguments, "description"),
-                location: optional_string_owned(&arguments, "location"),
-                dry_run: optional_bool(&arguments, "dry_run").unwrap_or(false),
-            },
-        )?,
-        "yacli.calendar.delete" => calendar_delete(
-            arguments.get("account").and_then(Value::as_str),
-            optional_string(&arguments, "calendar").unwrap_or("default"),
-            required_string(&arguments, "uid")?,
-        )?,
-        "yacli.disk.info" => disk_info(arguments.get("account").and_then(Value::as_str))?,
-        "yacli.disk.list" => disk_list(
-            arguments.get("account").and_then(Value::as_str),
-            optional_string(&arguments, "path").unwrap_or("disk:/"),
-            optional_usize(&arguments, "limit").unwrap_or(100),
-            optional_u64(&arguments, "offset").unwrap_or(0),
-        )?,
-        "yacli.disk.read" => disk_read(
-            arguments.get("account").and_then(Value::as_str),
-            required_string(&arguments, "path")?,
-        )?,
-        "yacli.disk.mkdir" => disk_mkdir(
-            arguments.get("account").and_then(Value::as_str),
-            required_string(&arguments, "path")?,
-            optional_bool(&arguments, "dry_run").unwrap_or(false),
-        )?,
-        "yacli.disk.upload" => disk_upload(
-            arguments.get("account").and_then(Value::as_str),
-            DiskUploadToolRequest {
-                source: required_string(&arguments, "source")?.to_string(),
-                path: required_string(&arguments, "path")?.to_string(),
-                overwrite: optional_bool(&arguments, "overwrite").unwrap_or(false),
-                dry_run: optional_bool(&arguments, "dry_run").unwrap_or(false),
-            },
-        )?,
-        "yacli.disk.upload_link" => disk_upload_link(
-            arguments.get("account").and_then(Value::as_str),
-            DiskUploadLinkToolRequest {
-                source: required_string(&arguments, "source")?.to_string(),
-                path: required_string(&arguments, "path")?.to_string(),
-                overwrite: optional_bool(&arguments, "overwrite").unwrap_or(false),
-                dry_run: optional_bool(&arguments, "dry_run").unwrap_or(false),
-            },
-        )?,
-        "yacli.disk.download" => disk_download(
-            arguments.get("account").and_then(Value::as_str),
-            DiskDownloadToolRequest {
-                path: required_string(&arguments, "path")?.to_string(),
-                output_path: required_string(&arguments, "output_path")?.to_string(),
-                force: optional_bool(&arguments, "force").unwrap_or(false),
-            },
-        )?,
-        "yacli.disk.publish" => disk_publish(
-            arguments.get("account").and_then(Value::as_str),
-            DiskPublishToolRequest {
-                path: required_string(&arguments, "path")?.to_string(),
-                dry_run: optional_bool(&arguments, "dry_run").unwrap_or(false),
-            },
-        )?,
-        "yacli.disk.unpublish" => disk_unpublish(
-            arguments.get("account").and_then(Value::as_str),
-            DiskUnpublishToolRequest {
-                path: required_string(&arguments, "path")?.to_string(),
-                dry_run: optional_bool(&arguments, "dry_run").unwrap_or(false),
-            },
-        )?,
-        _ => {
-            return Err(YacliError::UnsupportedOperation(format!(
-                "unsupported MCP tool: {name}"
-            )));
-        }
-    };
+                "yacli.mail.search" => mail_search(
+                    arguments.get("account").and_then(Value::as_str),
+                    optional_string(&arguments, "folder").unwrap_or("INBOX"),
+                    required_string(&arguments, "query")?,
+                    optional_usize(&arguments, "limit").unwrap_or(20),
+                )?,
+                "yacli.mail.read" => mail_read(
+                    arguments.get("account").and_then(Value::as_str),
+                    optional_string(&arguments, "folder").unwrap_or("INBOX"),
+                    required_u64(&arguments, "uid")?,
+                    optional_u64(&arguments, "max_bytes").unwrap_or(15 * 1024 * 1024),
+                )?,
+                "yacli.mail.send" => mail_send(
+                    arguments.get("account").and_then(Value::as_str),
+                    MailSendToolRequest {
+                        to: required_string(&arguments, "to")?.to_string(),
+                        cc: string_list(&arguments, "cc")?,
+                        bcc: string_list(&arguments, "bcc")?,
+                        subject: required_string(&arguments, "subject")?.to_string(),
+                        text: optional_string_owned(&arguments, "text"),
+                        html: optional_string_owned(&arguments, "html"),
+                        attachment_paths: string_list(&arguments, "attachments")?,
+                        dry_run: optional_bool(&arguments, "dry_run").unwrap_or(false),
+                    },
+                    native_attachments,
+                )?,
+                "yacli.mail.send_link" => mail_send_link(
+                    arguments.get("account").and_then(Value::as_str),
+                    MailSendLinkToolRequest {
+                        to: required_string(&arguments, "to")?.to_string(),
+                        cc: string_list(&arguments, "cc")?,
+                        bcc: string_list(&arguments, "bcc")?,
+                        subject: required_string(&arguments, "subject")?.to_string(),
+                        text: optional_string_owned(&arguments, "text"),
+                        html: optional_string_owned(&arguments, "html"),
+                        source_path: required_string(&arguments, "source_path")?.to_string(),
+                        disk_path: required_string(&arguments, "disk_path")?.to_string(),
+                        overwrite: optional_bool(&arguments, "overwrite").unwrap_or(false),
+                        dry_run: optional_bool(&arguments, "dry_run").unwrap_or(false),
+                    },
+                )?,
+                "yacli.mail.send_published_link" => mail_send_published_link(
+                    arguments.get("account").and_then(Value::as_str),
+                    MailSendPublishedLinkToolRequest {
+                        to: required_string(&arguments, "to")?.to_string(),
+                        cc: string_list(&arguments, "cc")?,
+                        bcc: string_list(&arguments, "bcc")?,
+                        subject: required_string(&arguments, "subject")?.to_string(),
+                        text: optional_string_owned(&arguments, "text"),
+                        html: optional_string_owned(&arguments, "html"),
+                        public_url: required_string(&arguments, "public_url")?.to_string(),
+                        dry_run: optional_bool(&arguments, "dry_run").unwrap_or(false),
+                    },
+                )?,
+                "yacli.mail.reply" => mail_reply(
+                    arguments.get("account").and_then(Value::as_str),
+                    optional_string(&arguments, "folder").unwrap_or("INBOX"),
+                    required_u64(&arguments, "uid")?,
+                    string_list(&arguments, "cc")?,
+                    optional_string_owned(&arguments, "text"),
+                    optional_string_owned(&arguments, "html"),
+                )?,
+                "yacli.mail.forward" => mail_forward(
+                    arguments.get("account").and_then(Value::as_str),
+                    MailForwardToolRequest {
+                        folder: optional_string(&arguments, "folder")
+                            .unwrap_or("INBOX")
+                            .to_string(),
+                        uid: required_u64(&arguments, "uid")?,
+                        to: required_string(&arguments, "to")?.to_string(),
+                        cc: string_list(&arguments, "cc")?,
+                        bcc: string_list(&arguments, "bcc")?,
+                        text: optional_string_owned(&arguments, "text"),
+                        html: optional_string_owned(&arguments, "html"),
+                        max_source_bytes: optional_u64(&arguments, "max_source_bytes")
+                            .unwrap_or(15 * 1024 * 1024),
+                    },
+                )?,
+                "yacli.mail.attachment.export" => mail_attachment_export(
+                    arguments.get("account").and_then(Value::as_str),
+                    MailAttachmentExportToolRequest {
+                        folder: optional_string(&arguments, "folder")
+                            .unwrap_or("INBOX")
+                            .to_string(),
+                        uid: required_u64(&arguments, "uid")?,
+                        selector: mail_attachment_selector(&arguments)?,
+                        output: required_string(&arguments, "output_path")?.to_string(),
+                        force: optional_bool(&arguments, "force").unwrap_or(false),
+                        max_bytes: optional_u64(&arguments, "max_bytes")
+                            .unwrap_or(15 * 1024 * 1024),
+                    },
+                )?,
+                "yacli.mail.invite.inspect" => mail_invite_inspect(
+                    arguments.get("account").and_then(Value::as_str),
+                    MailInviteInspectToolRequest {
+                        folder: optional_string(&arguments, "folder")
+                            .unwrap_or("INBOX")
+                            .to_string(),
+                        uid: required_u64(&arguments, "uid")?,
+                        selector: mail_attachment_selector_with_context(
+                            &arguments,
+                            "yacli.mail.invite.inspect",
+                        )?,
+                        max_bytes: optional_u64(&arguments, "max_bytes")
+                            .unwrap_or(15 * 1024 * 1024),
+                    },
+                )?,
+                "yacli.mail.invite.create_event" => mail_invite_create_event(
+                    arguments.get("account").and_then(Value::as_str),
+                    MailInviteCreateEventToolRequest {
+                        folder: optional_string(&arguments, "folder")
+                            .unwrap_or("INBOX")
+                            .to_string(),
+                        uid: required_u64(&arguments, "uid")?,
+                        selector: mail_attachment_selector_with_context(
+                            &arguments,
+                            "yacli.mail.invite.create_event",
+                        )?,
+                        calendar: optional_string(&arguments, "calendar")
+                            .unwrap_or("default")
+                            .to_string(),
+                        event_index: optional_usize(&arguments, "event_index").unwrap_or(1),
+                        max_bytes: optional_u64(&arguments, "max_bytes")
+                            .unwrap_or(15 * 1024 * 1024),
+                    },
+                )?,
+                "yacli.activity.undo" => activity_undo(required_string(&arguments, "id")?)?,
+                "yacli.calendar.calendars" => {
+                    calendar_calendars(arguments.get("account").and_then(Value::as_str))?
+                }
+                "yacli.calendar.events" => calendar_events(
+                    arguments.get("account").and_then(Value::as_str),
+                    optional_string(&arguments, "calendar").unwrap_or("default"),
+                    optional_string(&arguments, "from"),
+                    optional_string(&arguments, "to"),
+                    optional_usize(&arguments, "limit").unwrap_or(20),
+                )?,
+                "yacli.calendar.create" => calendar_create(
+                    arguments.get("account").and_then(Value::as_str),
+                    CalendarCreateToolRequest {
+                        calendar: optional_string(&arguments, "calendar")
+                            .unwrap_or("default")
+                            .to_string(),
+                        summary: required_string(&arguments, "summary")?.to_string(),
+                        start: required_string(&arguments, "start")?.to_string(),
+                        end: required_string(&arguments, "end")?.to_string(),
+                        description: optional_string_owned(&arguments, "description"),
+                        location: optional_string_owned(&arguments, "location"),
+                        dry_run: optional_bool(&arguments, "dry_run").unwrap_or(false),
+                    },
+                )?,
+                "yacli.calendar.delete" => calendar_delete(
+                    arguments.get("account").and_then(Value::as_str),
+                    optional_string(&arguments, "calendar").unwrap_or("default"),
+                    required_string(&arguments, "uid")?,
+                )?,
+                "yacli.disk.info" => disk_info(arguments.get("account").and_then(Value::as_str))?,
+                "yacli.disk.list" => disk_list(
+                    arguments.get("account").and_then(Value::as_str),
+                    optional_string(&arguments, "path").unwrap_or("disk:/"),
+                    optional_usize(&arguments, "limit").unwrap_or(100),
+                    optional_u64(&arguments, "offset").unwrap_or(0),
+                )?,
+                "yacli.disk.read" => disk_read(
+                    arguments.get("account").and_then(Value::as_str),
+                    required_string(&arguments, "path")?,
+                )?,
+                "yacli.disk.mkdir" => disk_mkdir(
+                    arguments.get("account").and_then(Value::as_str),
+                    required_string(&arguments, "path")?,
+                    optional_bool(&arguments, "dry_run").unwrap_or(false),
+                )?,
+                "yacli.disk.upload" => disk_upload(
+                    arguments.get("account").and_then(Value::as_str),
+                    DiskUploadToolRequest {
+                        source: required_string(&arguments, "source")?.to_string(),
+                        path: required_string(&arguments, "path")?.to_string(),
+                        overwrite: optional_bool(&arguments, "overwrite").unwrap_or(false),
+                        dry_run: optional_bool(&arguments, "dry_run").unwrap_or(false),
+                    },
+                )?,
+                "yacli.disk.upload_link" => disk_upload_link(
+                    arguments.get("account").and_then(Value::as_str),
+                    DiskUploadLinkToolRequest {
+                        source: required_string(&arguments, "source")?.to_string(),
+                        path: required_string(&arguments, "path")?.to_string(),
+                        overwrite: optional_bool(&arguments, "overwrite").unwrap_or(false),
+                        dry_run: optional_bool(&arguments, "dry_run").unwrap_or(false),
+                    },
+                )?,
+                "yacli.disk.download" => disk_download(
+                    arguments.get("account").and_then(Value::as_str),
+                    DiskDownloadToolRequest {
+                        path: required_string(&arguments, "path")?.to_string(),
+                        output_path: required_string(&arguments, "output_path")?.to_string(),
+                        force: optional_bool(&arguments, "force").unwrap_or(false),
+                    },
+                )?,
+                "yacli.disk.publish" => disk_publish(
+                    arguments.get("account").and_then(Value::as_str),
+                    DiskPublishToolRequest {
+                        path: required_string(&arguments, "path")?.to_string(),
+                        dry_run: optional_bool(&arguments, "dry_run").unwrap_or(false),
+                    },
+                )?,
+                "yacli.disk.unpublish" => disk_unpublish(
+                    arguments.get("account").and_then(Value::as_str),
+                    DiskUnpublishToolRequest {
+                        path: required_string(&arguments, "path")?.to_string(),
+                        dry_run: optional_bool(&arguments, "dry_run").unwrap_or(false),
+                    },
+                )?,
+                _ => {
+                    return Err(YacliError::UnsupportedOperation(format!(
+                        "unsupported MCP tool: {name}"
+                    )));
+                }
+            })
+        })?;
 
     if devcat::enabled() && devcat::is_risky(name) {
         if optional_bool(&arguments, "dry_run") == Some(true) {
