@@ -329,6 +329,14 @@ pub struct MailInviteInspectRequest {
     pub max_bytes: u64,
 }
 
+#[derive(Clone, Debug)]
+pub struct MailPdfTextReadRequest {
+    pub uid: u64,
+    pub selector: MailAttachmentSelector,
+    pub max_bytes: u64,
+    pub max_chars: usize,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MailAttachmentPayload {
     pub filename: Option<String>,
@@ -751,6 +759,91 @@ pub fn inspect_mail_invite(
         request.max_bytes,
     )?;
     inspect_invite_from_message(&message, &request.selector)
+}
+
+pub fn read_mail_pdf_text(
+    imap_host: &str,
+    imap_port: u16,
+    auth: MailSessionAuth,
+    mailbox_name: &str,
+    request: MailPdfTextReadRequest,
+) -> Result<(usize, Option<String>, String)> {
+    validate_mail_attachment_read_request(
+        request.uid,
+        &request.selector,
+        request.max_bytes,
+        "mail attachment read_pdf",
+    )?;
+    if request.max_chars == 0 {
+        return Err(YacliError::Validation(
+            "max_chars для чтения PDF должен быть больше нуля".into(),
+        ));
+    }
+    let message = read_mail_message(
+        imap_host,
+        imap_port,
+        auth,
+        mailbox_name,
+        request.uid,
+        request.max_bytes,
+    )?;
+    let (index, attachment) = select_attachment_part(&message, &request.selector)?;
+    if attachment.mime_type != "application/pdf"
+        && !attachment
+            .filename
+            .as_deref()
+            .is_some_and(|name| name.to_ascii_lowercase().ends_with(".pdf"))
+    {
+        return Err(YacliError::UnsupportedOperation(
+            "selected attachment is not a PDF".into(),
+        ));
+    }
+    let text =
+        extract_pdf_text_from_bytes(&attachment.content, request.max_bytes, request.max_chars)?;
+    Ok((index, attachment.filename.clone(), text))
+}
+
+fn extract_pdf_text_from_bytes(bytes: &[u8], max_bytes: u64, max_chars: usize) -> Result<String> {
+    if bytes.len() as u64 > max_bytes {
+        return Err(YacliError::UnsupportedOperation(
+            "PDF-вложение превышает max_bytes".into(),
+        ));
+    }
+    if !bytes.starts_with(b"%PDF-") {
+        return Err(YacliError::UnsupportedOperation(
+            "в выбранном вложении отсутствует сигнатура PDF".into(),
+        ));
+    }
+    if max_chars == 0 {
+        return Err(YacliError::Validation(
+            "mail attachment read_pdf max_chars must be greater than zero".into(),
+        ));
+    }
+    let extracted = pdf_extract::extract_text_from_mem(bytes).map_err(|_| {
+        YacliError::UnsupportedOperation("не удалось извлечь текст из PDF-вложения".into())
+    })?;
+    if extracted.trim().is_empty() {
+        return Err(YacliError::UnsupportedOperation(
+            "скан / текст не извлечён, требуется распознавание".into(),
+        ));
+    }
+    let truncated = extracted.chars().count() > max_chars;
+    let marker = "\n[текст обрезан]";
+    let content_chars = if truncated {
+        max_chars.saturating_sub(marker.chars().count())
+    } else {
+        max_chars
+    };
+    let mut text: String = extracted.chars().take(content_chars).collect();
+    if truncated {
+        text.push_str(
+            &marker
+                .chars()
+                .take(max_chars.saturating_sub(text.chars().count()))
+                .collect::<String>(),
+        );
+    }
+    Ok(text)
 }
 
 pub fn reply_to_mail_message(
@@ -3114,11 +3207,11 @@ mod tests {
         SMTP_SAFE_MESSAGE_BYTES, SentMail, SmtpSession, build_forward_body, build_message_summary,
         build_outgoing_message, build_read_message, build_reply_target, build_xoauth2_payload,
         decode_modified_utf7, encode_modified_utf7, export_attachment_from_message,
-        extract_message_content, finish_sent_copy, inspect_invite_from_message,
-        load_mail_attachments, normalize_forward_subject, normalize_reply_subject,
-        normalize_search_query, parse_fetch_metadata, parse_imap_token, parse_list_line,
-        parse_search_uids, prepare_mail_submission, quote_imap_string, review_mail_submission,
-        send_mail_message, validate_mail_attachment_export_request,
+        extract_message_content, extract_pdf_text_from_bytes, finish_sent_copy,
+        inspect_invite_from_message, load_mail_attachments, normalize_forward_subject,
+        normalize_reply_subject, normalize_search_query, parse_fetch_metadata, parse_imap_token,
+        parse_list_line, parse_search_uids, prepare_mail_submission, quote_imap_string,
+        review_mail_submission, send_mail_message, validate_mail_attachment_export_request,
         validate_mail_attachment_read_request,
     };
     use base64::Engine;
@@ -4281,5 +4374,53 @@ mod tests {
         assert_eq!(inspected.invites.len(), 1);
         assert_eq!(inspected.invites[0].uid.as_deref(), Some("evt-1"));
         assert_eq!(inspected.invites[0].summary.as_deref(), Some("Sync"));
+    }
+
+    fn minimal_pdf(content_stream: &str) -> Vec<u8> {
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>".to_string(),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+            format!("<< /Length {} >>\nstream\n{}\nendstream", content_stream.len(), content_stream),
+        ];
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let mut offsets = vec![0usize];
+        for (index, object) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.extend_from_slice(format!("{} 0 obj\n{}\nendobj\n", index + 1, object).as_bytes());
+        }
+        let xref = pdf.len();
+        pdf.extend_from_slice(
+            format!("xref\n0 {}\n0000000000 65535 f \n", offsets.len()).as_bytes(),
+        );
+        for offset in offsets.iter().skip(1) {
+            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF",
+                offsets.len()
+            )
+            .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn pdf_text_extraction_returns_text_and_enforces_limits_and_scan_error() {
+        let text_pdf = minimal_pdf("BT /F1 12 Tf 72 720 Td (Hello PDF) Tj ET");
+        let text = extract_pdf_text_from_bytes(&text_pdf, 64 * 1024, 5).expect("PDF text");
+        assert!(text.chars().count() <= 5);
+        assert!(extract_pdf_text_from_bytes(&text_pdf, 8, 100).is_err());
+        assert!(extract_pdf_text_from_bytes(b"not a pdf", 100, 10).is_err());
+
+        let scan_pdf = minimal_pdf("q 0 0 10 10 re f Q");
+        let error = extract_pdf_text_from_bytes(&scan_pdf, 64 * 1024, 100).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("скан / текст не извлечён, требуется распознавание")
+        );
     }
 }

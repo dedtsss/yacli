@@ -50,13 +50,40 @@ try:
             return json.load(r)
     rpc('initialize', {'protocolVersion': '2025-11-25', 'capabilities': {}, 'clientInfo': {'name': '551-recovery', 'version': '1'}})
     tools = rpc('tools/list', {})['result']['tools']
-    save({'check': 'catalog', 'count': len(tools), 'status': 'PASS' if len(tools) == 11 else 'BLOCKED'})
+    capabilities = {value.strip() for value in env.get('YACLI_DEVCAT_CAPABILITIES', 'mail.read,disk.read').split(',') if value.strip()}
+    capability_tools = {
+        'mail.read': {'yacli.mail.folders', 'yacli.mail.list', 'yacli.mail.search', 'yacli.mail.read',
+                      'yacli.mail.attachment.export', 'yacli.mail.attachment.read_pdf', 'yacli.mail.invite.inspect'},
+        'mail.send': {'yacli.mail.send', 'yacli.mail.send_published_link'},
+        'disk.read': {'yacli.disk.info', 'yacli.disk.list', 'yacli.disk.read'},
+        'disk.write': {'yacli.disk.mkdir', 'yacli.disk.upload'},
+        'disk.publish': {'yacli.disk.publish', 'yacli.disk.unpublish'},
+    }
+    expected_tools = set().union(*(tools_for_capability for capability, tools_for_capability in capability_tools.items()
+                                   if capability in capabilities))
+    if {'mail.send', 'disk.write', 'disk.publish'} <= capabilities:
+        expected_tools.add('yacli.mail.send_link')
+    if {'disk.write', 'disk.publish'} <= capabilities:
+        expected_tools.add('yacli.disk.upload_link')
+    actual_tools = {tool['name'] for tool in tools}
+    save({'check': 'exact capability-filtered catalog', 'count': len(tools),
+          'status': 'PASS' if actual_tools == expected_tools else 'BLOCKED',
+          'unexpected': sorted(actual_tools - expected_tools),
+          'missing': sorted(expected_tools - actual_tools)})
 
     def call(name, args, phase):
         start = time.monotonic()
         row = {'account': args.get('account', 'dedts'), 'tool': name, 'phase': phase, 'status': 'BLOCKED', 'code': 'INTERRUPTED'}
         try:
-            x = rpc('tools/call', {'name': 'yacli.' + name, 'arguments': args})
+            # Retry only idempotent mailbox reads on transient provider/network failures.
+            attempts = 3 if name in ('mail.list', 'mail.folders', 'mail.read', 'mail.search') else 1
+            for attempt in range(attempts):
+                x = rpc('tools/call', {'name': 'yacli.' + name, 'arguments': args})
+                err = x.get('error') or {}
+                if err.get('data', {}).get('code') != 'NETWORK_ERROR' or attempt + 1 == attempts:
+                    break
+                time.sleep(0.5 * (attempt + 1))
+            row['attempts'] = attempt + 1
             if 'error' in x:
                 err = x['error']
                 row.update(status='BLOCKED', code=err.get('data', {}).get('code', 'RPC_ERROR'))
@@ -90,7 +117,9 @@ try:
     schema_ok = all((t['inputSchema']['properties']['account'].get('enum') == sorted(aliases) and t['inputSchema']['properties']['account'].get('default') == 'dedts' for t in tools))
     save({'check': 'exact aliases and default in every schema', 'status': 'PASS' if schema_ok else 'BLOCKED'})
     state['catalog_sha256'] = hashlib.sha256(json.dumps(tools, sort_keys=True).encode()).hexdigest()
-    read_names = {'yacli.mail.folders', 'yacli.mail.list', 'yacli.mail.search', 'yacli.mail.read', 'yacli.disk.info', 'yacli.disk.list', 'yacli.disk.read'}
+    read_names = {'yacli.mail.folders', 'yacli.mail.list', 'yacli.mail.search', 'yacli.mail.read',
+                  'yacli.mail.attachment.read_pdf', 'yacli.mail.invite.inspect',
+                  'yacli.disk.info', 'yacli.disk.list', 'yacli.disk.read'}
     annotations_ok = all((t.get('annotations', {}).get('readOnlyHint') == (t['name'] in read_names) for t in tools))
     save({'check': 'read annotations', 'status': 'PASS' if annotations_ok else 'BLOCKED'})
 
@@ -98,7 +127,7 @@ try:
         response = rpc('tools/call', {'name': 'yacli.' + name, 'arguments': arguments})
         denied = 'error' in response or response.get('result', {}).get('isError', False)
         save({'check': expected, 'status': 'EXPECTED_DENY' if denied and expected in json.dumps(response) else 'BLOCKED'})
-    deny('disk.list', {'path': 'disk:/outside'}, 'outside')
+    deny('disk.list', {'path': 'disk:/../outside'}, 'unsafe segment')
     deny('mail.folders', {'account': 'unknown-551'}, 'account')
     deny('mail.folders', {'account': 123}, 'account')
     for alias in ('ykkareliadom', 'dvabobra2014'):

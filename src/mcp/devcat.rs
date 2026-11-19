@@ -150,6 +150,9 @@ fn required_capabilities(name: &str) -> Option<&'static [&'static str]> {
         "yacli.mail.folders" | "yacli.mail.list" | "yacli.mail.search" | "yacli.mail.read" => {
             Some(&["mail.read"])
         }
+        "yacli.mail.attachment.export"
+        | "yacli.mail.attachment.read_pdf"
+        | "yacli.mail.invite.inspect" => Some(&["mail.read"]),
         "yacli.mail.send" | "yacli.mail.send_published_link" => Some(&["mail.send"]),
         "yacli.disk.info" | "yacli.disk.list" | "yacli.disk.read" => Some(&["disk.read"]),
         "yacli.disk.mkdir" | "yacli.disk.upload" => Some(&["disk.write"]),
@@ -168,7 +171,7 @@ pub fn tool_allowed(name: &str) -> bool {
         .is_some_and(|required| required.iter().all(|cap| capabilities().contains(*cap)))
 }
 
-pub fn check_tool(name: &str, arguments: &serde_json::Value) -> Result<()> {
+pub fn check_tool_access(name: &str, arguments: &serde_json::Value) -> Result<()> {
     if !enabled() {
         return Ok(());
     }
@@ -191,6 +194,14 @@ pub fn check_tool(name: &str, arguments: &serde_json::Value) -> Result<()> {
         {
             return Err(YacliError::Auth("MCP account denied".into()));
         }
+    }
+    Ok(())
+}
+
+pub fn check_tool(name: &str, arguments: &serde_json::Value) -> Result<()> {
+    check_tool_access(name, arguments)?;
+    if !enabled() {
+        return Ok(());
     }
     if name.starts_with("yacli.disk.")
         && name != "yacli.disk.info"
@@ -241,15 +252,25 @@ pub fn check_tool(name: &str, arguments: &serde_json::Value) -> Result<()> {
             .and_then(serde_json::Value::as_bool)
             != Some(true)
     {
-        let supplied = arguments
-            .get("review_sha256")
-            .and_then(serde_json::Value::as_str);
-        let expected = review_hash(name, arguments)?;
-        if supplied != Some(expected.as_str()) || !consume_review(&expected) {
-            return Err(YacliError::Auth(format!(
-                "{name} requires review_sha256 from its dry run"
-            )));
-        }
+        check_review_binding(name, arguments)?;
+    }
+    Ok(())
+}
+
+pub fn run_after_tool_check<T>(check: Result<()>, action: impl FnOnce() -> Result<T>) -> Result<T> {
+    check?;
+    action()
+}
+
+fn check_review_binding(name: &str, arguments: &serde_json::Value) -> Result<()> {
+    let supplied = arguments
+        .get("review_sha256")
+        .and_then(serde_json::Value::as_str);
+    let expected = review_hash(name, arguments)?;
+    if supplied != Some(expected.as_str()) || !consume_review(&expected) {
+        return Err(YacliError::Auth(format!(
+            "{name} requires review_sha256 from its dry run"
+        )));
     }
     Ok(())
 }
@@ -286,6 +307,10 @@ pub fn is_risky(name: &str) -> bool {
             | "yacli.disk.unpublish"
             | "yacli.disk.upload_link"
     )
+}
+
+pub fn is_read_only(name: &str) -> bool {
+    !is_risky(name) && name != "yacli.mail.attachment.export"
 }
 
 pub fn review_hash(name: &str, arguments: &serde_json::Value) -> Result<String> {
@@ -383,6 +408,44 @@ pub fn check_disk_path(path: &str) -> Result<()> {
     }
 }
 
+/// Resolve a single attachment filename inside the configured local export directory.
+pub fn attachment_export_path(filename: &str) -> Result<std::path::PathBuf> {
+    let root = std::env::var("YACLI_DEVCAT_ATTACHMENT_ROOT").map_err(|_| {
+        YacliError::Config("YACLI_DEVCAT_ATTACHMENT_ROOT is required for attachment export".into())
+    })?;
+    let root = std::path::Path::new(&root)
+        .canonicalize()
+        .map_err(|error| {
+            YacliError::Config(format!(
+                "attachment export directory is unavailable: {error}"
+            ))
+        })?;
+    attachment_export_path_at(&root, filename)
+}
+
+fn attachment_export_path_at(root: &Path, filename: &str) -> Result<std::path::PathBuf> {
+    let name = Path::new(filename);
+    if filename.trim().is_empty()
+        || name.components().count() != 1
+        || !matches!(
+            name.components().next(),
+            Some(std::path::Component::Normal(_))
+        )
+        || filename.chars().any(char::is_control)
+    {
+        return Err(YacliError::Validation(
+            "для экспорта вложения укажите только имя файла без пути".into(),
+        ));
+    }
+    let target = root.join(name);
+    if std::fs::symlink_metadata(&target).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(YacliError::Auth(
+            "экспорт вложения запрещён: целевой путь является символической ссылкой".into(),
+        ));
+    }
+    Ok(target)
+}
+
 fn clean_path(path: &str) -> Result<String> {
     let Some(tail) = path.strip_prefix("disk:/") else {
         return Err(YacliError::Validation(
@@ -440,6 +503,47 @@ mod tests {
     }
 
     #[test]
+    fn mail_read_capability_exposes_attachment_reads_but_not_calendar_writes() {
+        for name in [
+            "yacli.mail.attachment.export",
+            "yacli.mail.attachment.read_pdf",
+            "yacli.mail.invite.inspect",
+        ] {
+            assert_eq!(required_capabilities(name), Some(["mail.read"].as_slice()));
+        }
+        assert_eq!(
+            required_capabilities("yacli.mail.invite.create_event"),
+            None
+        );
+        assert_eq!(required_capabilities("yacli.mail.reply"), None);
+        assert_eq!(required_capabilities("yacli.mail.forward"), None);
+    }
+
+    #[test]
+    fn attachment_export_filename_stays_inside_root_and_rejects_symlinks() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        assert_eq!(
+            attachment_export_path_at(&root, "invoice.pdf").unwrap(),
+            root.join("invoice.pdf")
+        );
+        for unsafe_name in [
+            "../invoice.pdf",
+            "/tmp/invoice.pdf",
+            "nested/file.pdf",
+            "..",
+        ] {
+            assert!(attachment_export_path_at(&root, unsafe_name).is_err());
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(temp.path().join("outside"), temp.path().join("link.pdf"))
+                .expect("create symlink");
+            assert!(attachment_export_path_at(&root, "link.pdf").is_err());
+        }
+    }
+
+    #[test]
     fn rejects_traversal_forms() {
         for path in [
             "disk:/safe/../private",
@@ -469,6 +573,47 @@ mod tests {
             review_hash("yacli.disk.publish", &one).unwrap(),
             review_hash("yacli.disk.publish", &changed).unwrap()
         );
+    }
+
+    #[test]
+    fn review_hash_binds_native_attachment_content_digests() {
+        let one = serde_json::json!({
+            "attachment_files": [{"file_id":"file-a", "download_url":"https://files.example/a.pdf"}],
+            "_native_attachment_sha256": ["aaaa"]
+        });
+        let changed_content = serde_json::json!({
+            "attachment_files": [{"file_id":"file-a", "download_url":"https://files.example/a.pdf"}],
+            "_native_attachment_sha256": ["bbbb"]
+        });
+        assert_ne!(
+            review_hash("yacli.mail.send", &one).unwrap(),
+            review_hash("yacli.mail.send", &changed_content).unwrap()
+        );
+    }
+
+    #[test]
+    fn changed_native_file_after_preview_is_rejected_before_send_action() {
+        let mut preview = serde_json::json!({
+            "to": "self@example.test",
+            "subject": "synthetic preview",
+            "dry_run": true,
+            "attachment_files": [{"file_id":"file-a", "download_url":"https://files.example/a.pdf"}],
+            "_native_attachment_sha256": ["digest-before"]
+        });
+        let binding = review_hash("yacli.mail.send", &preview).unwrap();
+        record_review(binding.clone());
+
+        preview["dry_run"] = serde_json::Value::Bool(false);
+        preview["review_sha256"] = serde_json::Value::String(binding);
+        preview["_native_attachment_sha256"] = serde_json::json!(["digest-after"]);
+        let mut smtp_attempts = 0;
+        let result =
+            run_after_tool_check(check_review_binding("yacli.mail.send", &preview), || {
+                smtp_attempts += 1;
+                Ok(())
+            });
+        assert!(result.is_err());
+        assert_eq!(smtp_attempts, 0);
     }
 
     #[test]
