@@ -75,7 +75,15 @@ try:
         start = time.monotonic()
         row = {'account': args.get('account', 'dedts'), 'tool': name, 'phase': phase, 'status': 'BLOCKED', 'code': 'INTERRUPTED'}
         try:
-            x = rpc('tools/call', {'name': 'yacli.' + name, 'arguments': args})
+            # Retry only idempotent mailbox reads on transient provider/network failures.
+            attempts = 3 if name in ('mail.list', 'mail.folders', 'mail.read', 'mail.search') else 1
+            for attempt in range(attempts):
+                x = rpc('tools/call', {'name': 'yacli.' + name, 'arguments': args})
+                err = x.get('error') or {}
+                if err.get('data', {}).get('code') != 'NETWORK_ERROR' or attempt + 1 == attempts:
+                    break
+                time.sleep(0.5 * (attempt + 1))
+            row['attempts'] = attempt + 1
             if 'error' in x:
                 err = x['error']
                 row.update(status='BLOCKED', code=err.get('data', {}).get('code', 'RPC_ERROR'))
@@ -119,7 +127,7 @@ try:
         response = rpc('tools/call', {'name': 'yacli.' + name, 'arguments': arguments})
         denied = 'error' in response or response.get('result', {}).get('isError', False)
         save({'check': expected, 'status': 'EXPECTED_DENY' if denied and expected in json.dumps(response) else 'BLOCKED'})
-    deny('disk.list', {'path': 'disk:/outside'}, 'outside')
+    deny('disk.list', {'path': 'disk:/../outside'}, 'unsafe segment')
     deny('mail.folders', {'account': 'unknown-551'}, 'account')
     deny('mail.folders', {'account': 123}, 'account')
     for alias in ('ykkareliadom', 'dvabobra2014'):
