@@ -372,7 +372,39 @@ fn devcat_slow_or_abandoned_tool_does_not_block_sessions_and_reviews_bind_accoun
         "slow/abandoned tool held the session registry"
     );
     let tools = catalog["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 11);
+    assert_eq!(tools.len(), 14);
+    let tool_names: std::collections::BTreeSet<_> = tools
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect();
+    let expected_tool_names: std::collections::BTreeSet<_> = [
+        "yacli.mail.folders",
+        "yacli.mail.list",
+        "yacli.mail.search",
+        "yacli.mail.read",
+        "yacli.mail.attachment.export",
+        "yacli.mail.attachment.read_pdf",
+        "yacli.mail.invite.inspect",
+        "yacli.mail.send",
+        "yacli.mail.send_published_link",
+        "yacli.disk.info",
+        "yacli.disk.list",
+        "yacli.disk.read",
+        "yacli.disk.mkdir",
+        "yacli.disk.upload",
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(tool_names, expected_tool_names);
+    let export = tools
+        .iter()
+        .find(|tool| tool["name"] == "yacli.mail.attachment.export")
+        .unwrap();
+    assert_eq!(
+        export["inputSchema"]["required"],
+        json!(["uid", "output_name"])
+    );
+    assert!(export["inputSchema"]["properties"]["output_path"].is_null());
     for tool in tools {
         let schema = &tool["inputSchema"]["properties"]["account"];
         assert_eq!(schema["enum"], json!(["mock", "second"]));
@@ -398,6 +430,7 @@ fn devcat_slow_or_abandoned_tool_does_not_block_sessions_and_reviews_bind_accoun
                 name,
                 "yacli.disk.upload"
                     | "yacli.disk.mkdir"
+                    | "yacli.mail.attachment.export"
                     | "yacli.mail.send"
                     | "yacli.mail.send_published_link"
             )

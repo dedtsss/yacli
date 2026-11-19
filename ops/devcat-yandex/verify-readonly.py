@@ -50,7 +50,26 @@ try:
             return json.load(r)
     rpc('initialize', {'protocolVersion': '2025-11-25', 'capabilities': {}, 'clientInfo': {'name': '551-recovery', 'version': '1'}})
     tools = rpc('tools/list', {})['result']['tools']
-    save({'check': 'catalog', 'count': len(tools), 'status': 'PASS' if len(tools) == 11 else 'BLOCKED'})
+    capabilities = {value.strip() for value in env.get('YACLI_DEVCAT_CAPABILITIES', 'mail.read,disk.read').split(',') if value.strip()}
+    capability_tools = {
+        'mail.read': {'yacli.mail.folders', 'yacli.mail.list', 'yacli.mail.search', 'yacli.mail.read',
+                      'yacli.mail.attachment.export', 'yacli.mail.attachment.read_pdf', 'yacli.mail.invite.inspect'},
+        'mail.send': {'yacli.mail.send', 'yacli.mail.send_published_link'},
+        'disk.read': {'yacli.disk.info', 'yacli.disk.list', 'yacli.disk.read'},
+        'disk.write': {'yacli.disk.mkdir', 'yacli.disk.upload'},
+        'disk.publish': {'yacli.disk.publish', 'yacli.disk.unpublish'},
+    }
+    expected_tools = set().union(*(tools_for_capability for capability, tools_for_capability in capability_tools.items()
+                                   if capability in capabilities))
+    if {'mail.send', 'disk.write', 'disk.publish'} <= capabilities:
+        expected_tools.add('yacli.mail.send_link')
+    if {'disk.write', 'disk.publish'} <= capabilities:
+        expected_tools.add('yacli.disk.upload_link')
+    actual_tools = {tool['name'] for tool in tools}
+    save({'check': 'exact capability-filtered catalog', 'count': len(tools),
+          'status': 'PASS' if actual_tools == expected_tools else 'BLOCKED',
+          'unexpected': sorted(actual_tools - expected_tools),
+          'missing': sorted(expected_tools - actual_tools)})
 
     def call(name, args, phase):
         start = time.monotonic()
@@ -90,7 +109,9 @@ try:
     schema_ok = all((t['inputSchema']['properties']['account'].get('enum') == sorted(aliases) and t['inputSchema']['properties']['account'].get('default') == 'dedts' for t in tools))
     save({'check': 'exact aliases and default in every schema', 'status': 'PASS' if schema_ok else 'BLOCKED'})
     state['catalog_sha256'] = hashlib.sha256(json.dumps(tools, sort_keys=True).encode()).hexdigest()
-    read_names = {'yacli.mail.folders', 'yacli.mail.list', 'yacli.mail.search', 'yacli.mail.read', 'yacli.disk.info', 'yacli.disk.list', 'yacli.disk.read'}
+    read_names = {'yacli.mail.folders', 'yacli.mail.list', 'yacli.mail.search', 'yacli.mail.read',
+                  'yacli.mail.attachment.read_pdf', 'yacli.mail.invite.inspect',
+                  'yacli.disk.info', 'yacli.disk.list', 'yacli.disk.read'}
     annotations_ok = all((t.get('annotations', {}).get('readOnlyHint') == (t['name'] in read_names) for t in tools))
     save({'check': 'read annotations', 'status': 'PASS' if annotations_ok else 'BLOCKED'})
 

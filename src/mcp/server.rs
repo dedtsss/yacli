@@ -69,9 +69,9 @@ use crate::{
     },
     mail::{
         MailAttachmentExportRequest, MailAttachmentSelector, MailInviteInspectRequest,
-        export_mail_attachment, inspect_mail_invite, list_mail_folders, list_mail_messages,
-        load_mail_attachments, read_mail_message, review_mail_submission, search_mail_messages,
-        send_mail_message_with_sent_copy,
+        MailPdfTextReadRequest, export_mail_attachment, inspect_mail_invite, list_mail_folders,
+        list_mail_messages, load_mail_attachments, read_mail_message, read_mail_pdf_text,
+        review_mail_submission, search_mail_messages, send_mail_message_with_sent_copy,
     },
 };
 use chrono::{DateTime, Utc};
@@ -208,6 +208,14 @@ struct MailAttachmentExportToolRequest {
     output: String,
     force: bool,
     max_bytes: u64,
+}
+
+struct MailAttachmentPdfTextToolRequest {
+    folder: String,
+    uid: u64,
+    selector: MailAttachmentSelector,
+    max_bytes: u64,
+    max_chars: usize,
 }
 
 struct MailInviteInspectToolRequest {
@@ -1176,6 +1184,39 @@ fn handle_request(
 }
 
 fn tool_definitions(ui_enabled: bool, roots_enabled: bool) -> Result<Vec<Value>> {
+    let attachment_export_schema = if devcat::enabled() {
+        json!({
+            "type": "object",
+            "properties": {
+                "account": { "type": "string" },
+                "folder": { "type": "string" },
+                "uid": { "type": "integer", "minimum": 1 },
+                "index": { "type": "integer", "minimum": 1 },
+                "name": { "type": "string" },
+                "output_name": { "type": "string" },
+                "force": { "type": "boolean" },
+                "max_bytes": { "type": "integer", "minimum": 1 }
+            },
+            "required": ["uid", "output_name"],
+            "additionalProperties": false
+        })
+    } else {
+        json!({
+            "type": "object",
+            "properties": {
+                "account": { "type": "string" },
+                "folder": { "type": "string" },
+                "uid": { "type": "integer", "minimum": 1 },
+                "index": { "type": "integer", "minimum": 1 },
+                "name": { "type": "string" },
+                "output_path": { "type": "string" },
+                "force": { "type": "boolean" },
+                "max_bytes": { "type": "integer", "minimum": 1 }
+            },
+            "required": ["uid", "output_path"],
+            "additionalProperties": false
+        })
+    };
     let account_schema = if devcat::enabled() {
         Some(devcat::account_schema()?)
     } else {
@@ -1509,7 +1550,14 @@ fn tool_definitions(ui_enabled: bool, roots_enabled: bool) -> Result<Vec<Value>>
         ),
         tool(
             "yacli.mail.attachment.export",
-            "Export one mail attachment to a local file on the MCP server host.",
+            "Сохранить вложение письма; в DevCat вывод ограничен настроенным локальным каталогом.",
+            attachment_export_schema,
+            None,
+            ui_enabled,
+        ),
+        tool(
+            "yacli.mail.attachment.read_pdf",
+            "Вернуть ограниченный по объёму текст из PDF-вложения без записи файла на сервере.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1518,11 +1566,10 @@ fn tool_definitions(ui_enabled: bool, roots_enabled: bool) -> Result<Vec<Value>>
                     "uid": { "type": "integer", "minimum": 1 },
                     "index": { "type": "integer", "minimum": 1 },
                     "name": { "type": "string" },
-                    "output_path": { "type": "string" },
-                    "force": { "type": "boolean" },
-                    "max_bytes": { "type": "integer", "minimum": 1 }
+                    "max_bytes": { "type": "integer", "minimum": 1, "maximum": 5242880 },
+                    "max_chars": { "type": "integer", "minimum": 1, "maximum": 100000 }
                 },
-                "required": ["uid", "output_path"],
+                "required": ["uid"],
                 "additionalProperties": false
             }),
             None,
@@ -1824,7 +1871,7 @@ fn tool(
     );
     object.insert("inputSchema".to_string(), input_schema);
     if devcat::enabled() {
-        let read_only = !devcat::is_risky(name);
+        let read_only = devcat::is_read_only(name);
         object.insert(
             "annotations".into(),
             json!({
@@ -2030,12 +2077,37 @@ fn call_tool(params: Value, ui_enabled: bool) -> Result<Value> {
                             .to_string(),
                         uid: required_u64(&arguments, "uid")?,
                         selector: mail_attachment_selector(&arguments)?,
-                        output: required_string(&arguments, "output_path")?.to_string(),
+                        output: if devcat::enabled() {
+                            required_string(&arguments, "output_name")?.to_string()
+                        } else {
+                            required_string(&arguments, "output_path")?.to_string()
+                        },
                         force: optional_bool(&arguments, "force").unwrap_or(false),
                         max_bytes: optional_u64(&arguments, "max_bytes")
                             .unwrap_or(15 * 1024 * 1024),
                     },
                 )?,
+                "yacli.mail.attachment.read_pdf" => {
+                    let (max_bytes, max_chars) = bounded_pdf_limits(
+                        optional_u64(&arguments, "max_bytes"),
+                        optional_usize(&arguments, "max_chars"),
+                    )?;
+                    mail_attachment_read_pdf_text(
+                        arguments.get("account").and_then(Value::as_str),
+                        MailAttachmentPdfTextToolRequest {
+                            folder: optional_string(&arguments, "folder")
+                                .unwrap_or("INBOX")
+                                .into(),
+                            uid: required_u64(&arguments, "uid")?,
+                            selector: mail_attachment_selector_with_context(
+                                &arguments,
+                                "yacli.mail.attachment.read_pdf",
+                            )?,
+                            max_bytes,
+                            max_chars,
+                        },
+                    )?
+                }
                 "yacli.mail.invite.inspect" => mail_invite_inspect(
                     arguments.get("account").and_then(Value::as_str),
                     MailInviteInspectToolRequest {
@@ -3307,6 +3379,11 @@ fn mail_attachment_export(
     account: Option<&str>,
     request: MailAttachmentExportToolRequest,
 ) -> Result<Value> {
+    let output = if devcat::enabled() {
+        devcat::attachment_export_path(&request.output)?
+    } else {
+        PathBuf::from(&request.output)
+    };
     let (resolved_account, auth, context) = resolve_mail_private_context(account)?;
     let attachment = export_mail_attachment(
         &context.imap_host,
@@ -3316,7 +3393,7 @@ fn mail_attachment_export(
         MailAttachmentExportRequest {
             uid: request.uid,
             selector: request.selector,
-            output: PathBuf::from(&request.output),
+            output,
             force: request.force,
             max_bytes: request.max_bytes,
         },
@@ -3326,6 +3403,49 @@ fn mail_attachment_export(
         "folder": request.folder,
         "attachment": attachment,
     }))
+}
+
+fn mail_attachment_read_pdf_text(
+    account: Option<&str>,
+    request: MailAttachmentPdfTextToolRequest,
+) -> Result<Value> {
+    let (resolved_account, auth, context) = resolve_mail_private_context(account)?;
+    let (attachment_index, filename, text) = read_mail_pdf_text(
+        &context.imap_host,
+        context.imap_port,
+        auth,
+        &request.folder,
+        MailPdfTextReadRequest {
+            uid: request.uid,
+            selector: request.selector,
+            max_bytes: request.max_bytes,
+            max_chars: request.max_chars,
+        },
+    )?;
+    Ok(json!({
+        "account": resolved_account,
+        "folder": request.folder,
+        "uid": request.uid,
+        "attachment_index": attachment_index,
+        "filename": filename,
+        "text": text,
+    }))
+}
+
+fn bounded_pdf_limits(max_bytes: Option<u64>, max_chars: Option<usize>) -> Result<(u64, usize)> {
+    let max_bytes = max_bytes.unwrap_or(5 * 1024 * 1024);
+    let max_chars = max_chars.unwrap_or(100_000);
+    if max_bytes == 0 || max_bytes > 5 * 1024 * 1024 {
+        return Err(YacliError::Validation(
+            "max_bytes для чтения PDF должен быть от 1 до 5242880".into(),
+        ));
+    }
+    if max_chars == 0 || max_chars > 100_000 {
+        return Err(YacliError::Validation(
+            "max_chars для чтения PDF должен быть от 1 до 100000".into(),
+        ));
+    }
+    Ok((max_bytes, max_chars))
 }
 
 fn mail_invite_inspect(
@@ -5117,7 +5237,7 @@ fn canonical_base_url(server_url: &str) -> Result<String> {
 #[cfg(test)]
 mod native_attachment_schema_tests {
     use super::{
-        Digest, NativeMailFile, Sha256, Url, download_native_mail_files,
+        Digest, NativeMailFile, Sha256, Url, bounded_pdf_limits, download_native_mail_files,
         download_native_mail_files_with, is_public_ip, native_mime_type,
         read_limited_native_content, resolve_dns_addresses_with, resolve_public_download_addresses,
         safe_native_filename, tool_definitions, validate_native_attachment_url,
@@ -5147,6 +5267,34 @@ mod native_attachment_schema_tests {
             send["_meta"]["openai/fileParams"],
             json!(["attachment_files"])
         );
+        let pdf = tools
+            .iter()
+            .find(|tool| tool["name"] == "yacli.mail.attachment.read_pdf")
+            .expect("PDF text tool");
+        assert_eq!(
+            pdf["inputSchema"]["properties"]["max_bytes"]["maximum"],
+            5_242_880
+        );
+        assert_eq!(
+            pdf["inputSchema"]["properties"]["max_chars"]["maximum"],
+            100_000
+        );
+    }
+
+    #[test]
+    fn pdf_limits_apply_to_omitted_and_explicit_values() {
+        assert_eq!(
+            bounded_pdf_limits(None, None).unwrap(),
+            (5_242_880, 100_000)
+        );
+        assert_eq!(
+            bounded_pdf_limits(Some(1024), Some(500)).unwrap(),
+            (1024, 500)
+        );
+        assert!(bounded_pdf_limits(Some(5_242_881), None).is_err());
+        assert!(bounded_pdf_limits(None, Some(100_001)).is_err());
+        assert!(bounded_pdf_limits(Some(0), None).is_err());
+        assert!(bounded_pdf_limits(None, Some(0)).is_err());
     }
 
     #[test]

@@ -842,6 +842,18 @@ client_id = "client-123"
             .iter()
             .any(|tool| tool["name"] == "yacli.mail.attachment.export")
     );
+    let pdf_tool = tools
+        .iter()
+        .find(|tool| tool["name"] == "yacli.mail.attachment.read_pdf")
+        .expect("PDF text tool");
+    assert_eq!(
+        pdf_tool["inputSchema"]["properties"]["max_bytes"]["maximum"],
+        5_242_880
+    );
+    assert_eq!(
+        pdf_tool["inputSchema"]["properties"]["max_chars"]["maximum"],
+        100_000
+    );
     assert!(
         tools
             .iter()

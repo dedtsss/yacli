@@ -150,6 +150,9 @@ fn required_capabilities(name: &str) -> Option<&'static [&'static str]> {
         "yacli.mail.folders" | "yacli.mail.list" | "yacli.mail.search" | "yacli.mail.read" => {
             Some(&["mail.read"])
         }
+        "yacli.mail.attachment.export"
+        | "yacli.mail.attachment.read_pdf"
+        | "yacli.mail.invite.inspect" => Some(&["mail.read"]),
         "yacli.mail.send" | "yacli.mail.send_published_link" => Some(&["mail.send"]),
         "yacli.disk.info" | "yacli.disk.list" | "yacli.disk.read" => Some(&["disk.read"]),
         "yacli.disk.mkdir" | "yacli.disk.upload" => Some(&["disk.write"]),
@@ -306,6 +309,10 @@ pub fn is_risky(name: &str) -> bool {
     )
 }
 
+pub fn is_read_only(name: &str) -> bool {
+    !is_risky(name) && name != "yacli.mail.attachment.export"
+}
+
 pub fn review_hash(name: &str, arguments: &serde_json::Value) -> Result<String> {
     let mut args = arguments
         .as_object()
@@ -401,6 +408,44 @@ pub fn check_disk_path(path: &str) -> Result<()> {
     }
 }
 
+/// Resolve a single attachment filename inside the configured local export directory.
+pub fn attachment_export_path(filename: &str) -> Result<std::path::PathBuf> {
+    let root = std::env::var("YACLI_DEVCAT_ATTACHMENT_ROOT").map_err(|_| {
+        YacliError::Config("YACLI_DEVCAT_ATTACHMENT_ROOT is required for attachment export".into())
+    })?;
+    let root = std::path::Path::new(&root)
+        .canonicalize()
+        .map_err(|error| {
+            YacliError::Config(format!(
+                "attachment export directory is unavailable: {error}"
+            ))
+        })?;
+    attachment_export_path_at(&root, filename)
+}
+
+fn attachment_export_path_at(root: &Path, filename: &str) -> Result<std::path::PathBuf> {
+    let name = Path::new(filename);
+    if filename.trim().is_empty()
+        || name.components().count() != 1
+        || !matches!(
+            name.components().next(),
+            Some(std::path::Component::Normal(_))
+        )
+        || filename.chars().any(char::is_control)
+    {
+        return Err(YacliError::Validation(
+            "для экспорта вложения укажите только имя файла без пути".into(),
+        ));
+    }
+    let target = root.join(name);
+    if std::fs::symlink_metadata(&target).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(YacliError::Auth(
+            "экспорт вложения запрещён: целевой путь является символической ссылкой".into(),
+        ));
+    }
+    Ok(target)
+}
+
 fn clean_path(path: &str) -> Result<String> {
     let Some(tail) = path.strip_prefix("disk:/") else {
         return Err(YacliError::Validation(
@@ -455,6 +500,47 @@ mod tests {
         );
         assert!(!accounts.contains("other"));
         assert!(merge_allowed_accounts("   ", Some("dedts")).is_err());
+    }
+
+    #[test]
+    fn mail_read_capability_exposes_attachment_reads_but_not_calendar_writes() {
+        for name in [
+            "yacli.mail.attachment.export",
+            "yacli.mail.attachment.read_pdf",
+            "yacli.mail.invite.inspect",
+        ] {
+            assert_eq!(required_capabilities(name), Some(["mail.read"].as_slice()));
+        }
+        assert_eq!(
+            required_capabilities("yacli.mail.invite.create_event"),
+            None
+        );
+        assert_eq!(required_capabilities("yacli.mail.reply"), None);
+        assert_eq!(required_capabilities("yacli.mail.forward"), None);
+    }
+
+    #[test]
+    fn attachment_export_filename_stays_inside_root_and_rejects_symlinks() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        assert_eq!(
+            attachment_export_path_at(&root, "invoice.pdf").unwrap(),
+            root.join("invoice.pdf")
+        );
+        for unsafe_name in [
+            "../invoice.pdf",
+            "/tmp/invoice.pdf",
+            "nested/file.pdf",
+            "..",
+        ] {
+            assert!(attachment_export_path_at(&root, unsafe_name).is_err());
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(temp.path().join("outside"), temp.path().join("link.pdf"))
+                .expect("create symlink");
+            assert!(attachment_export_path_at(&root, "link.pdf").is_err());
+        }
     }
 
     #[test]
