@@ -5879,6 +5879,8 @@ mod native_attachment_schema_tests {
     };
     use serde_json::json;
 
+    static DNS_RESOLVER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn mail_send_exposes_native_chatgpt_file_contract() {
         let tools = tool_definitions(false, false).expect("tool definitions");
@@ -5929,6 +5931,7 @@ mod native_attachment_schema_tests {
 
     #[test]
     fn native_dns_timeout_bounds_stuck_resolver_threads() {
+        let _lock = DNS_RESOLVER_TEST_LOCK.lock().unwrap();
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::mpsc;
@@ -5986,6 +5989,7 @@ mod native_attachment_schema_tests {
 
     #[test]
     fn native_dns_resolver_slot_is_released_after_panic() {
+        let _lock = DNS_RESOLVER_TEST_LOCK.lock().unwrap();
         let result = resolve_dns_addresses_with(
             || -> std::io::Result<Vec<std::net::SocketAddr>> { panic!("synthetic resolver panic") },
             std::time::Duration::from_secs(1),
