@@ -560,8 +560,12 @@ pub fn list_mail_drafts_page(
     limit: usize,
     offset: usize,
 ) -> Result<(String, Vec<MailMessageSummary>)> {
-    let folders = list_mail_folders(imap_host, imap_port, auth.clone())?;
-    let drafts = folders
+    validate_mail_summary_limit("mail draft list", limit)?;
+    validate_mail_page_offset(offset)?;
+
+    let mut session = open_authenticated_session(imap_host, imap_port, auth)?;
+    let drafts = session
+        .list_folders()?
         .into_iter()
         .find(|folder| {
             folder
@@ -572,7 +576,24 @@ pub fn list_mail_drafts_page(
         .ok_or_else(|| {
             YacliError::Api("IMAP server did not advertise a \\Drafts mailbox".into())
         })?;
-    let items = list_mail_messages_page(imap_host, imap_port, auth, &drafts.name, limit, offset)?;
+    session.select_mailbox(&encode_modified_utf7(&drafts.name))?;
+    let uids = session.search_all_uids()?;
+    if uids.is_empty() {
+        let _ = session.logout();
+        return Ok((drafts.name, Vec::new()));
+    }
+    let selected_uids = uids
+        .into_iter()
+        .rev()
+        .skip(offset)
+        .take(limit)
+        .collect::<Vec<_>>();
+    if selected_uids.is_empty() {
+        let _ = session.logout();
+        return Ok((drafts.name, Vec::new()));
+    }
+    let items = session.fetch_message_summaries(&selected_uids)?;
+    let _ = session.logout();
     Ok((drafts.name, items))
 }
 
