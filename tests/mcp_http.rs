@@ -372,7 +372,7 @@ fn devcat_slow_or_abandoned_tool_does_not_block_sessions_and_reviews_bind_accoun
         "slow/abandoned tool held the session registry"
     );
     let tools = catalog["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 17);
+    assert_eq!(tools.len(), 18);
     for tool in tools {
         let schema = &tool["inputSchema"]["properties"]["account"];
         assert_eq!(schema["enum"], json!(["mock", "second"]));
@@ -397,11 +397,12 @@ fn devcat_slow_or_abandoned_tool_does_not_block_sessions_and_reviews_bind_accoun
                     | "yacli.disk.trash.restore"
                     | "yacli.mail.send"
                     | "yacli.mail.send_published_link"
+                    | "yacli.mail.reply"
             )
         );
         assert_eq!(
             tool["annotations"]["openWorldHint"],
-            name.starts_with("yacli.mail.send")
+            name.starts_with("yacli.mail.send") || name == "yacli.mail.reply"
         );
         assert_eq!(
             tool["annotations"]["readOnlyHint"],
@@ -416,6 +417,7 @@ fn devcat_slow_or_abandoned_tool_does_not_block_sessions_and_reviews_bind_accoun
                     | "yacli.disk.trash.restore"
                     | "yacli.mail.send"
                     | "yacli.mail.send_published_link"
+                    | "yacli.mail.reply"
             )
         );
     }

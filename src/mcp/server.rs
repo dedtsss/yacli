@@ -76,8 +76,8 @@ use crate::{
         apply_mail_bulk_action, copy_mail_message, create_mail_draft, create_mail_folder,
         export_mail_attachment, inspect_mail_invite, list_mail_folders, list_mail_messages_page,
         load_mail_attachments, move_mail_message, move_mail_message_to_special_folder,
-        read_mail_message, rename_mail_folder, review_mail_submission,
-        search_mail_all_folders_page, search_mail_messages_filtered_page,
+        read_mail_message, rename_mail_folder, review_mail_reply_submission,
+        review_mail_submission, search_mail_all_folders_page, search_mail_messages_filtered_page,
         send_mail_message_with_sent_copy, update_mail_flags, validate_mail_folder_rename,
     },
 };
@@ -1495,7 +1495,7 @@ fn tool_definitions(ui_enabled: bool, roots_enabled: bool) -> Result<Vec<Value>>
         ),
         tool(
             "yacli.mail.reply",
-            "Reply to one message by UID.",
+            "Ответить на письмо; reply_all=true добавляет остальных адресатов исходного письма в копию, исключая адрес текущего аккаунта.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1504,6 +1504,8 @@ fn tool_definitions(ui_enabled: bool, roots_enabled: bool) -> Result<Vec<Value>>
                     "uid": { "type": "integer", "minimum": 1 },
                     "text": { "type": "string" },
                     "html": { "type": "string" },
+                    "reply_all": { "type": "boolean" },
+                    "dry_run": { "type": "boolean" },
                     "cc": {
                         "type": "array",
                         "items": { "type": "string" }
@@ -1961,7 +1963,7 @@ fn tool(
                 "readOnlyHint": read_only,
             "destructiveHint": devcat::is_risky(name),
                 "idempotentHint": read_only,
-            "openWorldHint": name.starts_with("yacli.mail.send")
+            "openWorldHint": name.starts_with("yacli.mail.send") || name == "yacli.mail.reply"
             }),
         );
     }
@@ -2105,14 +2107,7 @@ fn call_tool(params: Value, ui_enabled: bool) -> Result<Value> {
                 dry_run: optional_bool(&arguments, "dry_run").unwrap_or(false),
             },
         )?,
-        "yacli.mail.reply" => mail_reply(
-            arguments.get("account").and_then(Value::as_str),
-            optional_string(&arguments, "folder").unwrap_or("INBOX"),
-            required_u64(&arguments, "uid")?,
-            string_list(&arguments, "cc")?,
-            optional_string_owned(&arguments, "text"),
-            optional_string_owned(&arguments, "html"),
-        )?,
+        "yacli.mail.reply" => mail_reply(&arguments)?,
         "yacli.mail.forward" => mail_forward(
             arguments.get("account").and_then(Value::as_str),
             MailForwardToolRequest {
@@ -3530,15 +3525,38 @@ fn mail_send_published_link(
     }
 }
 
-fn mail_reply(
-    account: Option<&str>,
-    folder: &str,
-    uid: u64,
-    cc: Vec<String>,
-    text: Option<String>,
-    html: Option<String>,
-) -> Result<Value> {
+fn mail_reply(args: &Value) -> Result<Value> {
+    let account = args.get("account").and_then(Value::as_str);
+    let folder = optional_string(args, "folder").unwrap_or("INBOX");
+    let uid = required_u64(args, "uid")?;
+    let cc = string_list(args, "cc")?;
+    let reply_all = optional_bool(args, "reply_all").unwrap_or(false);
+    let dry_run = optional_bool(args, "dry_run").unwrap_or(false);
+    let text = optional_string_owned(args, "text");
+    let html = optional_string_owned(args, "html");
     let (resolved_account, auth, context) = resolve_mail_private_context(account)?;
+    let request = crate::mail::MailReplyRequest {
+        uid,
+        account_email: context.email.clone(),
+        reply_all,
+        cc,
+        text,
+        html,
+    };
+    if dry_run {
+        let review = review_mail_reply_submission(
+            &context.imap_host,
+            context.imap_port,
+            auth,
+            folder,
+            request,
+        )?;
+        let digest = devcat::review_hash("yacli.mail.reply", args)?;
+        devcat::record_review(digest.clone());
+        return Ok(
+            json!({"account":resolved_account,"folder":folder,"uid":uid,"dry_run":true,"review":review,"review_sha256":digest}),
+        );
+    }
     let reply = crate::mail::reply_to_mail_message(
         &context.imap_host,
         context.imap_port,
@@ -3546,12 +3564,7 @@ fn mail_reply(
         context.smtp_port,
         auth,
         folder,
-        crate::mail::MailReplyRequest {
-            uid,
-            cc,
-            text,
-            html,
-        },
+        request,
     )?;
     Ok(json!({
         "account": resolved_account,

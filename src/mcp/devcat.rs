@@ -150,7 +150,9 @@ fn required_capabilities(name: &str) -> Option<&'static [&'static str]> {
         "yacli.mail.folders" | "yacli.mail.list" | "yacli.mail.search" | "yacli.mail.read" => {
             Some(&["mail.read"])
         }
-        "yacli.mail.send" | "yacli.mail.send_published_link" => Some(&["mail.send"]),
+        "yacli.mail.send" | "yacli.mail.send_published_link" | "yacli.mail.reply" => {
+            Some(&["mail.send"])
+        }
         "yacli.mail.folder.create"
         | "yacli.mail.folder.rename"
         | "yacli.mail.copy"
@@ -337,6 +339,7 @@ pub fn is_risky(name: &str) -> bool {
         "yacli.mail.send"
             | "yacli.mail.send_link"
             | "yacli.mail.send_published_link"
+            | "yacli.mail.reply"
             | "yacli.mail.folder.create"
             | "yacli.mail.folder.rename"
             | "yacli.mail.copy"
@@ -603,6 +606,15 @@ mod tests {
             );
             assert!(is_risky(name));
         }
+    }
+
+    #[test]
+    fn mail_reply_uses_send_capability_and_review_gate() {
+        assert_eq!(
+            required_capabilities("yacli.mail.reply"),
+            Some(["mail.send"].as_slice())
+        );
+        assert!(is_risky("yacli.mail.reply"));
     }
 
     #[test]

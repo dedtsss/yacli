@@ -1401,6 +1401,7 @@ fn mail_reply_help_uses_positional_text() {
         .stdout(predicate::str::contains(
             "yacli mail reply [OPTIONS] <ID> [ТЕКСТ]",
         ))
+        .stdout(predicate::str::contains("--reply-all"))
         .stdout(predicate::str::contains("--text").not());
 }
 

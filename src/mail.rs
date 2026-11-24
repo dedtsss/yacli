@@ -409,6 +409,8 @@ pub struct RepliedMail {
 #[derive(Clone, Debug)]
 pub struct MailReplyRequest {
     pub uid: u64,
+    pub account_email: String,
+    pub reply_all: bool,
     pub cc: Vec<String>,
     pub text: Option<String>,
     pub html: Option<String>,
@@ -1303,43 +1305,72 @@ pub fn reply_to_mail_message(
         ));
     }
 
-    let normalized_body = normalize_outgoing_body(request.text, request.html, "mail reply")?;
+    let original_uid = request.uid;
+    let (target, submission) =
+        build_mail_reply_submission(imap_host, imap_port, &auth, mailbox_name, request)?;
+    let sent = send_mail_message_with_sent_copy(
+        smtp_host, smtp_port, imap_host, imap_port, auth, submission,
+    )?;
 
+    Ok(RepliedMail {
+        original_uid,
+        recipient: target.recipient,
+        original_subject: target.subject,
+        original_message_id: target.message_id,
+        sent,
+    })
+}
+
+pub fn review_mail_reply_submission(
+    imap_host: &str,
+    imap_port: u16,
+    auth: MailSessionAuth,
+    mailbox_name: &str,
+    request: MailReplyRequest,
+) -> Result<MailSendReview> {
+    let (_, submission) =
+        build_mail_reply_submission(imap_host, imap_port, &auth, mailbox_name, request)?;
+    review_mail_submission(auth, submission)
+}
+
+fn build_mail_reply_submission(
+    imap_host: &str,
+    imap_port: u16,
+    auth: &MailSessionAuth,
+    mailbox_name: &str,
+    request: MailReplyRequest,
+) -> Result<(MailReplyTarget, MailSendRequest)> {
+    validate_mail_uid(request.uid)?;
+    let normalized_body = normalize_outgoing_body(request.text, request.html, "mail reply")?;
     let target = fetch_reply_target(
         imap_host,
         imap_port,
         auth.clone(),
         mailbox_name,
         request.uid,
+        &request.account_email,
     )?;
-    let sent = send_mail_message_with_sent_copy(
-        smtp_host,
-        smtp_port,
-        imap_host,
-        imap_port,
-        auth,
-        MailSendRequest {
-            to: vec![target.recipient.clone()],
-            cc: request.cc,
-            bcc: Vec::new(),
-            subject: normalize_reply_subject(&target.subject),
-            text: normalized_body.text,
-            html: normalized_body.html,
-            attachments: Vec::new(),
-            thread_headers: Some(MailThreadHeaders {
-                in_reply_to: target.message_id.clone(),
-                references: target.references.clone(),
-            }),
-        },
-    )?;
-
-    Ok(RepliedMail {
-        original_uid: request.uid,
-        recipient: target.recipient,
-        original_subject: target.subject,
-        original_message_id: target.message_id,
-        sent,
-    })
+    let mut cc = if request.reply_all {
+        target.reply_all_cc.clone()
+    } else {
+        Vec::new()
+    };
+    cc.extend(request.cc);
+    let cc = dedupe_email_addresses(cc, std::slice::from_ref(&target.recipient));
+    let submission = MailSendRequest {
+        to: vec![target.recipient.clone()],
+        cc,
+        bcc: Vec::new(),
+        subject: normalize_reply_subject(&target.subject),
+        text: normalized_body.text,
+        html: normalized_body.html,
+        attachments: Vec::new(),
+        thread_headers: Some(MailThreadHeaders {
+            in_reply_to: target.message_id.clone(),
+            references: target.references.clone(),
+        }),
+    };
+    Ok((target, submission))
 }
 
 pub fn forward_mail_message(
@@ -1427,17 +1458,26 @@ fn fetch_reply_target(
     auth: MailSessionAuth,
     mailbox_name: &str,
     uid: u64,
+    account_email: &str,
 ) -> Result<MailReplyTarget> {
     let mut session = open_authenticated_session(imap_host, imap_port, auth)?;
     let encoded_mailbox = encode_modified_utf7(mailbox_name);
     session.select_mailbox(&encoded_mailbox)?;
     let (_, headers) = session.fetch_message_headers(
         uid,
-        &["SUBJECT", "FROM", "REPLY-TO", "MESSAGE-ID", "REFERENCES"],
+        &[
+            "SUBJECT",
+            "FROM",
+            "REPLY-TO",
+            "TO",
+            "CC",
+            "MESSAGE-ID",
+            "REFERENCES",
+        ],
     )?;
     let _ = session.logout();
 
-    build_reply_target(&headers)
+    build_reply_target_for_account(&headers, Some(account_email))
 }
 
 #[derive(Debug)]
@@ -1485,6 +1525,7 @@ struct PreparedMailSubmission {
 
 struct MailReplyTarget {
     recipient: String,
+    reply_all_cc: Vec<String>,
     subject: String,
     message_id: String,
     references: Vec<String>,
@@ -2223,7 +2264,10 @@ fn starts_with_ascii_case(value: &str, prefix: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn build_reply_target(headers: &[u8]) -> Result<MailReplyTarget> {
+fn build_reply_target_for_account(
+    headers: &[u8],
+    account_email: Option<&str>,
+) -> Result<MailReplyTarget> {
     let (parsed, _) = mailparse::parse_headers(headers)
         .map_err(|err| YacliError::Serialization(format!("failed to parse mail headers: {err}")))?;
 
@@ -2233,6 +2277,22 @@ fn build_reply_target(headers: &[u8]) -> Result<MailReplyTarget> {
         YacliError::Serialization("reply target has no Reply-To or From header".to_string())
     })?;
     let recipient = extract_primary_recipient(&recipient_header)?;
+    if account_email.is_some_and(|email| email.eq_ignore_ascii_case(&recipient)) {
+        return Err(YacliError::Validation(
+            "Нельзя ответить на письмо, отправителем которого является этот же аккаунт".into(),
+        ));
+    }
+    let mut reply_all_addresses = Vec::new();
+    for header_name in ["To", "Cc"] {
+        if let Some(value) = parsed.get_first_value(header_name) {
+            reply_all_addresses.extend(parse_recipient_addresses(&value)?);
+        }
+    }
+    let mut excluded = vec![recipient.clone()];
+    if let Some(account_email) = account_email {
+        excluded.push(account_email.to_string());
+    }
+    let reply_all_cc = dedupe_email_addresses(reply_all_addresses, &excluded);
 
     let subject = parsed.get_first_value("Subject").unwrap_or_default();
     let message_id = parsed.get_first_value("Message-ID").ok_or_else(|| {
@@ -2243,6 +2303,7 @@ fn build_reply_target(headers: &[u8]) -> Result<MailReplyTarget> {
 
     Ok(MailReplyTarget {
         recipient,
+        reply_all_cc,
         subject,
         message_id,
         references,
@@ -2250,24 +2311,43 @@ fn build_reply_target(headers: &[u8]) -> Result<MailReplyTarget> {
 }
 
 fn extract_primary_recipient(header_value: &str) -> Result<String> {
+    parse_recipient_addresses(header_value)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            YacliError::Serialization(
+                "reply target header does not contain a usable recipient address".to_string(),
+            )
+        })
+}
+
+fn parse_recipient_addresses(header_value: &str) -> Result<Vec<String>> {
     let addresses = addrparse(header_value).map_err(|err| {
         YacliError::Serialization(format!("failed to parse reply recipient header: {err}"))
     })?;
-
+    let mut recipients = Vec::new();
     for address in addresses.iter() {
         match address {
-            MailAddr::Single(single) => return Ok(single.addr.clone()),
+            MailAddr::Single(single) => recipients.push(single.addr.clone()),
             MailAddr::Group(group) => {
-                if let Some(first) = group.addrs.first() {
-                    return Ok(first.addr.clone());
-                }
+                recipients.extend(group.addrs.iter().map(|single| single.addr.clone()))
             }
         }
     }
+    Ok(recipients)
+}
 
-    Err(YacliError::Serialization(
-        "reply target header does not contain a usable recipient address".to_string(),
-    ))
+fn dedupe_email_addresses(values: Vec<String>, excluded: &[String]) -> Vec<String> {
+    let excluded = excluded
+        .iter()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut seen = excluded;
+    values
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty() && seen.insert(value.to_ascii_lowercase()))
+        .collect()
 }
 
 fn normalize_references_header(references: Option<&str>, message_id: &str) -> Result<Vec<String>> {
@@ -3776,16 +3856,16 @@ mod tests {
         MailAttachmentPayload, MailAttachmentSelector, MailAttachmentSummary, MailFlagUpdate,
         MailFolder, MailMessage, MailSendRequest, MailSessionAuth, MailSmtpAuth, MailThreadHeaders,
         OutgoingMessage, SMTP_SAFE_MESSAGE_BYTES, SentMail, SmtpSession, build_forward_body,
-        build_message_summary, build_outgoing_message, build_read_message, build_reply_target,
-        build_xoauth2_payload, decode_modified_utf7, encode_modified_utf7,
-        export_attachment_from_message, extract_message_content, finish_sent_copy,
-        format_mail_uid_set, format_uid_store_flag, inspect_invite_from_message,
-        load_mail_attachments, normalize_forward_subject, normalize_reply_subject,
-        normalize_search_date, normalize_search_query, parse_fetch_metadata, parse_imap_token,
-        parse_list_line, parse_search_uids, prepare_mail_submission, quote_imap_string,
-        review_mail_submission, send_mail_message, validate_folder_name,
-        validate_mail_attachment_export_request, validate_mail_attachment_read_request,
-        validate_mail_flag_update, validate_mail_page_offset, validate_mail_uid,
+        build_message_summary, build_outgoing_message, build_read_message, build_xoauth2_payload,
+        decode_modified_utf7, encode_modified_utf7, export_attachment_from_message,
+        extract_message_content, finish_sent_copy, format_mail_uid_set, format_uid_store_flag,
+        inspect_invite_from_message, load_mail_attachments, normalize_forward_subject,
+        normalize_reply_subject, normalize_search_date, normalize_search_query,
+        parse_fetch_metadata, parse_imap_token, parse_list_line, parse_search_uids,
+        prepare_mail_submission, quote_imap_string, review_mail_submission, send_mail_message,
+        validate_folder_name, validate_mail_attachment_export_request,
+        validate_mail_attachment_read_request, validate_mail_flag_update,
+        validate_mail_page_offset, validate_mail_uid,
     };
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
@@ -4344,12 +4424,17 @@ mod tests {
 
     #[test]
     fn build_reply_target_prefers_reply_to_and_extends_references() {
-        let target = build_reply_target(
-            b"Subject: Hello\r\nFrom: Sender <sender@example.com>\r\nReply-To: Reply <reply@example.com>\r\nMessage-ID: <msg-1@example>\r\nReferences: <root@example>\r\n\r\n",
+        let target = super::build_reply_target_for_account(
+            b"Subject: Hello\r\nFrom: Sender <sender@example.com>\r\nReply-To: Reply <reply@example.com>\r\nTo: Me <me@example.com>, Team <team@example.com>\r\nCc: Reply <reply@example.com>, Other <other@example.com>, Team <team@example.com>\r\nMessage-ID: <msg-1@example>\r\nReferences: <root@example>\r\n\r\n",
+            Some("me@example.com"),
         )
         .expect("reply target");
 
         assert_eq!(target.recipient, "reply@example.com");
+        assert_eq!(
+            target.reply_all_cc,
+            ["team@example.com", "other@example.com"]
+        );
         assert_eq!(target.subject, "Hello");
         assert_eq!(target.message_id, "<msg-1@example>");
         assert_eq!(

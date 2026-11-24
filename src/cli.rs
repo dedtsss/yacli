@@ -596,6 +596,9 @@ pub enum MailCommand {
         body: Option<String>,
         #[arg(long, value_name = "EMAIL")]
         cc: Vec<String>,
+        /// Ответить всем адресатам исходного письма, кроме текущего аккаунта.
+        #[arg(long, default_value_t = false)]
+        reply_all: bool,
         #[arg(long, value_name = "HTML")]
         html: Option<String>,
     },

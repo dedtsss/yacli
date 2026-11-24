@@ -1025,6 +1025,18 @@ client_id = "client-123"
             .any(|tool| tool["name"] == "yacli.mail.send_link")
     );
     assert!(tools.iter().any(|tool| tool["name"] == "yacli.mail.reply"));
+    let mail_reply = tools
+        .iter()
+        .find(|tool| tool["name"] == "yacli.mail.reply")
+        .expect("mail reply tool");
+    assert_eq!(
+        mail_reply["inputSchema"]["properties"]["reply_all"]["type"],
+        "boolean"
+    );
+    assert_eq!(
+        mail_reply["inputSchema"]["properties"]["dry_run"]["type"],
+        "boolean"
+    );
     assert!(
         tools
             .iter()

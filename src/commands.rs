@@ -2881,6 +2881,7 @@ fn execute_mail(format: OutputFormat, action: MailCommand) -> Result<RenderedOut
             uid,
             body,
             cc,
+            reply_all,
             html,
         } => {
             let (resolved_account, auth, context) =
@@ -2894,6 +2895,8 @@ fn execute_mail(format: OutputFormat, action: MailCommand) -> Result<RenderedOut
                 &folder,
                 MailReplyRequest {
                     uid,
+                    account_email: context.email.clone(),
+                    reply_all,
                     cc,
                     text: body,
                     html,
