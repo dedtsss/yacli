@@ -72,10 +72,11 @@ use crate::{
     },
     mail::{
         MailAttachmentExportRequest, MailAttachmentSelector, MailBulkAction, MailFlagUpdate,
-        MailInviteInspectRequest, apply_mail_bulk_action, copy_mail_message, create_mail_draft,
-        create_mail_folder, export_mail_attachment, inspect_mail_invite, list_mail_folders,
-        list_mail_messages_page, load_mail_attachments, move_mail_message, read_mail_message,
-        rename_mail_folder, review_mail_submission, search_mail_messages_page,
+        MailInviteInspectRequest, MailSearchFilter, apply_mail_bulk_action, copy_mail_message,
+        create_mail_draft, create_mail_folder, export_mail_attachment, inspect_mail_invite,
+        list_mail_folders, list_mail_messages_page, load_mail_attachments, move_mail_message,
+        read_mail_message, rename_mail_folder, review_mail_submission,
+        search_mail_all_folders_page, search_mail_messages_filtered_page,
         send_mail_message_with_sent_copy, update_mail_flags, validate_mail_folder_rename,
     },
 };
@@ -1344,13 +1345,16 @@ fn tool_definitions(ui_enabled: bool, roots_enabled: bool) -> Result<Vec<Value>>
         ),
         tool(
             "yacli.mail.search",
-            "Search messages in a folder.",
+            "Искать письма по тексту в выбранной папке или во всех папках; можно ограничить период датами IMAP.",
             json!({
                 "type": "object",
                 "properties": {
                     "account": { "type": "string" },
                     "folder": { "type": "string" },
+                    "all_folders": { "type": "boolean" },
                     "query": { "type": "string" },
+                    "since": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$" },
+                    "before": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$" },
                     "limit": { "type": "integer", "minimum": 1 },
                     "offset": { "type": "integer", "minimum": 0, "maximum": 1000000 }
                 },
@@ -2049,13 +2053,7 @@ fn call_tool(params: Value, ui_enabled: bool) -> Result<Value> {
             optional_usize(&arguments, "limit").unwrap_or(20),
             optional_usize(&arguments, "offset").unwrap_or(0),
         )?,
-        "yacli.mail.search" => mail_search(
-            arguments.get("account").and_then(Value::as_str),
-            optional_string(&arguments, "folder").unwrap_or("INBOX"),
-            required_string(&arguments, "query")?,
-            optional_usize(&arguments, "limit").unwrap_or(20),
-            optional_usize(&arguments, "offset").unwrap_or(0),
-        )?,
+        "yacli.mail.search" => mail_search(&arguments)?,
         "yacli.mail.read" => mail_read(
             arguments.get("account").and_then(Value::as_str),
             optional_string(&arguments, "folder").unwrap_or("INBOX"),
@@ -3130,27 +3128,58 @@ fn mail_list(account: Option<&str>, folder: &str, limit: usize, offset: usize) -
     }))
 }
 
-fn mail_search(
-    account: Option<&str>,
-    folder: &str,
-    query: &str,
-    limit: usize,
-    offset: usize,
-) -> Result<Value> {
+fn mail_search(args: &Value) -> Result<Value> {
+    let account = args.get("account").and_then(Value::as_str);
+    let folder = optional_string(args, "folder").unwrap_or("INBOX");
+    let query = required_string(args, "query")?;
+    let since = optional_string(args, "since");
+    let before = optional_string(args, "before");
+    let limit = optional_usize(args, "limit").unwrap_or(20);
+    let offset = optional_usize(args, "offset").unwrap_or(0);
+    let all_folders = optional_bool(args, "all_folders").unwrap_or(false);
     let (resolved_account, auth, context) = resolve_mail_private_context(account)?;
-    let messages = search_mail_messages_page(
+    if all_folders {
+        let items = search_mail_all_folders_page(
+            &context.imap_host,
+            context.imap_port,
+            auth,
+            query,
+            MailSearchFilter {
+                since,
+                before,
+                limit,
+                offset,
+            },
+        )?;
+        return Ok(json!({
+            "account": resolved_account,
+            "all_folders": true,
+            "query": query,
+            "since": since,
+            "before": before,
+            "offset": offset,
+            "items": items,
+        }));
+    }
+    let messages = search_mail_messages_filtered_page(
         &context.imap_host,
         context.imap_port,
         auth,
         folder,
         query,
-        limit,
-        offset,
+        MailSearchFilter {
+            since,
+            before,
+            limit,
+            offset,
+        },
     )?;
     Ok(json!({
         "account": resolved_account,
         "folder": folder,
         "query": query,
+        "since": since,
+        "before": before,
         "offset": offset,
         "items": messages,
     }))

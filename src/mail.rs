@@ -153,6 +153,20 @@ pub struct MailMessageSummary {
 }
 
 #[derive(Clone, Debug, Serialize, Eq, PartialEq)]
+pub struct MailSearchHit {
+    pub folder: String,
+    pub message: MailMessageSummary,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MailSearchFilter<'a> {
+    pub since: Option<&'a str>,
+    pub before: Option<&'a str>,
+    pub limit: usize,
+    pub offset: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
 pub struct MailAttachmentSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub filename: Option<String>,
@@ -800,15 +814,42 @@ pub fn search_mail_messages_page(
     limit: usize,
     offset: usize,
 ) -> Result<Vec<MailMessageSummary>> {
-    validate_mail_summary_limit("mail search", limit)?;
-    validate_mail_page_offset(offset)?;
+    search_mail_messages_filtered_page(
+        imap_host,
+        imap_port,
+        auth,
+        mailbox_name,
+        query,
+        MailSearchFilter {
+            since: None,
+            before: None,
+            limit,
+            offset,
+        },
+    )
+}
+
+pub fn search_mail_messages_filtered_page(
+    imap_host: &str,
+    imap_port: u16,
+    auth: MailSessionAuth,
+    mailbox_name: &str,
+    query: &str,
+    filter: MailSearchFilter<'_>,
+) -> Result<Vec<MailMessageSummary>> {
+    validate_mail_summary_limit("mail search", filter.limit)?;
+    validate_mail_page_offset(filter.offset)?;
     let query = normalize_search_query(query)?;
+    let since = normalize_search_date(filter.since)?;
+    let before = normalize_search_date(filter.before)?;
+    validate_mail_search_range(since.as_deref(), before.as_deref())?;
 
     let mut session = open_authenticated_session(imap_host, imap_port, auth)?;
 
     let encoded_mailbox = encode_modified_utf7(mailbox_name);
     session.select_mailbox(&encoded_mailbox)?;
-    let uids = session.search_uids_by_text(&query)?;
+    let uids =
+        session.search_uids_by_text_and_dates(&query, since.as_deref(), before.as_deref())?;
     if uids.is_empty() {
         let _ = session.logout();
         return Ok(Vec::new());
@@ -817,12 +858,107 @@ pub fn search_mail_messages_page(
     let selected_uids = uids
         .into_iter()
         .rev()
-        .skip(offset)
-        .take(limit)
+        .skip(filter.offset)
+        .take(filter.limit)
         .collect::<Vec<_>>();
     let messages = session.fetch_message_summaries(&selected_uids)?;
     let _ = session.logout();
     Ok(messages)
+}
+
+pub fn search_mail_all_folders_page(
+    imap_host: &str,
+    imap_port: u16,
+    auth: MailSessionAuth,
+    query: &str,
+    filter: MailSearchFilter<'_>,
+) -> Result<Vec<MailSearchHit>> {
+    const MAX_GLOBAL_SEARCH_MATCHES: usize = 5_000;
+    validate_mail_summary_limit("mail search", filter.limit)?;
+    validate_mail_page_offset(filter.offset)?;
+    let query = normalize_search_query(query)?;
+    let since = normalize_search_date(filter.since)?;
+    let before = normalize_search_date(filter.before)?;
+    validate_mail_search_range(since.as_deref(), before.as_deref())?;
+
+    let mut session = open_authenticated_session(imap_host, imap_port, auth)?;
+    let folders = session.list_folders()?;
+    let mut hits = Vec::new();
+    for folder in folders {
+        if folder
+            .attributes
+            .iter()
+            .any(|attribute| attribute.eq_ignore_ascii_case("\\Noselect"))
+        {
+            continue;
+        }
+        session.select_mailbox(&folder.raw_name)?;
+        let uids =
+            session.search_uids_by_text_and_dates(&query, since.as_deref(), before.as_deref())?;
+        if uids.is_empty() {
+            continue;
+        }
+        if hits.len().saturating_add(uids.len()) > MAX_GLOBAL_SEARCH_MATCHES {
+            return Err(YacliError::UnsupportedOperation(format!(
+                "Глобальный поиск ограничен {MAX_GLOBAL_SEARCH_MATCHES} совпадениями за запрос; уточните текст или период"
+            )));
+        }
+        for message in session.fetch_message_summaries(&uids)? {
+            hits.push(MailSearchHit {
+                folder: folder.name.clone(),
+                message,
+            });
+        }
+    }
+    let _ = session.logout();
+    hits.sort_by(|left, right| {
+        let left_date = left
+            .message
+            .date
+            .as_deref()
+            .and_then(|date| chrono::DateTime::parse_from_rfc2822(date).ok());
+        let right_date = right
+            .message
+            .date
+            .as_deref()
+            .and_then(|date| chrono::DateTime::parse_from_rfc2822(date).ok());
+        right_date
+            .cmp(&left_date)
+            .then_with(|| left.folder.cmp(&right.folder))
+            .then_with(|| right.message.uid.cmp(&left.message.uid))
+    });
+    Ok(hits
+        .into_iter()
+        .skip(filter.offset)
+        .take(filter.limit)
+        .collect())
+}
+
+fn normalize_search_date(value: Option<&str>) -> Result<Option<String>> {
+    value
+        .map(|value| {
+            let date = chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").map_err(|_| {
+                YacliError::Validation("Дата поиска должна иметь формат ГГГГ-ММ-ДД".into())
+            })?;
+            Ok(date.format("%d-%b-%Y").to_string())
+        })
+        .transpose()
+}
+
+fn validate_mail_search_range(since: Option<&str>, before: Option<&str>) -> Result<()> {
+    if let (Some(since), Some(before)) = (since, before)
+        && parse_imap_search_date(since)? >= parse_imap_search_date(before)?
+    {
+        return Err(YacliError::Validation(
+            "Дата since должна предшествовать before; before не включается в период".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn parse_imap_search_date(value: &str) -> Result<chrono::NaiveDate> {
+    chrono::NaiveDate::parse_from_str(value, "%d-%b-%Y")
+        .map_err(|_| YacliError::Validation("Некорректная дата поиска IMAP".into()))
 }
 
 fn validate_mail_page_offset(offset: usize) -> Result<()> {
@@ -1561,13 +1697,23 @@ impl<S: Read + Write> ImapSession<S> {
         parse_search_uids(&lines)
     }
 
-    fn search_uids_by_text(&mut self, query: &str) -> Result<Vec<u64>> {
+    fn search_uids_by_text_and_dates(
+        &mut self,
+        query: &str,
+        since: Option<&str>,
+        before: Option<&str>,
+    ) -> Result<Vec<u64>> {
         let tag = self.next_tag();
         let literal = query.as_bytes();
-        self.write_line(&format!(
-            "{tag} UID SEARCH CHARSET UTF-8 TEXT {{{}}}",
-            literal.len()
-        ))?;
+        let mut criteria = vec!["CHARSET UTF-8".to_string()];
+        if let Some(since) = since {
+            criteria.push(format!("SINCE {since}"));
+        }
+        if let Some(before) = before {
+            criteria.push(format!("BEFORE {before}"));
+        }
+        criteria.push(format!("TEXT {{{}}}", literal.len()));
+        self.write_line(&format!("{tag} UID SEARCH {}", criteria.join(" ")))?;
 
         let continuation = self.read_line()?;
         if !continuation.starts_with('+') {
@@ -3556,11 +3702,11 @@ mod tests {
         export_attachment_from_message, extract_message_content, finish_sent_copy,
         format_mail_uid_set, format_uid_store_flag, inspect_invite_from_message,
         load_mail_attachments, normalize_forward_subject, normalize_reply_subject,
-        normalize_search_query, parse_fetch_metadata, parse_imap_token, parse_list_line,
-        parse_search_uids, prepare_mail_submission, quote_imap_string, review_mail_submission,
-        send_mail_message, validate_folder_name, validate_mail_attachment_export_request,
-        validate_mail_attachment_read_request, validate_mail_flag_update,
-        validate_mail_page_offset, validate_mail_uid,
+        normalize_search_date, normalize_search_query, parse_fetch_metadata, parse_imap_token,
+        parse_list_line, parse_search_uids, prepare_mail_submission, quote_imap_string,
+        review_mail_submission, send_mail_message, validate_folder_name,
+        validate_mail_attachment_export_request, validate_mail_attachment_read_request,
+        validate_mail_flag_update, validate_mail_page_offset, validate_mail_uid,
     };
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
@@ -3794,6 +3940,25 @@ mod tests {
     }
 
     #[test]
+    fn imap_search_adds_date_filters_before_utf8_text_literal() {
+        let fake = FakeStream::new(
+            "+ send search literal\r\n* SEARCH 4 8\r\nA0001 OK search complete\r\n",
+        );
+        let mut session = ImapSession::from_stream(fake);
+        assert_eq!(
+            session
+                .search_uids_by_text_and_dates("invoice", Some("01-Nov-2026"), Some("05-Nov-2026"),)
+                .unwrap(),
+            [4, 8]
+        );
+        let written = session.reader.get_ref().written();
+        assert!(written.contains(
+            "A0001 UID SEARCH CHARSET UTF-8 SINCE 01-Nov-2026 BEFORE 05-Nov-2026 TEXT {7}\r\n"
+        ));
+        assert!(written.ends_with("invoice\r\n"));
+    }
+
+    #[test]
     fn mail_folder_and_uid_validation_rejects_unsafe_values() {
         assert!(validate_folder_name(" \t ").is_err());
         assert!(validate_folder_name("folder\r\nUID STORE 1 +FLAGS (\\Deleted)").is_err());
@@ -4011,6 +4176,22 @@ mod tests {
     fn normalize_search_query_trims_whitespace() {
         let query = normalize_search_query("  Budget  ").expect("query normalized");
         assert_eq!(query, "Budget");
+    }
+
+    #[test]
+    fn mail_search_dates_validate_calendar_values_and_exclusive_end() {
+        assert_eq!(
+            normalize_search_date(Some("2026-11-02")).unwrap(),
+            Some("02-Nov-2026".into())
+        );
+        assert!(normalize_search_date(Some("2026-02-30")).is_err());
+        assert!(normalize_search_date(Some("02-Nov-2026")).is_err());
+        assert!(
+            super::validate_mail_search_range(Some("03-Nov-2026"), Some("03-Nov-2026")).is_err()
+        );
+        assert!(
+            super::validate_mail_search_range(Some("02-Nov-2026"), Some("03-Nov-2026")).is_ok()
+        );
     }
 
     #[test]

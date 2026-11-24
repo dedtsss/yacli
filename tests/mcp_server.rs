@@ -1002,6 +1002,18 @@ client_id = "client-123"
         mail_search["inputSchema"]["properties"]["offset"]["minimum"],
         0
     );
+    assert_eq!(
+        mail_search["inputSchema"]["properties"]["all_folders"]["type"],
+        "boolean"
+    );
+    assert_eq!(
+        mail_search["inputSchema"]["properties"]["since"]["pattern"],
+        r"^\d{4}-\d{2}-\d{2}$"
+    );
+    assert_eq!(
+        mail_search["inputSchema"]["properties"]["before"]["pattern"],
+        r"^\d{4}-\d{2}-\d{2}$"
+    );
     assert!(
         tools
             .iter()
