@@ -162,6 +162,7 @@ fn required_capabilities(name: &str) -> Option<&'static [&'static str]> {
         | "yacli.mail.bulk"
         | "yacli.mail.special_folder"
         | "yacli.mail.draft.create" => Some(&["mail.mutate"]),
+        "yacli.mail.folder.delete" => Some(&["mail.delete"]),
         "yacli.contacts.list" | "yacli.contacts.search" | "yacli.contacts.export" => {
             Some(&["contacts.read"])
         }
@@ -362,6 +363,7 @@ pub fn is_risky(name: &str) -> bool {
             | "yacli.mail.forward"
             | "yacli.mail.folder.create"
             | "yacli.mail.folder.rename"
+            | "yacli.mail.folder.delete"
             | "yacli.mail.copy"
             | "yacli.mail.move"
             | "yacli.mail.flags"
@@ -613,6 +615,7 @@ mod tests {
         for name in [
             "yacli.mail.folder.create",
             "yacli.mail.folder.rename",
+            "yacli.mail.folder.delete",
             "yacli.mail.copy",
             "yacli.mail.move",
             "yacli.mail.flags",
@@ -622,7 +625,11 @@ mod tests {
         ] {
             assert_eq!(
                 required_capabilities(name),
-                Some(["mail.mutate"].as_slice())
+                if name == "yacli.mail.folder.delete" {
+                    Some(["mail.delete"].as_slice())
+                } else {
+                    Some(["mail.mutate"].as_slice())
+                }
             );
             assert!(is_risky(name));
         }

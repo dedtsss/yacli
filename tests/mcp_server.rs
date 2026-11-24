@@ -276,6 +276,40 @@ fn devcat_publishes_contacts_tools_only_with_explicit_read_capability() {
             .unwrap_or("")
             .starts_with("yacli.contacts.")
     }));
+    assert!(
+        !tools
+            .iter()
+            .any(|tool| tool["name"] == "yacli.mail.folder.delete")
+    );
+
+    let output = yacli()
+        .env("YACLI_CONFIG_DIR", temp.path())
+        .env("YACLI_DEVCAT_MODE", "1")
+        .env("YACLI_DEVCAT_ACCOUNT", "mock")
+        .env("YACLI_DEVCAT_CAPABILITIES", "mail.delete")
+        .env("YACLI_DEVCAT_DISK_ROOTS", temp.path())
+        .args(["mcp"])
+        .write_stdin(
+            [
+                initialize_request(false),
+                mcp_notification("notifications/initialized", json!({})),
+                mcp_request(2, "tools/list", json!({})),
+            ]
+            .concat(),
+        )
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let responses = parse_responses(&output);
+    let tools = responses[1]["result"]["tools"].as_array().unwrap();
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool["name"] == "yacli.mail.folder.delete")
+    );
+    assert!(!tools.iter().any(|tool| tool["name"] == "yacli.mail.copy"));
 
     let output = yacli()
         .env("YACLI_CONFIG_DIR", temp.path())

@@ -77,12 +77,12 @@ use crate::{
         MailAttachmentExportRequest, MailAttachmentSelector, MailBulkAction, MailFlagUpdate,
         MailForwardRequest, MailForwardReviewBinding, MailInviteInspectRequest, MailSearchFilter,
         MailSpecialFolderAction, apply_mail_bulk_action, copy_mail_message, create_mail_draft,
-        create_mail_folder, export_mail_attachment, forward_mail_message,
+        create_mail_folder, delete_mail_folder, export_mail_attachment, forward_mail_message,
         forward_mail_message_reviewed, inspect_mail_invite, list_mail_folders,
         list_mail_messages_page, load_mail_attachments, move_mail_message,
         move_mail_message_to_special_folder, read_mail_message, rename_mail_folder,
-        review_mail_forward_submission, review_mail_reply_submission, review_mail_submission,
-        search_mail_all_folders_page, search_mail_messages_filtered_page,
+        review_mail_folder_delete, review_mail_forward_submission, review_mail_reply_submission,
+        review_mail_submission, search_mail_all_folders_page, search_mail_messages_filtered_page,
         send_mail_message_with_sent_copy, update_mail_flags, validate_mail_folder_rename,
     },
 };
@@ -1338,6 +1338,7 @@ fn tool_definitions(ui_enabled: bool, roots_enabled: bool) -> Result<Vec<Value>>
         ),
         tool("yacli.mail.folder.create", "Создать папку почтового ящика; в DevCat требуется предварительная проверка.", json!({"type":"object","properties":{"account":{"type":"string"},"folder":{"type":"string"}},"required":["folder"],"additionalProperties":false}), None, ui_enabled),
         tool("yacli.mail.folder.rename", "Переименовать папку почтового ящика; сервер также переименует вложенные папки. Перед изменением требуется review.", json!({"type":"object","properties":{"account":{"type":"string"},"folder":{"type":"string"},"new_folder":{"type":"string"}},"required":["folder","new_folder"],"additionalProperties":false}), None, ui_enabled),
+        tool("yacli.mail.folder.delete", "Удалить только явно указанную пустую пользовательскую папку без подпапок; системные папки и папки с письмами отклоняются. В DevCat требуется mail.delete и одноразовый review.", json!({"type":"object","properties":{"account":{"type":"string"},"folder":{"type":"string"}},"required":["folder"],"additionalProperties":false}), None, ui_enabled),
         tool("yacli.mail.copy", "Скопировать одно письмо по постоянному UID в другую папку; в DevCat требуется предварительная проверка.", json!({"type":"object","properties":{"account":{"type":"string"},"source_folder":{"type":"string"},"uid":{"type":"integer","minimum":1},"destination_folder":{"type":"string"}},"required":["uid","destination_folder"],"additionalProperties":false}), None, ui_enabled),
         tool("yacli.mail.move", "Переместить одно письмо по постоянному UID в другую папку; в DevCat требуется предварительная проверка.", json!({"type":"object","properties":{"account":{"type":"string"},"source_folder":{"type":"string"},"uid":{"type":"integer","minimum":1},"destination_folder":{"type":"string"}},"required":["uid","destination_folder"],"additionalProperties":false}), None, ui_enabled),
         tool("yacli.mail.flags", "Установить состояние прочитанности и отметку избранного для одного письма по постоянному UID; в DevCat требуется проверка.", json!({"type":"object","properties":{"account":{"type":"string"},"folder":{"type":"string"},"uid":{"type":"integer","minimum":1},"seen":{"type":"boolean"},"flagged":{"type":"boolean"}},"required":["uid"],"additionalProperties":false}), None, ui_enabled),
@@ -2131,6 +2132,7 @@ fn call_tool(params: Value, ui_enabled: bool) -> Result<Value> {
         "yacli.mail.folders" => mail_folders(arguments.get("account").and_then(Value::as_str))?,
         "yacli.mail.folder.create" => mail_folder_create(&arguments)?,
         "yacli.mail.folder.rename" => mail_folder_rename(&arguments)?,
+        "yacli.mail.folder.delete" => mail_folder_delete(&arguments)?,
         "yacli.mail.copy" => mail_copy_move(&arguments, false)?,
         "yacli.mail.move" => mail_copy_move(&arguments, true)?,
         "yacli.mail.flags" => mail_flags(&arguments)?,
@@ -2919,6 +2921,24 @@ fn mail_folder_rename(args: &Value) -> Result<Value> {
         resolve_mail_private_context(args.get("account").and_then(Value::as_str))?;
     rename_mail_folder(&ctx.imap_host, ctx.imap_port, auth, folder, new_folder)?;
     Ok(json!({"account":account,"folder":folder,"new_folder":new_folder,"renamed":true}))
+}
+
+fn mail_folder_delete(args: &Value) -> Result<Value> {
+    let folder = required_string(args, "folder")?;
+    let (account, auth, ctx) =
+        resolve_mail_private_context(args.get("account").and_then(Value::as_str))?;
+    if optional_bool(args, "dry_run") == Some(true) {
+        let preview = review_mail_folder_delete(&ctx.imap_host, ctx.imap_port, auth, folder)?;
+        let digest = devcat::review_hash("yacli.mail.folder.delete", args)?;
+        if preview.allowed {
+            devcat::record_review(digest.clone());
+        }
+        return Ok(
+            json!({"account":account,"review":preview,"dry_run":true,"review_sha256":digest}),
+        );
+    }
+    let result = delete_mail_folder(&ctx.imap_host, ctx.imap_port, auth, folder)?;
+    Ok(json!({"account":account,"review":result,"deleted":true}))
 }
 
 fn mail_copy_move(args: &Value, is_move: bool) -> Result<Value> {

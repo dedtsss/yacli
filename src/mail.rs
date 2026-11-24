@@ -138,6 +138,17 @@ pub struct MailFolder {
 }
 
 #[derive(Clone, Debug, Serialize, Eq, PartialEq)]
+pub struct MailFolderDeleteReview {
+    pub folder: String,
+    pub allowed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_count: Option<usize>,
+    pub has_children: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
 pub struct MailMessageSummary {
     pub uid: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -528,6 +539,154 @@ pub fn create_mail_folder(
     session.create_mailbox(&encode_modified_utf7(folder))?;
     let _ = session.logout();
     Ok(())
+}
+
+pub fn review_mail_folder_delete(
+    imap_host: &str,
+    imap_port: u16,
+    auth: MailSessionAuth,
+    folder: &str,
+) -> Result<MailFolderDeleteReview> {
+    let folder = validate_folder_name(folder)?;
+    let mut session = open_authenticated_session(imap_host, imap_port, auth)?;
+    let (review, _) = inspect_mail_folder_delete(&mut session, folder)?;
+    let _ = session.logout();
+    Ok(review)
+}
+
+pub fn delete_mail_folder(
+    imap_host: &str,
+    imap_port: u16,
+    auth: MailSessionAuth,
+    folder: &str,
+) -> Result<MailFolderDeleteReview> {
+    let folder = validate_folder_name(folder)?;
+    let mut session = open_authenticated_session(imap_host, imap_port, auth)?;
+    let (review, raw_name) = inspect_mail_folder_delete(&mut session, folder)?;
+    if !review.allowed {
+        return Err(YacliError::Validation(
+            review
+                .reason
+                .clone()
+                .unwrap_or_else(|| "Папку нельзя безопасно удалить.".into()),
+        ));
+    }
+    let raw_name =
+        raw_name.ok_or_else(|| YacliError::Api("Папка исчезла перед удалением.".into()))?;
+    session.unselect_mailbox()?;
+    session.delete_mailbox(&raw_name)?;
+    let _ = session.logout();
+    Ok(review)
+}
+
+fn inspect_mail_folder_delete(
+    session: &mut ImapSession,
+    folder_name: &str,
+) -> Result<(MailFolderDeleteReview, Option<String>)> {
+    let folders = session.list_folders()?;
+    let Some(folder) = folders.iter().find(|folder| folder.name == folder_name) else {
+        return Ok((
+            MailFolderDeleteReview {
+                folder: folder_name.to_string(),
+                allowed: false,
+                reason: Some("Папка не найдена.".into()),
+                message_count: None,
+                has_children: false,
+            },
+            None,
+        ));
+    };
+    if is_protected_mail_folder(folder) || folder.attributes.iter().any(|attr| attr == r"\Noselect")
+    {
+        return Ok((
+            MailFolderDeleteReview {
+                folder: folder.name.clone(),
+                allowed: false,
+                reason: Some("Системную или недоступную для выбора папку удалять нельзя.".into()),
+                message_count: None,
+                has_children: false,
+            },
+            None,
+        ));
+    }
+    let has_children = folders.iter().any(|candidate| {
+        if candidate.raw_name == folder.raw_name {
+            return false;
+        }
+        folder
+            .delimiter
+            .as_deref()
+            .filter(|delimiter| !delimiter.is_empty())
+            .is_some_and(|delimiter| {
+                candidate
+                    .raw_name
+                    .starts_with(&format!("{}{delimiter}", folder.raw_name))
+            })
+    });
+    if has_children {
+        return Ok((
+            MailFolderDeleteReview {
+                folder: folder.name.clone(),
+                allowed: false,
+                reason: Some("Сначала переместите или удалите подпапки.".into()),
+                message_count: None,
+                has_children: true,
+            },
+            None,
+        ));
+    }
+    session.select_mailbox(&folder.raw_name)?;
+    let message_count = session.search_all_uids()?.len();
+    let review = MailFolderDeleteReview {
+        folder: folder.name.clone(),
+        allowed: message_count == 0,
+        reason: (message_count != 0).then(|| "Удалять можно только пустую папку.".into()),
+        message_count: Some(message_count),
+        has_children: false,
+    };
+    Ok((
+        review.clone(),
+        review.allowed.then(|| folder.raw_name.clone()),
+    ))
+}
+
+fn is_protected_mail_folder(folder: &MailFolder) -> bool {
+    const PROTECTED_ATTRIBUTES: &[&str] = &[
+        r"\Inbox",
+        r"\Drafts",
+        r"\Sent",
+        r"\Trash",
+        r"\Junk",
+        r"\Archive",
+        r"\All",
+        r"\Flagged",
+        r"\Important",
+    ];
+    const PROTECTED_NAMES: &[&str] = &[
+        "inbox",
+        "входящие",
+        "drafts",
+        "черновики",
+        "sent",
+        "отправленные",
+        "trash",
+        "корзина",
+        "junk",
+        "spam",
+        "спам",
+        "archive",
+        "архив",
+        "all mail",
+        "вся почта",
+    ];
+    folder.attributes.iter().any(|attribute| {
+        PROTECTED_ATTRIBUTES
+            .iter()
+            .any(|protected| attribute.eq_ignore_ascii_case(protected))
+    }) || {
+        let normalized_name = folder.name.to_lowercase();
+        PROTECTED_NAMES.iter().any(|name| normalized_name == *name)
+    }
 }
 
 pub fn rename_mail_folder(
@@ -1773,6 +1932,27 @@ impl<S: Read + Write> ImapSession<S> {
             &self.current_tag(),
             &tagged,
             "IMAP RENAME",
+            TaggedErrorKind::Api,
+        )
+    }
+
+    fn delete_mailbox(&mut self, mailbox_name: &str) -> Result<()> {
+        let (_, tagged) =
+            self.run_command(&format!("DELETE {}", quote_imap_string(mailbox_name)))?;
+        parse_tagged_status(
+            &self.current_tag(),
+            &tagged,
+            "IMAP DELETE",
+            TaggedErrorKind::Api,
+        )
+    }
+
+    fn unselect_mailbox(&mut self) -> Result<()> {
+        let (_, tagged) = self.run_command("UNSELECT")?;
+        parse_tagged_status(
+            &self.current_tag(),
+            &tagged,
+            "IMAP UNSELECT",
             TaggedErrorKind::Api,
         )
     }
@@ -4155,6 +4335,46 @@ mod tests {
                 .written()
                 .contains("A0001 UID MOVE 7 \"Archive\"\r\n")
         );
+
+        let mut deleted = ImapSession::from_stream(FakeStream::new(
+            "A0001 OK unselected\r\nA0002 OK deleted\r\n",
+        ));
+        deleted.unselect_mailbox().unwrap();
+        deleted.delete_mailbox("Пользовательская папка").unwrap();
+        assert!(
+            deleted
+                .reader
+                .get_ref()
+                .written()
+                .contains("A0002 DELETE \"Пользовательская папка\"\r\n")
+        );
+    }
+
+    #[test]
+    fn folder_delete_protection_covers_special_use_and_common_names() {
+        for folder in [
+            MailFolder {
+                name: "INBOX".into(),
+                raw_name: "INBOX".into(),
+                delimiter: Some("/".into()),
+                attributes: vec![r"\Inbox".into()],
+            },
+            MailFolder {
+                name: "Корзина".into(),
+                raw_name: "Корзина".into(),
+                delimiter: Some("/".into()),
+                attributes: vec![],
+            },
+        ] {
+            assert!(super::is_protected_mail_folder(&folder));
+        }
+        let ordinary = MailFolder {
+            name: "Пользовательская".into(),
+            raw_name: "Пользовательская".into(),
+            delimiter: Some("/".into()),
+            attributes: vec![],
+        };
+        assert!(!super::is_protected_mail_folder(&ordinary));
     }
 
     #[test]
