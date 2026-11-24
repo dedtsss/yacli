@@ -380,6 +380,14 @@ pub enum MailBulkAction {
     Move,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MailSpecialFolderAction {
+    MoveToTrash,
+    RestoreFromTrash,
+    MoveToSpam,
+    RestoreFromSpam,
+}
+
 #[derive(Clone, Debug, Serialize, Eq, PartialEq)]
 pub struct CreatedMailDraft {
     pub folder: String,
@@ -579,6 +587,77 @@ pub fn move_mail_message(
     session.uid_move(uid, &encode_modified_utf7(destination_folder))?;
     let _ = session.logout();
     Ok(())
+}
+
+pub fn move_mail_message_to_special_folder(
+    imap_host: &str,
+    imap_port: u16,
+    auth: MailSessionAuth,
+    uid: u64,
+    action: MailSpecialFolderAction,
+    source_folder: Option<&str>,
+    destination_folder: Option<&str>,
+) -> Result<()> {
+    validate_mail_uid(uid)?;
+    let is_move_to_special = matches!(
+        action,
+        MailSpecialFolderAction::MoveToTrash | MailSpecialFolderAction::MoveToSpam
+    );
+    if is_move_to_special && destination_folder.is_some()
+        || !is_move_to_special && source_folder.is_some()
+    {
+        return Err(YacliError::Validation(
+            "Укажите только поле папки, относящееся к выбранному действию".into(),
+        ));
+    }
+    let mut session = open_authenticated_session(imap_host, imap_port, auth)?;
+    let folders = session.list_folders()?;
+    let (source, destination) = match action {
+        MailSpecialFolderAction::MoveToTrash | MailSpecialFolderAction::MoveToSpam => {
+            let source = validate_folder_name(source_folder.unwrap_or("INBOX"))?;
+            let target_attribute = if action == MailSpecialFolderAction::MoveToTrash {
+                "\\Trash"
+            } else {
+                "\\Junk"
+            };
+            let destination = find_special_mail_folder(&folders, target_attribute)?;
+            (encode_modified_utf7(source), destination.raw_name.clone())
+        }
+        MailSpecialFolderAction::RestoreFromTrash | MailSpecialFolderAction::RestoreFromSpam => {
+            let target_attribute = if action == MailSpecialFolderAction::RestoreFromTrash {
+                "\\Trash"
+            } else {
+                "\\Junk"
+            };
+            let source = find_special_mail_folder(&folders, target_attribute)?;
+            let destination = validate_folder_name(destination_folder.unwrap_or("INBOX"))?;
+            (source.raw_name.clone(), encode_modified_utf7(destination))
+        }
+    };
+    session.select_mailbox(&source)?;
+    session.uid_move(uid, &destination)?;
+    let _ = session.logout();
+    Ok(())
+}
+
+fn find_special_mail_folder<'a>(
+    folders: &'a [MailFolder],
+    attribute: &str,
+) -> Result<&'a MailFolder> {
+    folders
+        .iter()
+        .find(|folder| {
+            folder.attributes.iter().any(|candidate| {
+                candidate.eq_ignore_ascii_case(attribute)
+                    || attribute.eq_ignore_ascii_case("\\Junk")
+                        && candidate.eq_ignore_ascii_case("\\Spam")
+            })
+        })
+        .ok_or_else(|| {
+            YacliError::UnsupportedOperation(format!(
+                "IMAP server did not advertise the {attribute} mailbox"
+            ))
+        })
 }
 
 pub fn update_mail_flags(
@@ -3695,7 +3774,7 @@ mod tests {
     use super::{
         FetchMetadata, ImapSession, MailAttachmentExportRequest, MailAttachmentPart,
         MailAttachmentPayload, MailAttachmentSelector, MailAttachmentSummary, MailFlagUpdate,
-        MailMessage, MailSendRequest, MailSessionAuth, MailSmtpAuth, MailThreadHeaders,
+        MailFolder, MailMessage, MailSendRequest, MailSessionAuth, MailSmtpAuth, MailThreadHeaders,
         OutgoingMessage, SMTP_SAFE_MESSAGE_BYTES, SentMail, SmtpSession, build_forward_body,
         build_message_summary, build_outgoing_message, build_read_message, build_reply_target,
         build_xoauth2_payload, decode_modified_utf7, encode_modified_utf7,
@@ -3915,6 +3994,37 @@ mod tests {
                 .contains("A0001 RENAME \"Старое\" \"Новое \\\"имя\\\"\"\r\n")
         );
         assert!(super::validate_mail_folder_rename(" Same ", "Same").is_err());
+    }
+
+    #[test]
+    fn special_mail_folder_selection_requires_server_attribute() {
+        let folders = vec![
+            MailFolder {
+                name: "Корзина".into(),
+                raw_name: "Trash".into(),
+                delimiter: Some("/".into()),
+                attributes: vec!["\\Trash".into()],
+            },
+            MailFolder {
+                name: "Спам".into(),
+                raw_name: "Spam".into(),
+                delimiter: Some("/".into()),
+                attributes: vec!["\\Spam".into()],
+            },
+        ];
+        assert_eq!(
+            super::find_special_mail_folder(&folders, "\\Trash")
+                .unwrap()
+                .raw_name,
+            "Trash"
+        );
+        assert_eq!(
+            super::find_special_mail_folder(&folders, "\\Junk")
+                .unwrap()
+                .raw_name,
+            "Spam"
+        );
+        assert!(super::find_special_mail_folder(&folders, "\\Drafts").is_err());
     }
 
     #[test]

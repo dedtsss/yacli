@@ -975,6 +975,11 @@ client_id = "client-123"
     assert!(
         tools
             .iter()
+            .any(|tool| tool["name"] == "yacli.mail.special_folder")
+    );
+    assert!(
+        tools
+            .iter()
             .any(|tool| tool["name"] == "yacli.mail.folder.rename")
     );
     assert!(
