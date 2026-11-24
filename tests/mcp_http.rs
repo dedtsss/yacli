@@ -372,7 +372,7 @@ fn devcat_slow_or_abandoned_tool_does_not_block_sessions_and_reviews_bind_accoun
         "slow/abandoned tool held the session registry"
     );
     let tools = catalog["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 22);
+    assert_eq!(tools.len(), 23);
     assert!(
         tools
             .iter()

@@ -151,6 +151,7 @@ fn required_capabilities(name: &str) -> Option<&'static [&'static str]> {
         | "yacli.mail.list"
         | "yacli.mail.search"
         | "yacli.mail.read"
+        | "yacli.mail.checkpoint"
         | "yacli.mail.draft.list"
         | "yacli.mail.attachment.export"
         | "yacli.mail.eml.export" => Some(&["mail.read"]),
@@ -658,6 +659,15 @@ mod tests {
             Some(["mail.read"].as_slice())
         );
         assert!(!is_risky("yacli.mail.draft.list"));
+    }
+
+    #[test]
+    fn mailbox_checkpoint_is_read_only_mail_capability() {
+        assert_eq!(
+            required_capabilities("yacli.mail.checkpoint"),
+            Some(["mail.read"].as_slice())
+        );
+        assert!(!is_risky("yacli.mail.checkpoint"));
     }
 
     #[test]

@@ -1035,6 +1035,16 @@ client_id = "client-123"
             .unwrap()
             .contains(r"\Drafts")
     );
+    let mailbox_checkpoint = tools
+        .iter()
+        .find(|tool| tool["name"] == "yacli.mail.checkpoint")
+        .expect("mailbox checkpoint tool");
+    assert!(
+        mailbox_checkpoint["description"]
+            .as_str()
+            .unwrap()
+            .contains("UIDVALIDITY")
+    );
     let mail_list = tools
         .iter()
         .find(|tool| tool["name"] == "yacli.mail.list")

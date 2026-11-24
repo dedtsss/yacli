@@ -138,6 +138,13 @@ pub struct MailFolder {
 }
 
 #[derive(Clone, Debug, Serialize, Eq, PartialEq)]
+pub struct MailboxCheckpoint {
+    pub folder: String,
+    pub uid_validity: u64,
+    pub uid_next: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
 pub struct MailFolderDeleteReview {
     pub folder: String,
     pub allowed: bool,
@@ -551,6 +558,27 @@ pub fn list_mail_folders(
     let folders = session.list_folders()?;
     let _ = session.logout();
     Ok(folders)
+}
+
+pub fn mail_mailbox_checkpoint(
+    imap_host: &str,
+    imap_port: u16,
+    auth: MailSessionAuth,
+    folder: &str,
+) -> Result<MailboxCheckpoint> {
+    validate_folder_name(folder)?;
+    let mut session = open_authenticated_session(imap_host, imap_port, auth)?;
+    let status = session.select_mailbox_with_status(&encode_modified_utf7(folder))?;
+    let _ = session.logout();
+    Ok(MailboxCheckpoint {
+        folder: folder.to_string(),
+        uid_validity: status.uid_validity.ok_or_else(|| {
+            YacliError::Api("IMAP SELECT omitted UIDVALIDITY; checkpoint unavailable".into())
+        })?,
+        uid_next: status.uid_next.ok_or_else(|| {
+            YacliError::Api("IMAP SELECT omitted UIDNEXT; checkpoint unavailable".into())
+        })?,
+    })
 }
 
 pub fn list_mail_drafts_page(
@@ -2068,6 +2096,12 @@ struct ImapSession<S = native_tls::TlsStream<TcpStream>> {
     next_tag: u32,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ImapMailboxSelectStatus {
+    uid_validity: Option<u64>,
+    uid_next: Option<u64>,
+}
+
 #[derive(Clone, Copy)]
 enum TaggedErrorKind {
     Auth,
@@ -2307,14 +2341,22 @@ impl<S: Read + Write> ImapSession<S> {
     }
 
     fn select_mailbox(&mut self, mailbox_name: &str) -> Result<()> {
+        self.select_mailbox_with_status(mailbox_name).map(|_| ())
+    }
+
+    fn select_mailbox_with_status(
+        &mut self,
+        mailbox_name: &str,
+    ) -> Result<ImapMailboxSelectStatus> {
         let quoted_mailbox = quote_imap_string(mailbox_name);
-        let (_, tagged) = self.run_command(&format!("SELECT {quoted_mailbox}"))?;
+        let (lines, tagged) = self.run_command(&format!("SELECT {quoted_mailbox}"))?;
         parse_tagged_status(
             &self.current_tag(),
             &tagged,
             "IMAP SELECT",
             TaggedErrorKind::Api,
-        )
+        )?;
+        parse_imap_mailbox_select_status(&lines)
     }
 
     fn append_message(&mut self, mailbox_name: &str, message: &[u8]) -> Result<()> {
@@ -3564,6 +3606,42 @@ fn extract_trailing_literal_len(line: &str) -> Result<Option<usize>> {
     Ok(Some(value))
 }
 
+fn parse_imap_mailbox_select_status(lines: &[String]) -> Result<ImapMailboxSelectStatus> {
+    fn value(lines: &[String], key: &str) -> Result<Option<u64>> {
+        let marker = format!("[{key} ");
+        let mut found = None;
+        for line in lines {
+            let Some(start) = line.to_ascii_uppercase().find(&marker) else {
+                continue;
+            };
+            let value_start = start + marker.len();
+            let value_text = line[value_start..]
+                .split_once(']')
+                .map(|(value, _)| value)
+                .ok_or_else(|| {
+                    YacliError::Serialization(format!("malformed IMAP {key} response"))
+                })?;
+            let parsed = value_text
+                .parse::<u64>()
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| YacliError::Serialization(format!("invalid IMAP {key} response")))?;
+            if found.is_some_and(|previous| previous != parsed) {
+                return Err(YacliError::Serialization(format!(
+                    "conflicting IMAP {key} responses"
+                )));
+            }
+            found = Some(parsed);
+        }
+        Ok(found)
+    }
+
+    Ok(ImapMailboxSelectStatus {
+        uid_validity: value(lines, "UIDVALIDITY")?,
+        uid_next: value(lines, "UIDNEXT")?,
+    })
+}
+
 fn parse_list_line(line: &str) -> Result<MailFolder> {
     let payload = line
         .strip_prefix("* LIST ")
@@ -4676,6 +4754,40 @@ mod tests {
         assert!(super::validate_mail_eml_export(42, 0).is_err());
         assert!(super::validate_mail_eml_output_path(std::path::Path::new("mail.txt")).is_err());
         assert!(super::validate_mail_eml_output_path(std::path::Path::new("mail.EML")).is_ok());
+    }
+
+    #[test]
+    fn mailbox_checkpoint_reads_uid_validity_and_next_from_select() {
+        let stream = FakeStream::new(
+            "* 3 EXISTS\r\n* OK [UIDVALIDITY 93124] UIDs valid\r\n* OK [UIDNEXT 442] Predicted next UID\r\nA0001 OK [READ-WRITE] selected\r\n",
+        );
+        let mut session = ImapSession::from_stream(stream);
+        let status = session
+            .select_mailbox_with_status("Drafts")
+            .expect("select status");
+        assert_eq!(status.uid_validity, Some(93124));
+        assert_eq!(status.uid_next, Some(442));
+        assert!(
+            session
+                .reader
+                .get_ref()
+                .written()
+                .contains("A0001 SELECT \"Drafts\"\r\n")
+        );
+    }
+
+    #[test]
+    fn mailbox_checkpoint_parser_rejects_conflicting_or_invalid_values() {
+        assert!(
+            super::parse_imap_mailbox_select_status(&[
+                "* OK [UIDVALIDITY 1] valid".into(),
+                "* OK [UIDVALIDITY 2] valid".into(),
+            ])
+            .is_err()
+        );
+        assert!(
+            super::parse_imap_mailbox_select_status(&["* OK [UIDNEXT 0] invalid".into()]).is_err()
+        );
     }
 
     #[test]

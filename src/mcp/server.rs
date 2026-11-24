@@ -80,10 +80,10 @@ use crate::{
         create_mail_draft, create_mail_folder, delete_mail_folder, export_mail_attachment,
         export_mail_eml, forward_mail_message_reviewed_with_attachments,
         forward_mail_message_with_attachments, inspect_mail_invite, list_mail_drafts_page,
-        list_mail_folders, list_mail_messages_page, load_mail_attachments, move_mail_message,
-        move_mail_message_to_special_folder, read_mail_message, rename_mail_folder,
-        reply_to_mail_message_with_attachments, review_mail_eml_export, review_mail_folder_delete,
-        review_mail_forward_submission_with_attachments,
+        list_mail_folders, list_mail_messages_page, load_mail_attachments, mail_mailbox_checkpoint,
+        move_mail_message, move_mail_message_to_special_folder, read_mail_message,
+        rename_mail_folder, reply_to_mail_message_with_attachments, review_mail_eml_export,
+        review_mail_folder_delete, review_mail_forward_submission_with_attachments,
         review_mail_reply_submission_with_attachments, review_mail_submission,
         search_mail_all_folders_page, search_mail_messages_filtered_page,
         send_mail_message_with_sent_copy, update_mail_flags, validate_mail_eml_output_path,
@@ -1422,6 +1422,20 @@ fn tool_definitions(ui_enabled: bool, roots_enabled: bool) -> Result<Vec<Value>>
             ui_enabled,
         ),
         tool(
+            "yacli.mail.checkpoint",
+            "Получить UIDVALIDITY и UIDNEXT выбранной IMAP-папки для проверки устойчивости UID после изменений ящика.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "account": { "type": "string" },
+                    "folder": { "type": "string" }
+                },
+                "additionalProperties": false
+            }),
+            None,
+            ui_enabled,
+        ),
+        tool(
             "yacli.mail.draft.list",
             "Показать черновики из папки, которую IMAP-сервер пометил как \\Drafts; список ограничен пагинацией.",
             json!({
@@ -2242,6 +2256,7 @@ fn call_tool(params: Value, ui_enabled: bool) -> Result<Value> {
             optional_u64(&arguments, "max_bytes").unwrap_or(15 * 1024 * 1024),
         )?,
         "yacli.mail.draft.list" => mail_draft_list(&arguments)?,
+        "yacli.mail.checkpoint" => mail_checkpoint(&arguments)?,
         "yacli.mail.draft.create" => mail_draft_create(&arguments)?,
         "yacli.mail.send" => mail_send(
             arguments.get("account").and_then(Value::as_str),
@@ -3458,6 +3473,14 @@ fn mail_draft_list(args: &Value) -> Result<Value> {
     let (folder, items) =
         list_mail_drafts_page(&context.imap_host, context.imap_port, auth, limit, offset)?;
     Ok(json!({"account":account,"folder":folder,"limit":limit,"offset":offset,"items":items}))
+}
+
+fn mail_checkpoint(args: &Value) -> Result<Value> {
+    let folder = optional_string(args, "folder").unwrap_or("INBOX");
+    let (account, auth, context) =
+        resolve_mail_private_context(args.get("account").and_then(Value::as_str))?;
+    let checkpoint = mail_mailbox_checkpoint(&context.imap_host, context.imap_port, auth, folder)?;
+    Ok(json!({"account":account,"checkpoint":checkpoint}))
 }
 
 fn mail_draft_create(args: &Value) -> Result<Value> {
