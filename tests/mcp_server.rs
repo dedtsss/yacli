@@ -510,6 +510,113 @@ fn devcat_mail_rule_configure_preview_does_not_write_rule_file() {
     assert!(!temp.path().join("mail-rules.toml").exists());
 }
 
+#[test]
+fn mail_rule_mcp_update_changes_action_value() {
+    let temp = tempdir().expect("tempdir");
+    write_mock_mail_account(temp.path());
+    fs::write(
+        temp.path().join("mail-rules.toml"),
+        r#"version = 1
+
+[[rules]]
+id = "triage"
+enabled = false
+account = "mock"
+mailbox = "INBOX"
+subject_contains = "alert"
+action = "mark_read"
+"#,
+    )
+    .expect("write rule config");
+    let input = [
+        initialize_request(false),
+        mcp_notification("notifications/initialized", json!({})),
+        mcp_request(
+            2,
+            "tools/call",
+            json!({
+                "name":"yacli.mail.rules.configure",
+                "arguments":{
+                    "account":"mock",
+                    "operation":"update",
+                    "id":"triage",
+                    "action":"star"
+                }
+            }),
+        ),
+    ]
+    .concat();
+    let output = yacli()
+        .env("YACLI_CONFIG_DIR", temp.path())
+        .args(["mcp"])
+        .write_stdin(input)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let responses = parse_responses(&output);
+    assert_eq!(
+        responses[1]["result"]["structuredContent"]["rule"]["action"],
+        "star"
+    );
+    assert!(
+        fs::read_to_string(temp.path().join("mail-rules.toml"))
+            .expect("updated rule config")
+            .contains("action = \"star\"")
+    );
+}
+
+#[test]
+fn devcat_mail_rule_undo_pending_returns_both_plan_and_mcp_review_digests() {
+    let temp = tempdir().expect("tempdir");
+    write_mock_mail_account(temp.path());
+    fs::write(
+        temp.path().join("mail-rules-audit.toml"),
+        format!(
+            "version = 1\n\n[[runs]]\nrun_id = \"run-1\"\nrule_id = \"triage\"\naccount = \"mock\"\nmailbox = \"INBOX\"\nuid_validity = 9\naction = \"mark_read\"\napplied_at_epoch_secs = 1\n\n[[runs.messages]]\nuid = 11\nwas_seen = false\nwas_flagged = false\nbecame_seen = true\nbecame_flagged = false\n\n[runs.undo_pending]\nreview_sha256 = \"{}\"\n\n[[runs.undo_pending.messages]]\nuid = 11\nexpected_seen = true\nrestore_seen = false\n",
+            "a".repeat(64)
+        ),
+    )
+    .expect("write pending audit");
+    let input = [
+        initialize_request(false),
+        mcp_notification("notifications/initialized", json!({})),
+        mcp_request(
+            2,
+            "tools/call",
+            json!({
+                "name":"yacli.mail.rules.undo",
+                "arguments":{
+                    "account":"mock",
+                    "run_id":"run-1",
+                    "dry_run":true
+                }
+            }),
+        ),
+    ]
+    .concat();
+    let output = yacli()
+        .env("YACLI_CONFIG_DIR", temp.path())
+        .env("YACLI_DEVCAT_MODE", "1")
+        .env("YACLI_DEVCAT_ACCOUNT", "mock")
+        .env("YACLI_DEVCAT_CAPABILITIES", "mail.mutate")
+        .env("YACLI_DEVCAT_DISK_ROOTS", temp.path())
+        .args(["mcp"])
+        .write_stdin(input)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let responses = parse_responses(&output);
+    let structured = &responses[1]["result"]["structuredContent"];
+    assert_eq!(structured["dry_run"], true);
+    assert_eq!(structured["plan_sha256"], "a".repeat(64));
+    assert!(structured["review_sha256"].is_string());
+    assert_ne!(structured["plan_sha256"], structured["review_sha256"]);
+}
+
 fn write_mock_calendar_account(config_dir: &std::path::Path, caldav_base_url: &str) {
     write_accounts_file(
         config_dir,

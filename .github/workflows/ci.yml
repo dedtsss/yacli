@@ -102,6 +102,13 @@ jobs:
           install_dir="$RUNNER_TEMP/bin"
           sh ./scripts/install.sh --base-url http://127.0.0.1:8877 --install-dir "$install_dir"
           "$install_dir/yacli" --format json guide --topic disk
+      - name: Upload isolated Linux x86_64 candidate binary
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        uses: actions/upload-artifact@v6
+        with:
+          name: yacli-linux-x86_64-candidate
+          path: target/x86_64-unknown-linux-gnu/release/yacli
+          if-no-files-found: error
       - name: Smoke Windows installer
         if: matrix.package_kind == 'windows'
         shell: pwsh

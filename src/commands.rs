@@ -3196,6 +3196,7 @@ pub(crate) fn execute_mail_rules(
         }
         MailRulesCommand::Enable { id } => set_mail_rule_enabled(format, &id, true),
         MailRulesCommand::Disable { id } => set_mail_rule_enabled(format, &id, false),
+        MailRulesCommand::Baseline { id } => mail_rule_baseline(format, &id),
         MailRulesCommand::Reset { id } => {
             let config = MailRulesFile::load(&mail_rules_path()?)?;
             if !config.rules.iter().any(|rule| rule.id == id) {
@@ -3309,6 +3310,65 @@ fn set_mail_rule_enabled(format: OutputFormat, id: &str, enabled: bool) -> Resul
     )
 }
 
+fn mail_rule_baseline(format: OutputFormat, id: &str) -> Result<RenderedOutput> {
+    if crate::mcp::devcat::enabled() && !crate::mcp::devcat::has_capability("mail.mutate") {
+        return Err(YacliError::Auth(
+            "Создание контрольной точки требует явной возможности DevCat mail.mutate".into(),
+        ));
+    }
+    let rules = MailRulesFile::load(&mail_rules_path()?)?;
+    let rule = rules
+        .rules
+        .iter()
+        .find(|rule| rule.id == id)
+        .ok_or_else(|| YacliError::Validation(format!("Правило {id} не найдено")))?;
+    let (account, auth, context) = resolve_mail_private_context(Some(&rule.account))?;
+    if account != rule.account {
+        return Err(YacliError::Validation(
+            "Разрешённый аккаунт не совпал с точным alias правила".into(),
+        ));
+    }
+    let current =
+        mail_mailbox_checkpoint(&context.imap_host, context.imap_port, auth, &rule.mailbox)?;
+    let path = mail_rules_state_path()?;
+    let mut state = MailRulesState::load(&path)?;
+    if state
+        .checkpoint(id)
+        .is_some_and(|checkpoint| checkpoint.pending.is_some())
+    {
+        return Err(YacliError::Validation(
+            "Нельзя заменить контрольную точку с незавершённым действием".into(),
+        ));
+    }
+    state
+        .checkpoints
+        .retain(|checkpoint| checkpoint.rule_id != id);
+    let checkpoint = MailRuleCheckpoint {
+        rule_id: rule.id.clone(),
+        account: rule.account.clone(),
+        mailbox: rule.mailbox.clone(),
+        uid_validity: current.uid_validity,
+        cursor_uid: current.uid_next.saturating_sub(1),
+        pending: None,
+    };
+    state.checkpoints.push(checkpoint.clone());
+    state.save(&path)?;
+    ok_output(
+        format,
+        "mail.rules.baseline",
+        json!({"rule_id":id,"checkpoint":checkpoint,"status":"baseline_created"}),
+        render_key_value_table(&[
+            ("rule.id", id.to_string()),
+            ("uid_validity", checkpoint.uid_validity.to_string()),
+            ("cursor_uid", checkpoint.cursor_uid.to_string()),
+            (
+                "status",
+                "baseline создан; старые письма пропускаются".into(),
+            ),
+        ]),
+    )
+}
+
 fn mail_rule_action_from_arg(action: MailRuleActionArg) -> MailRuleAction {
     match action {
         MailRuleActionArg::MarkRead => MailRuleAction::MarkRead,
@@ -3381,20 +3441,22 @@ fn execute_mail_rules_run(
                 auth,
                 &rule.mailbox,
             )?;
-            state.checkpoints.push(MailRuleCheckpoint {
-                rule_id: rule.id.clone(),
-                account: rule.account.clone(),
-                mailbox: rule.mailbox.clone(),
-                uid_validity: current.uid_validity,
-                cursor_uid: current.uid_next.saturating_sub(1),
-                pending: None,
-            });
-            state.save(&state_path)?;
+            if automatic {
+                state.checkpoints.push(MailRuleCheckpoint {
+                    rule_id: rule.id.clone(),
+                    account: rule.account.clone(),
+                    mailbox: rule.mailbox.clone(),
+                    uid_validity: current.uid_validity,
+                    cursor_uid: current.uid_next.saturating_sub(1),
+                    pending: None,
+                });
+                state.save(&state_path)?;
+            }
             results.push(json!({
                 "rule_id":rule.id,
-                "status":"baseline_created",
+                "status":if automatic {"baseline_created"} else {"baseline_required"},
                 "checkpoint":{"uid_validity":current.uid_validity,"cursor_uid":current.uid_next.saturating_sub(1)},
-                "note":"Старые письма не попадут под это правило; запустите preview повторно для новых сообщений"
+                "note":"Старые письма не попадут под это правило; сохраните baseline явной операцией"
             }));
             continue;
         }

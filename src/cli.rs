@@ -791,6 +791,11 @@ pub enum MailRulesCommand {
         #[arg(value_name = "ID")]
         id: String,
     },
+    /// Зафиксировать безопасную начальную UIDNEXT-контрольную точку без обработки старых писем.
+    Baseline {
+        #[arg(value_name = "ID")]
+        id: String,
+    },
     /// Сбросить контрольную точку; следующий запуск только зафиксирует новый baseline.
     Reset {
         #[arg(value_name = "ID")]
@@ -801,7 +806,7 @@ pub enum MailRulesCommand {
         #[arg(value_name = "ID")]
         id: String,
     },
-    /// Просмотреть пакет; для применения нужны --apply и хеш preview.
+    /// Просмотреть пакет без сохранения состояния; для применения нужны --apply и хеш preview.
     Run {
         #[arg(long, value_name = "ID")]
         rule: Option<String>,

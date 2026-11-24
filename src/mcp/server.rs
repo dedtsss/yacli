@@ -1518,8 +1518,8 @@ fn tool_definitions(ui_enabled: bool, roots_enabled: bool) -> Result<Vec<Value>>
         ),
         tool("yacli.mail.rules.list", "Показать локальные правила Mail и их контрольные точки; это правила yacli, не серверные фильтры Яндекса.", json!({"type":"object","properties":{"account":{"type":"string"}},"additionalProperties":false}), None, ui_enabled),
         tool("yacli.mail.rules.audit", "Показать content-free аудит запусков и откатов локальных правил Mail.", json!({"type":"object","properties":{"account":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":1000}},"additionalProperties":false}), None, ui_enabled),
-        tool("yacli.mail.rules.preview", "Просмотреть следующий ограниченный пакет (до 50 UID) для указанного включённого локального правила. Первый вызов фиксирует baseline и не обрабатывает старые письма.", json!({"type":"object","properties":{"account":{"type":"string"},"rule":{"type":"string"}},"required":["account","rule"],"additionalProperties":false}), None, ui_enabled),
-        tool("yacli.mail.rules.configure", "Создать, изменить, включить, выключить, сбросить или удалить локальное правило; создание выключено по умолчанию. В DevCat требуется mail.mutate и review.", json!({"type":"object","properties":{"account":{"type":"string"},"operation":{"type":"string","enum":["add","update","enable","disable","reset","delete"]},"id":{"type":"string"},"mailbox":{"type":"string"},"from_contains":{"type":"string"},"subject_contains":{"type":"string"},"clear_from":{"type":"boolean"},"clear_subject":{"type":"boolean"},"action":{"type":"string","enum":["mark_read","mark_unread","star","unstar"]}},"required":["account","operation","id"],"additionalProperties":false}), None, ui_enabled),
+        tool("yacli.mail.rules.preview", "Прочитать следующий ограниченный пакет (до 50 UID) для указанного включённого локального правила. Без baseline вернёт baseline_required и не изменит локальное состояние.", json!({"type":"object","properties":{"account":{"type":"string"},"rule":{"type":"string"}},"required":["account","rule"],"additionalProperties":false}), None, ui_enabled),
+        tool("yacli.mail.rules.configure", "Создать, изменить, включить, выключить, сбросить или удалить локальное правило либо явно создать его baseline; создание правила выключено по умолчанию. В DevCat требуется mail.mutate и review.", json!({"type":"object","properties":{"account":{"type":"string"},"operation":{"type":"string","enum":["add","update","enable","disable","baseline","reset","delete"]},"id":{"type":"string"},"mailbox":{"type":"string"},"from_contains":{"type":"string"},"subject_contains":{"type":"string"},"clear_from":{"type":"boolean"},"clear_subject":{"type":"boolean"},"action":{"type":"string","enum":["mark_read","mark_unread","star","unstar"]}},"required":["account","operation","id"],"additionalProperties":false}), None, ui_enabled),
         tool("yacli.mail.rules.run", "Применить только пакет, показанный preview, после проверки digest. Сначала вызовите с dry_run=true; затем передайте plan_sha256 и MCP review_sha256 из соответствующих preview.", json!({"type":"object","properties":{"account":{"type":"string"},"rule":{"type":"string"},"plan_sha256":{"type":"string"}},"required":["account","rule"],"additionalProperties":false}), None, ui_enabled),
         tool("yacli.mail.rules.undo", "Просмотреть или отменить одно выполнение правил; undo возможен только если целевой флаг не изменялся после применения. В DevCat требуется review.", json!({"type":"object","properties":{"account":{"type":"string"},"run_id":{"type":"string"},"plan_sha256":{"type":"string"}},"required":["account","run_id"],"additionalProperties":false}), None, ui_enabled),
         tool(
@@ -3623,7 +3623,11 @@ fn mail_rules_preview(args: &Value) -> Result<Value> {
 }
 
 fn mail_rules_action(value: &Value) -> Result<MailRuleActionArg> {
-    match required_string(value, "action")? {
+    mail_rules_action_value(required_string(value, "action")?)
+}
+
+fn mail_rules_action_value(value: &str) -> Result<MailRuleActionArg> {
+    match value {
         "mark_read" => Ok(MailRuleActionArg::MarkRead),
         "mark_unread" => Ok(MailRuleActionArg::MarkUnread),
         "star" => Ok(MailRuleActionArg::Star),
@@ -3661,7 +3665,7 @@ fn mail_rules_configure(args: &Value) -> Result<Value> {
             object.remove("review_sha256");
         }
         return Ok(
-            json!({"status":"review_required","operation":"mail.rules.configure","proposal":proposal}),
+            json!({"status":"review_required","operation":"mail.rules.configure","proposal":proposal,"dry_run":true}),
         );
     }
     let command = match operation {
@@ -3683,10 +3687,15 @@ fn mail_rules_configure(args: &Value) -> Result<Value> {
             subject_contains: optional_string_owned(args, "subject_contains"),
             clear_from: optional_bool(args, "clear_from").unwrap_or(false),
             clear_subject: optional_bool(args, "clear_subject").unwrap_or(false),
-            action: args.get("action").map(mail_rules_action).transpose()?,
+            action: args
+                .get("action")
+                .and_then(Value::as_str)
+                .map(mail_rules_action_value)
+                .transpose()?,
         },
         "enable" => MailRulesCommand::Enable { id },
         "disable" => MailRulesCommand::Disable { id },
+        "baseline" => MailRulesCommand::Baseline { id },
         "reset" => MailRulesCommand::Reset { id },
         "delete" => MailRulesCommand::Delete { id },
         _ => {
@@ -3695,7 +3704,9 @@ fn mail_rules_configure(args: &Value) -> Result<Value> {
             ));
         }
     };
-    mail_rules_command(command)
+    let mut result = mail_rules_command(command)?;
+    result["dry_run"] = json!(false);
+    Ok(result)
 }
 
 fn mail_rules_run(args: &Value) -> Result<Value> {
@@ -3712,11 +3723,13 @@ fn mail_rules_run(args: &Value) -> Result<Value> {
     } else {
         None
     };
-    mail_rules_command(MailRulesCommand::Run {
+    let mut result = mail_rules_command(MailRulesCommand::Run {
         rule: Some(id),
         apply,
         review_sha256: plan,
-    })
+    })?;
+    result["dry_run"] = json!(dry_run);
+    Ok(result)
 }
 
 fn mail_rules_undo(args: &Value) -> Result<Value> {
@@ -3743,11 +3756,24 @@ fn mail_rules_undo(args: &Value) -> Result<Value> {
     } else {
         None
     };
-    mail_rules_command(MailRulesCommand::Undo {
+    let mut result = mail_rules_command(MailRulesCommand::Undo {
         run_id: run_id.to_string(),
         apply,
         review_sha256: plan,
-    })
+    })?;
+    if let Some(plan) = result
+        .get("review_sha256")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    {
+        result["plan_sha256"] = Value::String(plan);
+        result
+            .as_object_mut()
+            .expect("mail rules undo response is an object")
+            .remove("review_sha256");
+    }
+    result["dry_run"] = json!(dry_run);
+    Ok(result)
 }
 
 fn mail_draft_list(args: &Value) -> Result<Value> {
