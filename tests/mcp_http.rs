@@ -372,7 +372,17 @@ fn devcat_slow_or_abandoned_tool_does_not_block_sessions_and_reviews_bind_accoun
         "slow/abandoned tool held the session registry"
     );
     let tools = catalog["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 19);
+    assert_eq!(tools.len(), 21);
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool["name"] == "yacli.mail.attachment.export")
+    );
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool["name"] == "yacli.mail.eml.export")
+    );
     for tool in tools {
         let schema = &tool["inputSchema"]["properties"]["account"];
         assert_eq!(schema["enum"], json!(["mock", "second"]));
@@ -384,7 +394,7 @@ fn devcat_slow_or_abandoned_tool_does_not_block_sessions_and_reviews_bind_accoun
                 .contains("second: mail=configured, disk=NOT_CONFIGURED")
         );
         let name = tool["name"].as_str().unwrap();
-        if name == "yacli.mail.forward" {
+        if matches!(name, "yacli.mail.forward" | "yacli.mail.eml.export") {
             assert_eq!(
                 tool["inputSchema"]["properties"]["dry_run"]["type"],
                 "boolean"
@@ -409,6 +419,7 @@ fn devcat_slow_or_abandoned_tool_does_not_block_sessions_and_reviews_bind_accoun
                     | "yacli.mail.send_published_link"
                     | "yacli.mail.reply"
                     | "yacli.mail.forward"
+                    | "yacli.mail.eml.export"
             )
         );
         assert_eq!(
@@ -432,6 +443,7 @@ fn devcat_slow_or_abandoned_tool_does_not_block_sessions_and_reviews_bind_accoun
                     | "yacli.mail.send_published_link"
                     | "yacli.mail.reply"
                     | "yacli.mail.forward"
+                    | "yacli.mail.eml.export"
             )
         );
     }

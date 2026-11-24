@@ -348,6 +348,31 @@ pub struct MailAttachmentExportRequest {
 }
 
 #[derive(Clone, Debug)]
+pub struct MailEmlExportRequest {
+    pub uid: u64,
+    pub output: PathBuf,
+    pub force: bool,
+    pub max_bytes: u64,
+    pub expected_sha256: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
+pub struct MailEmlExportReview {
+    pub message_uid: u64,
+    pub max_bytes: u64,
+    pub sha256: String,
+    pub bytes: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
+pub struct ExportedMailEml {
+    pub message_uid: u64,
+    pub output_path: String,
+    pub bytes_written: u64,
+    pub sha256: String,
+}
+
+#[derive(Clone, Debug)]
 pub struct MailInviteInspectRequest {
     pub uid: u64,
     pub selector: MailAttachmentSelector,
@@ -1251,7 +1276,7 @@ pub fn read_mail_message(
         )));
     }
 
-    let raw_message = session.fetch_message_rfc822(uid)?;
+    let raw_message = session.fetch_message_rfc822_limited(uid, max_bytes)?;
     let message = build_read_message(metadata, &headers, &raw_message)?;
     let _ = session.logout();
     Ok(message)
@@ -1429,6 +1454,93 @@ pub fn export_mail_attachment(
 
     let message = read_mail_message(imap_host, imap_port, auth, mailbox_name, uid, max_bytes)?;
     export_attachment_from_message(&message, &selector, &output, force)
+}
+
+pub fn review_mail_eml_export(
+    imap_host: &str,
+    imap_port: u16,
+    auth: MailSessionAuth,
+    mailbox_name: &str,
+    uid: u64,
+    max_bytes: u64,
+) -> Result<MailEmlExportReview> {
+    validate_mail_eml_export(uid, max_bytes)?;
+    let mut session = open_authenticated_session(imap_host, imap_port, auth)?;
+    session.select_mailbox(&encode_modified_utf7(mailbox_name))?;
+    let contents = session.fetch_message_rfc822_limited(uid, max_bytes)?;
+    let _ = session.logout();
+    Ok(mail_eml_export_review(uid, max_bytes, &contents))
+}
+
+pub fn export_mail_eml(
+    imap_host: &str,
+    imap_port: u16,
+    auth: MailSessionAuth,
+    mailbox_name: &str,
+    request: MailEmlExportRequest,
+) -> Result<ExportedMailEml> {
+    validate_mail_eml_export(request.uid, request.max_bytes)?;
+    validate_mail_eml_output_path(&request.output)?;
+    let mut session = open_authenticated_session(imap_host, imap_port, auth)?;
+    session.select_mailbox(&encode_modified_utf7(mailbox_name))?;
+    let contents = session.fetch_message_rfc822_limited(request.uid, request.max_bytes)?;
+    let _ = session.logout();
+    let preview = mail_eml_export_review(request.uid, request.max_bytes, &contents);
+    if request
+        .expected_sha256
+        .as_deref()
+        .is_some_and(|expected| expected != preview.sha256)
+    {
+        return Err(YacliError::Auth(
+            "Содержимое письма изменилось после предварительной проверки; повторите review.".into(),
+        ));
+    }
+    let written = write_attachment_to_path(&contents, &request.output, request.force)?;
+    Ok(ExportedMailEml {
+        message_uid: request.uid,
+        output_path: written.output_path,
+        bytes_written: written.bytes_written,
+        sha256: written.sha256,
+    })
+}
+
+pub fn validate_mail_eml_output_path(output: &Path) -> Result<()> {
+    if !output
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("eml"))
+    {
+        return Err(YacliError::Validation(
+            "Путь для экспорта письма должен иметь расширение .eml".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_mail_eml_export(uid: u64, max_bytes: u64) -> Result<()> {
+    if uid == 0 {
+        return Err(YacliError::Validation(
+            "mail eml export uid must be greater than zero".into(),
+        ));
+    }
+    if max_bytes == 0 || max_bytes > SMTP_SAFE_MESSAGE_BYTES as u64 {
+        return Err(YacliError::Validation(format!(
+            "mail eml export max_bytes must be between 1 and {}",
+            SMTP_SAFE_MESSAGE_BYTES
+        )));
+    }
+    Ok(())
+}
+
+fn mail_eml_export_review(uid: u64, max_bytes: u64, contents: &[u8]) -> MailEmlExportReview {
+    let mut hasher = Sha256::new();
+    hasher.update(contents);
+    MailEmlExportReview {
+        message_uid: uid,
+        max_bytes,
+        sha256: format!("{:x}", hasher.finalize()),
+        bytes: contents.len() as u64,
+    }
 }
 
 pub fn inspect_mail_invite(
@@ -2319,7 +2431,7 @@ impl<S: Read + Write> ImapSession<S> {
         }
     }
 
-    fn fetch_message_rfc822(&mut self, uid: u64) -> Result<Vec<u8>> {
+    fn fetch_message_rfc822_limited(&mut self, uid: u64, max_bytes: u64) -> Result<Vec<u8>> {
         let tag = self.next_tag();
         self.write_line(&format!("{tag} UID FETCH {uid} (BODY.PEEK[])"))?;
 
@@ -2339,6 +2451,11 @@ impl<S: Read + Write> ImapSession<S> {
                         "missing RFC822 literal in IMAP FETCH response: {line}"
                     ))
                 })?;
+                if literal_len as u64 > max_bytes {
+                    return Err(YacliError::Validation(format!(
+                        "message size {literal_len} exceeds mail eml export limit {max_bytes}"
+                    )));
+                }
                 let mut literal = vec![0_u8; literal_len];
                 self.reader.read_exact(&mut literal)?;
                 let trailer = self.read_line()?;
@@ -4488,6 +4605,33 @@ mod tests {
             attributes: vec![],
         };
         assert!(!super::is_protected_mail_folder(&ordinary));
+    }
+
+    #[test]
+    fn fetch_mail_eml_preserves_rfc822_bytes_and_enforces_limit_before_allocation() {
+        let stream =
+            FakeStream::new("* 7 FETCH (UID 42 BODY[] {4}\r\nDATA)\r\nA0001 OK fetched\r\n");
+        let mut session = ImapSession::from_stream(stream);
+        assert_eq!(
+            session.fetch_message_rfc822_limited(42, 4).unwrap(),
+            b"DATA"
+        );
+        assert!(
+            session
+                .reader
+                .get_ref()
+                .written()
+                .contains("A0001 UID FETCH 42 (BODY.PEEK[])\r\n")
+        );
+
+        let stream =
+            FakeStream::new("* 7 FETCH (UID 42 BODY[] {5}\r\nDATA!)\r\nA0001 OK fetched\r\n");
+        let mut session = ImapSession::from_stream(stream);
+        assert!(session.fetch_message_rfc822_limited(42, 4).is_err());
+        assert!(super::validate_mail_eml_export(0, 10).is_err());
+        assert!(super::validate_mail_eml_export(42, 0).is_err());
+        assert!(super::validate_mail_eml_output_path(std::path::Path::new("mail.txt")).is_err());
+        assert!(super::validate_mail_eml_output_path(std::path::Path::new("mail.EML")).is_ok());
     }
 
     #[test]

@@ -147,9 +147,12 @@ pub fn has_capability(capability: &str) -> bool {
 
 fn required_capabilities(name: &str) -> Option<&'static [&'static str]> {
     match name {
-        "yacli.mail.folders" | "yacli.mail.list" | "yacli.mail.search" | "yacli.mail.read" => {
-            Some(&["mail.read"])
-        }
+        "yacli.mail.folders"
+        | "yacli.mail.list"
+        | "yacli.mail.search"
+        | "yacli.mail.read"
+        | "yacli.mail.attachment.export"
+        | "yacli.mail.eml.export" => Some(&["mail.read"]),
         "yacli.mail.send"
         | "yacli.mail.send_published_link"
         | "yacli.mail.reply"
@@ -282,10 +285,12 @@ pub fn check_tool(name: &str, arguments: &serde_json::Value) -> Result<()> {
             crate::disk::validate_trash_restore_name(name)?;
         }
     }
-    if matches!(name, "yacli.disk.download" | "yacli.mail.attachment.export")
-        && let Some(path) = arguments
-            .get("output_path")
-            .and_then(serde_json::Value::as_str)
+    if matches!(
+        name,
+        "yacli.disk.download" | "yacli.mail.attachment.export" | "yacli.mail.eml.export"
+    ) && let Some(path) = arguments
+        .get("output_path")
+        .and_then(serde_json::Value::as_str)
     {
         check_local_download(path)?;
     }
@@ -370,6 +375,7 @@ pub fn is_risky(name: &str) -> bool {
             | "yacli.mail.bulk"
             | "yacli.mail.special_folder"
             | "yacli.mail.draft.create"
+            | "yacli.mail.eml.export"
             | "yacli.contacts.create"
             | "yacli.contacts.update"
             | "yacli.contacts.delete"
@@ -593,6 +599,15 @@ mod tests {
             required_capabilities("yacli.contacts.search"),
             Some(["contacts.read"].as_slice())
         );
+    }
+
+    #[test]
+    fn mail_eml_export_uses_read_scope_with_a_review_gate() {
+        assert_eq!(
+            required_capabilities("yacli.mail.eml.export"),
+            Some(["mail.read"].as_slice())
+        );
+        assert!(is_risky("yacli.mail.eml.export"));
     }
 
     #[test]

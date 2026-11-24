@@ -4,7 +4,7 @@ use std::hash::{Hash, Hasher};
 use std::io::Read;
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -74,18 +74,20 @@ use crate::{
         validate_private_trash_path, validate_trash_restore_name,
     },
     mail::{
-        MailAttachmentExportRequest, MailAttachmentSelector, MailBulkAction, MailFlagUpdate,
-        MailForwardRequest, MailForwardReviewBinding, MailInviteInspectRequest, MailSearchFilter,
-        MailSpecialFolderAction, apply_mail_bulk_action, copy_mail_message, create_mail_draft,
-        create_mail_folder, delete_mail_folder, export_mail_attachment,
-        forward_mail_message_reviewed_with_attachments, forward_mail_message_with_attachments,
-        inspect_mail_invite, list_mail_folders, list_mail_messages_page, load_mail_attachments,
-        move_mail_message, move_mail_message_to_special_folder, read_mail_message,
-        rename_mail_folder, reply_to_mail_message_with_attachments, review_mail_folder_delete,
+        MailAttachmentExportRequest, MailAttachmentSelector, MailBulkAction, MailEmlExportRequest,
+        MailFlagUpdate, MailForwardRequest, MailForwardReviewBinding, MailInviteInspectRequest,
+        MailSearchFilter, MailSpecialFolderAction, apply_mail_bulk_action, copy_mail_message,
+        create_mail_draft, create_mail_folder, delete_mail_folder, export_mail_attachment,
+        export_mail_eml, forward_mail_message_reviewed_with_attachments,
+        forward_mail_message_with_attachments, inspect_mail_invite, list_mail_folders,
+        list_mail_messages_page, load_mail_attachments, move_mail_message,
+        move_mail_message_to_special_folder, read_mail_message, rename_mail_folder,
+        reply_to_mail_message_with_attachments, review_mail_eml_export, review_mail_folder_delete,
         review_mail_forward_submission_with_attachments,
         review_mail_reply_submission_with_attachments, review_mail_submission,
         search_mail_all_folders_page, search_mail_messages_filtered_page,
-        send_mail_message_with_sent_copy, update_mail_flags, validate_mail_folder_rename,
+        send_mail_message_with_sent_copy, update_mail_flags, validate_mail_eml_output_path,
+        validate_mail_folder_rename,
     },
 };
 use chrono::{DateTime, Utc};
@@ -1615,6 +1617,26 @@ fn tool_definitions(ui_enabled: bool, roots_enabled: bool) -> Result<Vec<Value>>
             ui_enabled,
         ),
         tool(
+            "yacli.mail.eml.export",
+            "Экспортировать исходные байты письма в файл .eml с ограничением размера; в DevCat нужен review и путь в разрешённом каталоге выгрузки.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "account": { "type": "string" },
+                    "folder": { "type": "string" },
+                    "uid": { "type": "integer", "minimum": 1 },
+                    "output_path": { "type": "string" },
+                    "force": { "type": "boolean" },
+                    "max_bytes": { "type": "integer", "minimum": 1, "maximum": 26214400 },
+                    "dry_run": { "type": "boolean" }
+                },
+                "required": ["uid", "output_path"],
+                "additionalProperties": false
+            }),
+            None,
+            ui_enabled,
+        ),
+        tool(
             "yacli.mail.invite.inspect",
             "Inspect one calendar invite attachment and return parsed VEVENT fields.",
             json!({
@@ -2081,6 +2103,29 @@ fn call_tool(params: Value, ui_enabled: bool) -> Result<Value> {
     } else {
         Vec::new()
     };
+    if devcat::enabled() && name == "yacli.mail.eml.export" {
+        required_string(&arguments, "output_path")?;
+        validate_mail_eml_output_path(Path::new(required_string(&arguments, "output_path")?))?;
+        let mut validation_arguments = arguments.clone();
+        validation_arguments["dry_run"] = Value::Bool(true);
+        devcat::check_tool(name, &validation_arguments)?;
+        let folder = optional_string(&arguments, "folder").unwrap_or("INBOX");
+        let uid = required_u64(&arguments, "uid")?;
+        let max_bytes = optional_u64(&arguments, "max_bytes").unwrap_or(25 * 1024 * 1024);
+        let (_, auth, context) =
+            resolve_mail_private_context(arguments.get("account").and_then(Value::as_str))?;
+        let preview = review_mail_eml_export(
+            &context.imap_host,
+            context.imap_port,
+            auth,
+            folder,
+            uid,
+            max_bytes,
+        )?;
+        if let Some(object) = arguments.as_object_mut() {
+            object.insert("_eml_sha256".into(), Value::String(preview.sha256));
+        }
+    }
     if devcat::enabled() && name == "yacli.mail.forward" {
         let request = mail_forward_tool_request(&arguments)?;
         let (resolved_account, auth, context) =
@@ -2239,6 +2284,7 @@ fn call_tool(params: Value, ui_enabled: bool) -> Result<Value> {
                 max_bytes: optional_u64(&arguments, "max_bytes").unwrap_or(15 * 1024 * 1024),
             },
         )?,
+        "yacli.mail.eml.export" => mail_eml_export(&arguments)?,
         "yacli.mail.invite.inspect" => mail_invite_inspect(
             arguments.get("account").and_then(Value::as_str),
             MailInviteInspectToolRequest {
@@ -4075,6 +4121,55 @@ fn mail_attachment_export(
         "folder": request.folder,
         "attachment": attachment,
     }))
+}
+
+fn mail_eml_export(args: &Value) -> Result<Value> {
+    let folder = optional_string(args, "folder").unwrap_or("INBOX");
+    let uid = required_u64(args, "uid")?;
+    let max_bytes = optional_u64(args, "max_bytes").unwrap_or(25 * 1024 * 1024);
+    let output_path = PathBuf::from(required_string(args, "output_path")?);
+    validate_mail_eml_output_path(&output_path)?;
+    let (account, auth, context) =
+        resolve_mail_private_context(args.get("account").and_then(Value::as_str))?;
+    if optional_bool(args, "dry_run") == Some(true) {
+        let review = review_mail_eml_export(
+            &context.imap_host,
+            context.imap_port,
+            auth,
+            folder,
+            uid,
+            max_bytes,
+        )?;
+        if optional_string(args, "_eml_sha256").is_some_and(|expected| expected != review.sha256) {
+            return Err(YacliError::Auth(
+                "Содержимое письма изменилось во время предварительной проверки; повторите review."
+                    .into(),
+            ));
+        }
+        let digest = devcat::review_hash("yacli.mail.eml.export", args)?;
+        devcat::record_review(digest.clone());
+        return Ok(json!({
+            "account": account,
+            "folder": folder,
+            "review": review,
+            "dry_run": true,
+            "review_sha256": digest,
+        }));
+    }
+    let exported = export_mail_eml(
+        &context.imap_host,
+        context.imap_port,
+        auth,
+        folder,
+        MailEmlExportRequest {
+            uid,
+            output: output_path,
+            force: optional_bool(args, "force").unwrap_or(false),
+            max_bytes,
+            expected_sha256: optional_string(args, "_eml_sha256").map(str::to_string),
+        },
+    )?;
+    Ok(json!({"account":account,"folder":folder,"export":exported}))
 }
 
 fn mail_invite_inspect(
@@ -6051,6 +6146,23 @@ mod native_attachment_schema_tests {
         assert_eq!(attachments[0].content, b"synthetic-pdf");
         assert_eq!(metadata[0]["file_id"], "synthetic-id");
         assert_eq!(metadata[0]["sha256"], "synthetic-sha256");
+    }
+
+    #[test]
+    fn mail_eml_export_schema_requires_uid_and_output_path() {
+        let tools = tool_definitions(false, false).expect("tool definitions");
+        let tool = tools
+            .iter()
+            .find(|tool| tool["name"] == "yacli.mail.eml.export")
+            .expect("mail eml export tool");
+        assert_eq!(
+            tool["inputSchema"]["required"],
+            json!(["uid", "output_path"])
+        );
+        assert_eq!(
+            tool["inputSchema"]["properties"]["max_bytes"]["maximum"],
+            26_214_400
+        );
     }
 
     #[test]
