@@ -950,7 +950,27 @@ fn update_mail_draft_session<S: Read + Write>(
                 .into(),
         ));
     }
-    session.append_draft(draft_folder, replacement_message.as_bytes())?;
+    if session
+        .append_draft(draft_folder, replacement_message.as_bytes())
+        .is_err()
+    {
+        // Сервер может сохранить APPEND, а затем вернуть отрицательный ответ.
+        // Не повторяем запись: ищем замену по созданному Message-ID и продолжаем
+        // только при подтверждении ровно одного совпадения.
+        match confirm_appended_draft(session, draft_folder, uid_validity, replacement_message_id) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(YacliError::Api(
+                    "IMAP APPEND вернул ошибку; новая версия не подтверждена, исходный черновик сохранён. Проверьте Drafts и Trash перед повтором".into(),
+                ));
+            }
+            Err(_) => {
+                return Err(YacliError::Api(
+                    "IMAP APPEND вернул ошибку; состояние новой версии проверить не удалось, исходный черновик сохранён. Проверьте Drafts и Trash перед повтором".into(),
+                ));
+            }
+        }
+    }
 
     let source_after_append = fetch_mail_draft_source(session, draft_folder, uid, uid_validity)
         .map_err(|_| YacliError::Api(format!(
@@ -974,6 +994,39 @@ fn update_mail_draft_session<S: Read + Write>(
         replacement_message_id: replacement_message_id.to_string(),
         old_moved_to_trash: true,
     })
+}
+
+fn confirm_appended_draft<S: Read + Write>(
+    session: &mut ImapSession<S>,
+    draft_folder: &str,
+    uid_validity: u64,
+    expected_message_id: &str,
+) -> Result<bool> {
+    select_mailbox_with_expected_uid_validity(session, draft_folder, uid_validity)?;
+    let matching_uids = session.search_uids_by_message_id(expected_message_id)?;
+    let [uid] = matching_uids.as_slice() else {
+        return Ok(false);
+    };
+    let message = session.fetch_message_rfc822_limited(*uid, SMTP_SAFE_MESSAGE_BYTES as u64)?;
+    Ok(mail_message_id_matches(&message, expected_message_id))
+}
+
+fn mail_message_id_matches(message: &[u8], expected: &str) -> bool {
+    let Ok(parsed) = mailparse::parse_mail(message) else {
+        return false;
+    };
+    let Some(actual) = parsed.headers.get_first_value("Message-ID") else {
+        return false;
+    };
+    normalize_message_id(&actual) == normalize_message_id(expected)
+}
+
+fn normalize_message_id(value: &str) -> &str {
+    value
+        .trim()
+        .strip_prefix('<')
+        .and_then(|value| value.strip_suffix('>'))
+        .unwrap_or(value.trim())
 }
 
 fn fetch_mail_draft_source<S: Read + Write>(
@@ -2817,6 +2870,30 @@ impl<S: Read + Write> ImapSession<S> {
             &self.current_tag(),
             &tagged,
             "IMAP UID SEARCH",
+            TaggedErrorKind::Api,
+        )?;
+        parse_search_uids(&lines)
+    }
+
+    fn search_uids_by_message_id(&mut self, message_id: &str) -> Result<Vec<u64>> {
+        let normalized = normalize_message_id(message_id);
+        if normalized.is_empty()
+            || !normalized.is_ascii()
+            || normalized.contains(['\r', '\n', '\0', '<', '>'])
+        {
+            return Err(YacliError::Validation(
+                "Некорректный Message-ID для поиска IMAP".into(),
+            ));
+        }
+        let search_value = format!("<{normalized}>");
+        let (lines, tagged) = self.run_command(&format!(
+            "UID SEARCH HEADER Message-ID {}",
+            quote_imap_string(&search_value)
+        ))?;
+        parse_tagged_status(
+            &self.current_tag(),
+            &tagged,
+            "IMAP UID SEARCH HEADER Message-ID",
             TaggedErrorKind::Api,
         )?;
         parse_search_uids(&lines)
@@ -4930,6 +5007,7 @@ mod tests {
     };
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
+    use sha2::Digest;
     use std::io::{Cursor, Read, Result as IoResult, Write};
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
@@ -5292,6 +5370,81 @@ mod tests {
         assert!(commands.contains("UID FETCH 15 (BODY.PEEK[])"));
         assert!(!commands.contains("APPEND"));
         assert!(!commands.contains("UID MOVE"));
+    }
+
+    #[test]
+    fn draft_update_confirms_append_by_unique_message_id_after_negative_tagged_reply() {
+        let source = b"Subject: original\r\n\r\nsource";
+        let replacement =
+            b"Subject: replacement\r\nMessage-ID: <replacement@example.invalid>\r\n\r\nreplacement";
+        let script = format!(
+            "* OK [UIDVALIDITY 30] valid\r\n* OK [UIDNEXT 16] next\r\nA0001 OK [READ-WRITE] selected\r\n* SEARCH 15\r\nA0002 OK searched\r\n* 1 FETCH (UID 15 BODY[] {{{}}}\r\n{} )\r\nA0003 OK fetched\r\n+ Ready for literal\r\nA0004 NO [TEMPFAIL] response failed after commit\r\n* OK [UIDVALIDITY 30] valid\r\n* OK [UIDNEXT 17] next\r\nA0005 OK [READ-WRITE] selected\r\n* SEARCH 16\r\nA0006 OK searched\r\n* 1 FETCH (UID 16 BODY[] {{{}}}\r\n{} )\r\nA0007 OK fetched\r\n* OK [UIDVALIDITY 30] valid\r\n* OK [UIDNEXT 17] next\r\nA0008 OK [READ-WRITE] selected\r\n* SEARCH 15 16\r\nA0009 OK searched\r\n* 1 FETCH (UID 15 BODY[] {{{}}}\r\n{} )\r\nA0010 OK fetched\r\nA0011 OK moved\r\n",
+            source.len(),
+            String::from_utf8_lossy(source),
+            replacement.len(),
+            String::from_utf8_lossy(replacement),
+            source.len(),
+            String::from_utf8_lossy(source),
+        );
+        let mut session = ImapSession::from_stream(FakeStream::new(&script));
+        let source_sha256 = format!("{:x}", super::Sha256::digest(source));
+        let result = super::update_mail_draft_session(
+            &mut session,
+            super::MailDraftUpdatePlan {
+                uid: 15,
+                uid_validity: 30,
+                expected_source_sha256: &source_sha256,
+                draft_folder: "Drafts",
+                trash_folder: "Trash",
+                replacement_message: std::str::from_utf8(replacement).unwrap(),
+                replacement_message_id: "replacement@example.invalid",
+            },
+        )
+        .expect("подтверждённую замену проверяем до перемещения исходника");
+
+        assert!(result.old_moved_to_trash);
+        let commands = session.reader.get_ref().written();
+        assert!(
+            commands.contains(
+                "A0006 UID SEARCH HEADER Message-ID \"<replacement@example.invalid>\"\r\n"
+            )
+        );
+        assert!(commands.contains("A0011 UID MOVE 15 \"Trash\"\r\n"));
+        assert_eq!(commands.matches(" APPEND ").count(), 1);
+    }
+
+    #[test]
+    fn draft_update_keeps_source_when_append_message_id_does_not_match() {
+        let source = b"Subject: original\r\n\r\nsource";
+        let unrelated =
+            b"Subject: unrelated\r\nMessage-ID: <other@example.invalid>\r\n\r\nunrelated";
+        let script = format!(
+            "* OK [UIDVALIDITY 30] valid\r\n* OK [UIDNEXT 16] next\r\nA0001 OK [READ-WRITE] selected\r\n* SEARCH 15\r\nA0002 OK searched\r\n* 1 FETCH (UID 15 BODY[] {{{}}}\r\n{} )\r\nA0003 OK fetched\r\n+ Ready for literal\r\nA0004 NO [TEMPFAIL] append rejected\r\n* OK [UIDVALIDITY 30] valid\r\n* OK [UIDNEXT 17] next\r\nA0005 OK [READ-WRITE] selected\r\n* SEARCH 16\r\nA0006 OK searched\r\n* 1 FETCH (UID 16 BODY[] {{{}}}\r\n{} )\r\nA0007 OK fetched\r\n",
+            source.len(),
+            String::from_utf8_lossy(source),
+            unrelated.len(),
+            String::from_utf8_lossy(unrelated),
+        );
+        let mut session = ImapSession::from_stream(FakeStream::new(&script));
+        let source_sha256 = format!("{:x}", super::Sha256::digest(source));
+        let result = super::update_mail_draft_session(
+            &mut session,
+            super::MailDraftUpdatePlan {
+                uid: 15,
+                uid_validity: 30,
+                expected_source_sha256: &source_sha256,
+                draft_folder: "Drafts",
+                trash_folder: "Trash",
+                replacement_message: "Subject: replacement\r\nMessage-ID: <replacement@example.invalid>\r\n\r\nreplacement",
+                replacement_message_id: "replacement@example.invalid",
+            },
+        );
+
+        assert!(result.is_err());
+        let commands = session.reader.get_ref().written();
+        assert!(commands.contains("UID SEARCH HEADER Message-ID"));
+        assert!(!commands.contains("UID MOVE"));
+        assert_eq!(commands.matches(" APPEND ").count(), 1);
     }
 
     #[test]
