@@ -29,7 +29,10 @@ use url::Url;
 use crate::account_store::AccountStore;
 use crate::activity_store::{ActivityStore, NewActivityEntry, record_activity};
 use crate::activity_undo::{apply_activity_undo, calendar_create_undo, disk_publish_undo};
-use crate::commands::{apply_safe_doctor_remediation, doctor_safe_remediation_activity_entry};
+use crate::cli::{MailRuleActionArg, MailRulesCommand, OutputFormat};
+use crate::commands::{
+    apply_safe_doctor_remediation, doctor_safe_remediation_activity_entry, execute_mail_rules,
+};
 use crate::credential_store::CredentialStore;
 use crate::disk_link::{DiskUploadLinkRequest, review_disk_upload_link, upload_link_to_disk};
 use crate::doctor::doctor_payload;
@@ -44,8 +47,10 @@ use crate::mail_link::{
     review_mail_send_published_link, send_link_via_mail_with_sent_copy,
     send_published_link_command, send_published_link_via_mail_with_sent_copy,
 };
+use crate::mail_rules::{MailRulesAuditFile, MailRulesFile};
 use crate::next_actions::next_actions_payload;
 use crate::onboarding::onboarding_resource_payload;
+use crate::paths::{mail_rules_audit_path, mail_rules_path};
 use crate::runtime_context::{
     auth_state, resolve_calendar_private_context, resolve_contacts_private_context,
     resolve_disk_private_context, resolve_mail_private_context,
@@ -1511,6 +1516,12 @@ fn tool_definitions(ui_enabled: bool, roots_enabled: bool) -> Result<Vec<Value>>
             None,
             ui_enabled,
         ),
+        tool("yacli.mail.rules.list", "Показать локальные правила Mail и их контрольные точки; это правила yacli, не серверные фильтры Яндекса.", json!({"type":"object","properties":{"account":{"type":"string"}},"additionalProperties":false}), None, ui_enabled),
+        tool("yacli.mail.rules.audit", "Показать content-free аудит запусков и откатов локальных правил Mail.", json!({"type":"object","properties":{"account":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":1000}},"additionalProperties":false}), None, ui_enabled),
+        tool("yacli.mail.rules.preview", "Просмотреть следующий ограниченный пакет (до 50 UID) для указанного включённого локального правила. Первый вызов фиксирует baseline и не обрабатывает старые письма.", json!({"type":"object","properties":{"account":{"type":"string"},"rule":{"type":"string"}},"required":["account","rule"],"additionalProperties":false}), None, ui_enabled),
+        tool("yacli.mail.rules.configure", "Создать, изменить, включить, выключить, сбросить или удалить локальное правило; создание выключено по умолчанию. В DevCat требуется mail.mutate и review.", json!({"type":"object","properties":{"account":{"type":"string"},"operation":{"type":"string","enum":["add","update","enable","disable","reset","delete"]},"id":{"type":"string"},"mailbox":{"type":"string"},"from_contains":{"type":"string"},"subject_contains":{"type":"string"},"clear_from":{"type":"boolean"},"clear_subject":{"type":"boolean"},"action":{"type":"string","enum":["mark_read","mark_unread","star","unstar"]}},"required":["account","operation","id"],"additionalProperties":false}), None, ui_enabled),
+        tool("yacli.mail.rules.run", "Применить только пакет, показанный preview, после проверки digest. Сначала вызовите с dry_run=true; затем передайте plan_sha256 и MCP review_sha256 из соответствующих preview.", json!({"type":"object","properties":{"account":{"type":"string"},"rule":{"type":"string"},"plan_sha256":{"type":"string"}},"required":["account","rule"],"additionalProperties":false}), None, ui_enabled),
+        tool("yacli.mail.rules.undo", "Просмотреть или отменить одно выполнение правил; undo возможен только если целевой флаг не изменялся после применения. В DevCat требуется review.", json!({"type":"object","properties":{"account":{"type":"string"},"run_id":{"type":"string"},"plan_sha256":{"type":"string"}},"required":["account","run_id"],"additionalProperties":false}), None, ui_enabled),
         tool(
             "yacli.mail.send",
             "Send one mail message.",
@@ -2324,6 +2335,12 @@ fn call_tool(params: Value, ui_enabled: bool) -> Result<Value> {
         )?,
         "yacli.mail.draft.list" => mail_draft_list(&arguments)?,
         "yacli.mail.checkpoint" => mail_checkpoint(&arguments)?,
+        "yacli.mail.rules.list" => mail_rules_list(&arguments)?,
+        "yacli.mail.rules.audit" => mail_rules_audit(&arguments)?,
+        "yacli.mail.rules.preview" => mail_rules_preview(&arguments)?,
+        "yacli.mail.rules.configure" => mail_rules_configure(&arguments)?,
+        "yacli.mail.rules.run" => mail_rules_run(&arguments)?,
+        "yacli.mail.rules.undo" => mail_rules_undo(&arguments)?,
         "yacli.mail.draft.trash" => mail_draft_trash(&arguments)?,
         "yacli.mail.draft.update" => mail_draft_update(&arguments)?,
         "yacli.mail.draft.create" => mail_draft_create(&arguments)?,
@@ -3548,6 +3565,189 @@ fn activity_undo(id: &str) -> Result<Value> {
         "entry": entry,
         "undo": applied,
     }))
+}
+
+fn mail_rules_command(action: MailRulesCommand) -> Result<Value> {
+    Ok(execute_mail_rules(OutputFormat::Json, action)?.json)
+}
+
+fn mail_rules_list(args: &Value) -> Result<Value> {
+    let account = optional_string(args, "account");
+    let mut result = mail_rules_command(MailRulesCommand::List)?;
+    if let Some(items) = result.get_mut("items").and_then(Value::as_array_mut) {
+        items.retain(|item| {
+            account.is_none_or(|account| item["rule"]["account"].as_str() == Some(account))
+        });
+        result["count"] = json!(items.len());
+    }
+    Ok(result)
+}
+
+fn mail_rules_audit(args: &Value) -> Result<Value> {
+    let account = optional_string(args, "account");
+    let mut result = mail_rules_command(MailRulesCommand::Audit {
+        limit: optional_usize(args, "limit").unwrap_or(100),
+    })?;
+    if let Some(items) = result.get_mut("items").and_then(Value::as_array_mut) {
+        items
+            .retain(|item| account.is_none_or(|account| item["account"].as_str() == Some(account)));
+        result["count"] = json!(items.len());
+    }
+    Ok(result)
+}
+
+fn mail_rules_require_rule_account(args: &Value) -> Result<(String, String)> {
+    let account = required_string(args, "account")?.to_string();
+    let id = required_string(args, "rule")?.to_string();
+    let rules = MailRulesFile::load(&mail_rules_path()?)?;
+    let rule = rules
+        .rules
+        .iter()
+        .find(|rule| rule.id == id)
+        .ok_or_else(|| YacliError::Validation(format!("Правило {id} не найдено")))?;
+    if rule.account != account {
+        return Err(YacliError::Auth(
+            "Аккаунт инструмента не совпадает с точным аккаунтом правила".into(),
+        ));
+    }
+    Ok((account, id))
+}
+
+fn mail_rules_preview(args: &Value) -> Result<Value> {
+    let (_, id) = mail_rules_require_rule_account(args)?;
+    mail_rules_command(MailRulesCommand::Run {
+        rule: Some(id),
+        apply: false,
+        review_sha256: None,
+    })
+}
+
+fn mail_rules_action(value: &Value) -> Result<MailRuleActionArg> {
+    match required_string(value, "action")? {
+        "mark_read" => Ok(MailRuleActionArg::MarkRead),
+        "mark_unread" => Ok(MailRuleActionArg::MarkUnread),
+        "star" => Ok(MailRuleActionArg::Star),
+        "unstar" => Ok(MailRuleActionArg::Unstar),
+        _ => Err(YacliError::Validation(
+            "Неизвестное действие правила".into(),
+        )),
+    }
+}
+
+fn mail_rules_configure(args: &Value) -> Result<Value> {
+    let account = required_string(args, "account")?.to_string();
+    let id = required_string(args, "id")?.to_string();
+    let operation = required_string(args, "operation")?;
+    let config = MailRulesFile::load(&mail_rules_path()?)?;
+    if operation == "add" {
+        if args.get("account").and_then(Value::as_str) != Some(account.as_str()) {
+            return Err(YacliError::Validation(
+                "У правила требуется точный account alias".into(),
+            ));
+        }
+    } else if !config
+        .rules
+        .iter()
+        .any(|rule| rule.id == id && rule.account == account)
+    {
+        return Err(YacliError::Auth(
+            "Правило не найдено для указанного точного аккаунта".into(),
+        ));
+    }
+    if optional_bool(args, "dry_run") == Some(true) {
+        let mut proposal = args.clone();
+        if let Some(object) = proposal.as_object_mut() {
+            object.remove("dry_run");
+            object.remove("review_sha256");
+        }
+        return Ok(
+            json!({"status":"review_required","operation":"mail.rules.configure","proposal":proposal}),
+        );
+    }
+    let command = match operation {
+        "add" => MailRulesCommand::Add {
+            id,
+            account,
+            mailbox: optional_string(args, "mailbox")
+                .unwrap_or("INBOX")
+                .to_string(),
+            from_contains: optional_string_owned(args, "from_contains"),
+            subject_contains: optional_string_owned(args, "subject_contains"),
+            action: mail_rules_action(args)?,
+        },
+        "update" => MailRulesCommand::Update {
+            id,
+            account: None,
+            mailbox: optional_string_owned(args, "mailbox"),
+            from_contains: optional_string_owned(args, "from_contains"),
+            subject_contains: optional_string_owned(args, "subject_contains"),
+            clear_from: optional_bool(args, "clear_from").unwrap_or(false),
+            clear_subject: optional_bool(args, "clear_subject").unwrap_or(false),
+            action: args.get("action").map(mail_rules_action).transpose()?,
+        },
+        "enable" => MailRulesCommand::Enable { id },
+        "disable" => MailRulesCommand::Disable { id },
+        "reset" => MailRulesCommand::Reset { id },
+        "delete" => MailRulesCommand::Delete { id },
+        _ => {
+            return Err(YacliError::Validation(
+                "Неизвестная операция правила".into(),
+            ));
+        }
+    };
+    mail_rules_command(command)
+}
+
+fn mail_rules_run(args: &Value) -> Result<Value> {
+    let (_, id) = mail_rules_require_rule_account(args)?;
+    let dry_run = optional_bool(args, "dry_run").unwrap_or(false);
+    let apply = !dry_run && args.get("plan_sha256").is_some();
+    if devcat::enabled() && !dry_run && !apply {
+        return Err(YacliError::Validation(
+            "Для применения правила нужен plan_sha256 из preview".into(),
+        ));
+    }
+    let plan = if apply {
+        Some(required_string(args, "plan_sha256")?.to_string())
+    } else {
+        None
+    };
+    mail_rules_command(MailRulesCommand::Run {
+        rule: Some(id),
+        apply,
+        review_sha256: plan,
+    })
+}
+
+fn mail_rules_undo(args: &Value) -> Result<Value> {
+    let account = required_string(args, "account")?;
+    let run_id = required_string(args, "run_id")?;
+    let audit = MailRulesAuditFile::load(&mail_rules_audit_path()?)?;
+    let run = audit
+        .run(run_id)
+        .ok_or_else(|| YacliError::Validation("Запуск правила не найден в аудите".into()))?;
+    if run.account != account {
+        return Err(YacliError::Auth(
+            "Аккаунт инструмента не совпадает с точным аккаунтом аудита".into(),
+        ));
+    }
+    let dry_run = optional_bool(args, "dry_run").unwrap_or(false);
+    let apply = !dry_run && args.get("plan_sha256").is_some();
+    if devcat::enabled() && !dry_run && !apply {
+        return Err(YacliError::Validation(
+            "Для отката правила нужен plan_sha256 из preview".into(),
+        ));
+    }
+    let plan = if apply {
+        Some(required_string(args, "plan_sha256")?.to_string())
+    } else {
+        None
+    };
+    mail_rules_command(MailRulesCommand::Undo {
+        run_id: run_id.to_string(),
+        apply,
+        review_sha256: plan,
+    })
 }
 
 fn mail_draft_list(args: &Value) -> Result<Value> {

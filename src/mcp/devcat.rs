@@ -54,6 +54,8 @@ pub fn validate() -> Result<()> {
         "disk.write",
         "disk.delete",
         "disk.publish",
+        "contacts.read",
+        "contacts.write",
     ];
     for cap in capabilities() {
         if !known.contains(&cap.as_str()) {
@@ -153,6 +155,9 @@ fn required_capabilities(name: &str) -> Option<&'static [&'static str]> {
         | "yacli.mail.read"
         | "yacli.mail.checkpoint"
         | "yacli.mail.draft.list"
+        | "yacli.mail.rules.list"
+        | "yacli.mail.rules.audit"
+        | "yacli.mail.rules.preview"
         | "yacli.mail.attachment.export"
         | "yacli.mail.eml.export" => Some(&["mail.read"]),
         "yacli.mail.send"
@@ -168,7 +173,10 @@ fn required_capabilities(name: &str) -> Option<&'static [&'static str]> {
         | "yacli.mail.special_folder"
         | "yacli.mail.draft.create"
         | "yacli.mail.draft.trash"
-        | "yacli.mail.draft.update" => Some(&["mail.mutate"]),
+        | "yacli.mail.draft.update"
+        | "yacli.mail.rules.configure"
+        | "yacli.mail.rules.run"
+        | "yacli.mail.rules.undo" => Some(&["mail.mutate"]),
         "yacli.mail.folder.delete" => Some(&["mail.delete"]),
         "yacli.contacts.list" | "yacli.contacts.search" | "yacli.contacts.export" => {
             Some(&["contacts.read"])
@@ -381,6 +389,9 @@ pub fn is_risky(name: &str) -> bool {
             | "yacli.mail.draft.trash"
             | "yacli.mail.draft.update"
             | "yacli.mail.draft.create"
+            | "yacli.mail.rules.configure"
+            | "yacli.mail.rules.run"
+            | "yacli.mail.rules.undo"
             | "yacli.mail.eml.export"
             | "yacli.contacts.create"
             | "yacli.contacts.update"

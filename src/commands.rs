@@ -3026,7 +3026,10 @@ fn execute_mail_attachment(
     }
 }
 
-fn execute_mail_rules(format: OutputFormat, action: MailRulesCommand) -> Result<RenderedOutput> {
+pub(crate) fn execute_mail_rules(
+    format: OutputFormat,
+    action: MailRulesCommand,
+) -> Result<RenderedOutput> {
     match action {
         MailRulesCommand::List => {
             let rules = MailRulesFile::load(&mail_rules_path()?)?;
