@@ -1046,6 +1046,23 @@ client_id = "client-123"
             .iter()
             .any(|field| field == "uid_validity")
     );
+    let draft_update = tools
+        .iter()
+        .find(|tool| tool["name"] == "yacli.mail.draft.update")
+        .expect("draft update tool");
+    assert!(
+        draft_update["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field == "uid_validity")
+    );
+    assert!(
+        draft_update["description"]
+            .as_str()
+            .unwrap()
+            .contains("SHA-256")
+    );
     let mailbox_checkpoint = tools
         .iter()
         .find(|tool| tool["name"] == "yacli.mail.checkpoint")

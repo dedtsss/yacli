@@ -83,12 +83,12 @@ use crate::{
         list_mail_folders, list_mail_messages_page, load_mail_attachments, mail_mailbox_checkpoint,
         move_mail_draft_to_trash, move_mail_message, move_mail_message_to_special_folder,
         read_mail_message, rename_mail_folder, reply_to_mail_message_with_attachments,
-        review_mail_draft_trash, review_mail_eml_export, review_mail_folder_delete,
-        review_mail_forward_submission_with_attachments,
+        review_mail_draft_trash, review_mail_draft_update, review_mail_eml_export,
+        review_mail_folder_delete, review_mail_forward_submission_with_attachments,
         review_mail_reply_submission_with_attachments, review_mail_submission,
         search_mail_all_folders_page, search_mail_messages_filtered_page,
-        send_mail_message_with_sent_copy, update_mail_flags, validate_mail_eml_output_path,
-        validate_mail_folder_rename,
+        send_mail_message_with_sent_copy, update_mail_draft, update_mail_flags,
+        validate_mail_eml_output_path, validate_mail_folder_rename,
     },
 };
 use chrono::{DateTime, Utc};
@@ -1468,6 +1468,29 @@ fn tool_definitions(ui_enabled: bool, roots_enabled: bool) -> Result<Vec<Value>>
             ui_enabled,
         ),
         tool(
+            "yacli.mail.draft.update",
+            "Заменить только указанный черновик: добавить новую версию с \\Draft, повторно проверить исходный SHA-256 и UIDVALIDITY, затем перенести прежнюю запись в \\Trash. При частичной ошибке обе версии сохраняются.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "account": { "type": "string" },
+                    "uid": { "type": "integer", "minimum": 1 },
+                    "uid_validity": { "type": "integer", "minimum": 1 },
+                    "to": { "type": "string" },
+                    "cc": { "type": "array", "items": { "type": "string" } },
+                    "bcc": { "type": "array", "items": { "type": "string" } },
+                    "subject": { "type": "string" },
+                    "text": { "type": "string" },
+                    "html": { "type": "string" },
+                    "attachments": { "type": "array", "items": { "type": "string" } }
+                },
+                "required": ["uid", "uid_validity", "to", "subject"],
+                "additionalProperties": false
+            }),
+            None,
+            ui_enabled,
+        ),
+        tool(
             "yacli.mail.draft.create",
             "Создать неотправленный черновик в почтовом ящике; в DevCat требуется предварительная проверка.",
             json!({
@@ -2197,6 +2220,33 @@ fn call_tool(params: Value, ui_enabled: bool) -> Result<Value> {
             object.insert("account".into(), Value::String(resolved_account));
         }
     }
+    if name == "yacli.mail.draft.update" {
+        let mut validation_arguments = arguments.clone();
+        validation_arguments["dry_run"] = Value::Bool(true);
+        devcat::check_tool(name, &validation_arguments)?;
+        let uid = required_u64(&arguments, "uid")?;
+        let uid_validity = required_u64(&arguments, "uid_validity")?;
+        let (account, auth, context) =
+            resolve_mail_private_context(arguments.get("account").and_then(Value::as_str))?;
+        let source = review_mail_draft_update(
+            &context.imap_host,
+            context.imap_port,
+            auth,
+            uid,
+            uid_validity,
+        )?;
+        if let Some(object) = arguments.as_object_mut() {
+            object.insert(
+                "_draft_source_sha256".into(),
+                Value::String(source.source_sha256.clone()),
+            );
+            object.insert(
+                "_draft_source_bytes".into(),
+                Value::Number(source.source_bytes.into()),
+            );
+            object.insert("account".into(), Value::String(account));
+        }
+    }
     devcat::check_tool(name, &arguments)?;
     if devcat::enabled()
         && devcat::is_risky(name)
@@ -2275,6 +2325,7 @@ fn call_tool(params: Value, ui_enabled: bool) -> Result<Value> {
         "yacli.mail.draft.list" => mail_draft_list(&arguments)?,
         "yacli.mail.checkpoint" => mail_checkpoint(&arguments)?,
         "yacli.mail.draft.trash" => mail_draft_trash(&arguments)?,
+        "yacli.mail.draft.update" => mail_draft_update(&arguments)?,
         "yacli.mail.draft.create" => mail_draft_create(&arguments)?,
         "yacli.mail.send" => mail_send(
             arguments.get("account").and_then(Value::as_str),
@@ -3538,6 +3589,60 @@ fn mail_draft_trash(args: &Value) -> Result<Value> {
         uid_validity,
     )?;
     Ok(json!({"account":account,"moved_to_trash":true,"review":review}))
+}
+
+fn mail_draft_update(args: &Value) -> Result<Value> {
+    let uid = required_u64(args, "uid")?;
+    let uid_validity = required_u64(args, "uid_validity")?;
+    let to = required_string(args, "to")?.to_string();
+    let cc = string_list(args, "cc")?;
+    let bcc = string_list(args, "bcc")?;
+    let subject = required_string(args, "subject")?.to_string();
+    let text = optional_string_owned(args, "text");
+    let html = optional_string_owned(args, "html");
+    let attachment_paths = string_list(args, "attachments")?;
+    let attachments = load_mail_attachments(
+        &attachment_paths
+            .iter()
+            .map(PathBuf::from)
+            .collect::<Vec<_>>(),
+    )?;
+    let request = crate::mail::MailSendRequest {
+        to: vec![to],
+        cc,
+        bcc,
+        subject,
+        text,
+        html,
+        attachments,
+        thread_headers: None,
+    };
+    let expected_source_sha256 = required_string(args, "_draft_source_sha256")?;
+    let source_bytes = required_u64(args, "_draft_source_bytes")?;
+    let (account, auth, context) =
+        resolve_mail_private_context(args.get("account").and_then(Value::as_str))?;
+    if optional_bool(args, "dry_run") == Some(true) {
+        let replacement = review_mail_submission(auth, request)?;
+        let digest = devcat::review_hash("yacli.mail.draft.update", args)?;
+        devcat::record_review(digest.clone());
+        return Ok(json!({
+            "account":account,
+            "dry_run":true,
+            "source":{"uid":uid,"uid_validity":uid_validity,"bytes":source_bytes,"sha256":expected_source_sha256},
+            "replacement":replacement,
+            "review_sha256":digest
+        }));
+    }
+    let updated = update_mail_draft(
+        &context.imap_host,
+        context.imap_port,
+        auth,
+        uid,
+        uid_validity,
+        expected_source_sha256,
+        request,
+    )?;
+    Ok(json!({"account":account,"updated":updated}))
 }
 
 fn mail_checkpoint(args: &Value) -> Result<Value> {

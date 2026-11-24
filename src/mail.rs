@@ -155,6 +155,22 @@ pub struct MailDraftTrashReview {
 }
 
 #[derive(Clone, Debug, Serialize, Eq, PartialEq)]
+pub struct MailDraftUpdateReview {
+    pub uid: u64,
+    pub uid_validity: u64,
+    pub source_bytes: u64,
+    pub source_sha256: String,
+}
+
+#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
+pub struct MailDraftUpdateResult {
+    pub uid: u64,
+    pub uid_validity: u64,
+    pub replacement_message_id: String,
+    pub old_moved_to_trash: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
 pub struct MailFolderDeleteReview {
     pub folder: String,
     pub allowed: bool,
@@ -730,6 +746,155 @@ fn move_mail_draft_to_trash_session<S: Read + Write>(
         exists_in_drafts: true,
         allowed: true,
     })
+}
+
+pub fn review_mail_draft_update(
+    imap_host: &str,
+    imap_port: u16,
+    auth: MailSessionAuth,
+    uid: u64,
+    uid_validity: u64,
+) -> Result<MailDraftUpdateReview> {
+    validate_mail_uid(uid)?;
+    let mut session = open_authenticated_session(imap_host, imap_port, auth)?;
+    let folders = session.list_folders()?;
+    let drafts = find_special_mail_folder(&folders, "\\Drafts")?;
+    let source = fetch_mail_draft_source(&mut session, &drafts.raw_name, uid, uid_validity)?;
+    let review = MailDraftUpdateReview {
+        uid,
+        uid_validity,
+        source_bytes: source.len() as u64,
+        source_sha256: format!("{:x}", Sha256::digest(&source)),
+    };
+    let _ = session.logout();
+    Ok(review)
+}
+
+pub fn update_mail_draft(
+    imap_host: &str,
+    imap_port: u16,
+    auth: MailSessionAuth,
+    uid: u64,
+    uid_validity: u64,
+    expected_source_sha256: &str,
+    request: MailSendRequest,
+) -> Result<MailDraftUpdateResult> {
+    validate_mail_uid(uid)?;
+    if uid_validity == 0 {
+        return Err(YacliError::Validation(
+            "UIDVALIDITY must be greater than zero".into(),
+        ));
+    }
+    if expected_source_sha256.len() != 64
+        || !expected_source_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(YacliError::Validation(
+            "Не задан SHA-256 исходного черновика из preview".into(),
+        ));
+    }
+    let prepared = prepare_mail_submission(auth.clone(), request)?;
+    ensure_smtp_safe_submission(&prepared)?;
+    let mut session = open_authenticated_session(imap_host, imap_port, auth)?;
+    let folders = session.list_folders()?;
+    let drafts = find_special_mail_folder(&folders, "\\Drafts")?;
+    let trash = find_special_mail_folder(&folders, "\\Trash")?;
+    if drafts.raw_name == trash.raw_name {
+        return Err(YacliError::Api(
+            "IMAP Drafts and Trash folders resolve to the same mailbox".into(),
+        ));
+    }
+    let result = update_mail_draft_session(
+        &mut session,
+        MailDraftUpdatePlan {
+            uid,
+            uid_validity,
+            expected_source_sha256,
+            draft_folder: &drafts.raw_name,
+            trash_folder: &trash.raw_name,
+            replacement_message: &prepared.message,
+            replacement_message_id: &prepared.sent.message_id,
+        },
+    )?;
+    let _ = session.logout();
+    Ok(result)
+}
+
+struct MailDraftUpdatePlan<'a> {
+    uid: u64,
+    uid_validity: u64,
+    expected_source_sha256: &'a str,
+    draft_folder: &'a str,
+    trash_folder: &'a str,
+    replacement_message: &'a str,
+    replacement_message_id: &'a str,
+}
+
+fn update_mail_draft_session<S: Read + Write>(
+    session: &mut ImapSession<S>,
+    plan: MailDraftUpdatePlan<'_>,
+) -> Result<MailDraftUpdateResult> {
+    let MailDraftUpdatePlan {
+        uid,
+        uid_validity,
+        expected_source_sha256,
+        draft_folder,
+        trash_folder,
+        replacement_message,
+        replacement_message_id,
+    } = plan;
+    let source = fetch_mail_draft_source(session, draft_folder, uid, uid_validity)?;
+    let current_sha256 = format!("{:x}", Sha256::digest(&source));
+    if current_sha256 != expected_source_sha256.to_ascii_lowercase() {
+        return Err(YacliError::Validation(
+            "Исходный черновик изменился после preview; обновите список и повторите проверку"
+                .into(),
+        ));
+    }
+    session.append_draft(draft_folder, replacement_message.as_bytes())?;
+
+    let source_after_append = fetch_mail_draft_source(session, draft_folder, uid, uid_validity)
+        .map_err(|_| YacliError::Api(format!(
+            "Новая версия черновика {replacement_message_id} добавлена, но исходная запись осталась в Черновиках; проверьте папку перед повтором"
+        )))?;
+    let source_after_sha256 = format!("{:x}", Sha256::digest(&source_after_append));
+    if source_after_sha256 != expected_source_sha256.to_ascii_lowercase() {
+        return Err(YacliError::Api(format!(
+            "Новая версия черновика {} добавлена, но исходный черновик изменился и остался в папке; проверьте папку перед повтором",
+            replacement_message_id
+        )));
+    }
+    session.uid_move(uid, trash_folder).map_err(|_| {
+        YacliError::Api(format!(
+            "Новая версия черновика {replacement_message_id} добавлена, но исходная осталась в Черновиках; проверьте обе папки перед повтором"
+        ))
+    })?;
+    Ok(MailDraftUpdateResult {
+        uid,
+        uid_validity,
+        replacement_message_id: replacement_message_id.to_string(),
+        old_moved_to_trash: true,
+    })
+}
+
+fn fetch_mail_draft_source<S: Read + Write>(
+    session: &mut ImapSession<S>,
+    draft_folder: &str,
+    uid: u64,
+    uid_validity: u64,
+) -> Result<Vec<u8>> {
+    select_mailbox_with_expected_uid_validity(session, draft_folder, uid_validity)?;
+    if !session
+        .search_all_uids()?
+        .into_iter()
+        .any(|found| found == uid)
+    {
+        return Err(YacliError::Validation(
+            "Черновик не найден в папке \\Drafts или UIDVALIDITY изменилась".into(),
+        ));
+    }
+    session.fetch_message_rfc822_limited(uid, SMTP_SAFE_MESSAGE_BYTES as u64)
 }
 
 pub fn create_mail_folder(
@@ -4974,6 +5139,31 @@ mod tests {
         let commands = session.reader.get_ref().written();
         assert!(commands.contains("A0004 UID MOVE 15 \"Trash\"\r\n"));
         assert!(!commands.contains("EXPUNGE"));
+    }
+
+    #[test]
+    fn draft_update_rejects_changed_source_before_append() {
+        let stream = FakeStream::new(
+            "* OK [UIDVALIDITY 30] valid\r\n* OK [UIDNEXT 16] next\r\nA0001 OK [READ-WRITE] selected\r\n* SEARCH 15\r\nA0002 OK searched\r\n* 1 FETCH (UID 15 BODY[] {4}\r\nDATA)\r\nA0003 OK fetched\r\n",
+        );
+        let mut session = ImapSession::from_stream(stream);
+        let result = super::update_mail_draft_session(
+            &mut session,
+            super::MailDraftUpdatePlan {
+                uid: 15,
+                uid_validity: 30,
+                expected_source_sha256: &"0".repeat(64),
+                draft_folder: "Drafts",
+                trash_folder: "Trash",
+                replacement_message: "To: test@example.invalid\r\n\r\nreplacement",
+                replacement_message_id: "<replacement@example.invalid>",
+            },
+        );
+        assert!(result.is_err());
+        let commands = session.reader.get_ref().written();
+        assert!(commands.contains("UID FETCH 15 (BODY.PEEK[])"));
+        assert!(!commands.contains("APPEND"));
+        assert!(!commands.contains("UID MOVE"));
     }
 
     #[test]
