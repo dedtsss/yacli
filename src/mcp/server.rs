@@ -79,8 +79,8 @@ use crate::{
         MailSearchFilter, MailSpecialFolderAction, apply_mail_bulk_action, copy_mail_message,
         create_mail_draft, create_mail_folder, delete_mail_folder, export_mail_attachment,
         export_mail_eml, forward_mail_message_reviewed_with_attachments,
-        forward_mail_message_with_attachments, inspect_mail_invite, list_mail_folders,
-        list_mail_messages_page, load_mail_attachments, move_mail_message,
+        forward_mail_message_with_attachments, inspect_mail_invite, list_mail_drafts_page,
+        list_mail_folders, list_mail_messages_page, load_mail_attachments, move_mail_message,
         move_mail_message_to_special_folder, read_mail_message, rename_mail_folder,
         reply_to_mail_message_with_attachments, review_mail_eml_export, review_mail_folder_delete,
         review_mail_forward_submission_with_attachments,
@@ -1422,6 +1422,21 @@ fn tool_definitions(ui_enabled: bool, roots_enabled: bool) -> Result<Vec<Value>>
             ui_enabled,
         ),
         tool(
+            "yacli.mail.draft.list",
+            "Показать черновики из папки, которую IMAP-сервер пометил как \\Drafts; список ограничен пагинацией.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "account": { "type": "string" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 100 },
+                    "offset": { "type": "integer", "minimum": 0, "maximum": 1000000 }
+                },
+                "additionalProperties": false
+            }),
+            None,
+            ui_enabled,
+        ),
+        tool(
             "yacli.mail.draft.create",
             "Создать неотправленный черновик в почтовом ящике; в DevCat требуется предварительная проверка.",
             json!({
@@ -2226,6 +2241,7 @@ fn call_tool(params: Value, ui_enabled: bool) -> Result<Value> {
             required_u64(&arguments, "uid")?,
             optional_u64(&arguments, "max_bytes").unwrap_or(15 * 1024 * 1024),
         )?,
+        "yacli.mail.draft.list" => mail_draft_list(&arguments)?,
         "yacli.mail.draft.create" => mail_draft_create(&arguments)?,
         "yacli.mail.send" => mail_send(
             arguments.get("account").and_then(Value::as_str),
@@ -3432,6 +3448,16 @@ fn activity_undo(id: &str) -> Result<Value> {
         "entry": entry,
         "undo": applied,
     }))
+}
+
+fn mail_draft_list(args: &Value) -> Result<Value> {
+    let (account, auth, context) =
+        resolve_mail_private_context(args.get("account").and_then(Value::as_str))?;
+    let limit = optional_usize(args, "limit").unwrap_or(20);
+    let offset = optional_usize(args, "offset").unwrap_or(0);
+    let (folder, items) =
+        list_mail_drafts_page(&context.imap_host, context.imap_port, auth, limit, offset)?;
+    Ok(json!({"account":account,"folder":folder,"limit":limit,"offset":offset,"items":items}))
 }
 
 fn mail_draft_create(args: &Value) -> Result<Value> {

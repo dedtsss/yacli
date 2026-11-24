@@ -553,6 +553,29 @@ pub fn list_mail_folders(
     Ok(folders)
 }
 
+pub fn list_mail_drafts_page(
+    imap_host: &str,
+    imap_port: u16,
+    auth: MailSessionAuth,
+    limit: usize,
+    offset: usize,
+) -> Result<(String, Vec<MailMessageSummary>)> {
+    let folders = list_mail_folders(imap_host, imap_port, auth.clone())?;
+    let drafts = folders
+        .into_iter()
+        .find(|folder| {
+            folder
+                .attributes
+                .iter()
+                .any(|attribute| attribute.eq_ignore_ascii_case(r"\Drafts"))
+        })
+        .ok_or_else(|| {
+            YacliError::Api("IMAP server did not advertise a \\Drafts mailbox".into())
+        })?;
+    let items = list_mail_messages_page(imap_host, imap_port, auth, &drafts.name, limit, offset)?;
+    Ok((drafts.name, items))
+}
+
 pub fn create_mail_folder(
     imap_host: &str,
     imap_port: u16,

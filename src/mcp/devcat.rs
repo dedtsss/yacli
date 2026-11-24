@@ -151,6 +151,7 @@ fn required_capabilities(name: &str) -> Option<&'static [&'static str]> {
         | "yacli.mail.list"
         | "yacli.mail.search"
         | "yacli.mail.read"
+        | "yacli.mail.draft.list"
         | "yacli.mail.attachment.export"
         | "yacli.mail.eml.export" => Some(&["mail.read"]),
         "yacli.mail.send"
@@ -648,6 +649,15 @@ mod tests {
             );
             assert!(is_risky(name));
         }
+    }
+
+    #[test]
+    fn draft_listing_is_read_only_mail_capability() {
+        assert_eq!(
+            required_capabilities("yacli.mail.draft.list"),
+            Some(["mail.read"].as_slice())
+        );
+        assert!(!is_risky("yacli.mail.draft.list"));
     }
 
     #[test]

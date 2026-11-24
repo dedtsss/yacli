@@ -1021,6 +1021,20 @@ client_id = "client-123"
             .iter()
             .any(|tool| tool["name"] == "yacli.mail.draft.create")
     );
+    let draft_list = tools
+        .iter()
+        .find(|tool| tool["name"] == "yacli.mail.draft.list")
+        .expect("draft list tool");
+    assert_eq!(
+        draft_list["inputSchema"]["properties"]["limit"]["maximum"],
+        100
+    );
+    assert!(
+        draft_list["description"]
+            .as_str()
+            .unwrap()
+            .contains(r"\Drafts")
+    );
     let mail_list = tools
         .iter()
         .find(|tool| tool["name"] == "yacli.mail.list")
