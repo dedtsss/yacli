@@ -3732,6 +3732,27 @@ fn mail_rules_run(args: &Value) -> Result<Value> {
     Ok(result)
 }
 
+fn normalize_mail_rules_undo_plan_digest(result: &mut Value) {
+    let plan = result
+        .get("review_sha256")
+        .or_else(|| {
+            result
+                .get("preview")
+                .and_then(|preview| preview.get("review_sha256"))
+        })
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    if let Some(plan) = plan {
+        result["plan_sha256"] = Value::String(plan);
+        if result.get("review_sha256").is_some() {
+            result
+                .as_object_mut()
+                .expect("mail rules undo response is an object")
+                .remove("review_sha256");
+        }
+    }
+}
+
 fn mail_rules_undo(args: &Value) -> Result<Value> {
     let account = required_string(args, "account")?;
     let run_id = required_string(args, "run_id")?;
@@ -3761,17 +3782,7 @@ fn mail_rules_undo(args: &Value) -> Result<Value> {
         apply,
         review_sha256: plan,
     })?;
-    if let Some(plan) = result
-        .get("review_sha256")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-    {
-        result["plan_sha256"] = Value::String(plan);
-        result
-            .as_object_mut()
-            .expect("mail rules undo response is an object")
-            .remove("review_sha256");
-    }
+    normalize_mail_rules_undo_plan_digest(&mut result);
     result["dry_run"] = json!(dry_run);
     Ok(result)
 }
@@ -6538,8 +6549,9 @@ mod native_attachment_schema_tests {
     use super::{
         Digest, NativeMailFile, Sha256, Url, download_native_mail_files,
         download_native_mail_files_with, is_public_ip, native_mime_type,
-        read_limited_native_content, resolve_dns_addresses_with, resolve_public_download_addresses,
-        safe_native_filename, tool_definitions, validate_native_attachment_url,
+        normalize_mail_rules_undo_plan_digest, read_limited_native_content,
+        resolve_dns_addresses_with, resolve_public_download_addresses, safe_native_filename,
+        tool_definitions, validate_native_attachment_url,
     };
     use serde_json::json;
 
@@ -6574,6 +6586,22 @@ mod native_attachment_schema_tests {
             send["inputSchema"]["properties"]["attachments"]["items"]["type"],
             "string"
         );
+    }
+
+    #[test]
+    fn mail_rules_undo_exposes_plan_digest_for_nested_preview() {
+        let mut response = json!({"status":"preview","preview":{"review_sha256":"plan"}});
+        normalize_mail_rules_undo_plan_digest(&mut response);
+        assert_eq!(response["plan_sha256"], "plan");
+        assert_eq!(response["preview"]["review_sha256"], "plan");
+    }
+
+    #[test]
+    fn mail_rules_undo_promotes_pending_plan_digest() {
+        let mut response = json!({"status":"pending_review","review_sha256":"plan"});
+        normalize_mail_rules_undo_plan_digest(&mut response);
+        assert_eq!(response["plan_sha256"], "plan");
+        assert!(response.get("review_sha256").is_none());
     }
 
     #[test]

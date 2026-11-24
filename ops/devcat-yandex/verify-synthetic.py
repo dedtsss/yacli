@@ -325,9 +325,9 @@ def main():
             "uid_validity": current["uid_validity"], "destination_folder": folder_a,
         })
         page_a, copied = listed_item(mcp, folder_a, marker + " updated")
-        if not copied or not page_a.get("uid_validity"):
+        if not copied or not copied.get("uid_validity"):
             raise CandidateError("mail.copy", "SYNTHETIC_COPY_NOT_LISTED")
-        message = {"folder": folder_a, "uid": copied["uid"], "uid_validity": page_a["uid_validity"]}
+        message = {"folder": folder_a, "uid": copied["uid"], "uid_validity": copied["uid_validity"]}
         add_case(report, output, "mail.copy")
 
         preview = mcp.call("mail.rules.preview", {"account": ACCOUNT, "rule": rule_id})
@@ -336,7 +336,15 @@ def main():
             raise CandidateError("mail.rules.preview", "NO_PLAN_DIGEST")
         run_id = apply_rule(mcp, rule_id, plan)
         add_case(report, output, "mail.rules.run", run_id=run_id)
+        _, ruled = listed_item(mcp, folder_a, marker + " updated")
+        if not ruled or r"\Flagged" not in ruled.get("flags", []):
+            raise CandidateError("mail.rules.run", "SYNTHETIC_STAR_NOT_FOUND")
+        add_case(report, output, "mail.rules.run.star_verified")
         undo_rule(mcp, run_id)
+        _, restored_rule_target = listed_item(mcp, folder_a, marker + " updated")
+        if not restored_rule_target or r"\Flagged" in restored_rule_target.get("flags", []):
+            raise CandidateError("mail.rules.undo", "SYNTHETIC_UNDO_NOT_VERIFIED")
+        run_id = None
         add_case(report, output, "mail.rules.undo")
 
         mcp.reviewed("mail.move", {
@@ -344,9 +352,9 @@ def main():
             "uid_validity": message["uid_validity"], "destination_folder": folder_b,
         })
         page_b, moved = listed_item(mcp, folder_b, marker + " updated")
-        if not moved or not page_b.get("uid_validity"):
+        if not moved or not moved.get("uid_validity"):
             raise CandidateError("mail.move", "MOVED_COPY_NOT_LISTED")
-        message.update(folder=folder_b, uid=moved["uid"], uid_validity=page_b["uid_validity"])
+        message.update(folder=folder_b, uid=moved["uid"], uid_validity=moved["uid_validity"])
         add_case(report, output, "mail.move")
 
         folders = mcp.call("mail.folders", {"account": ACCOUNT}).get("items", [])
@@ -361,14 +369,16 @@ def main():
             if not spam_folder:
                 raise CandidateError("mail.special_folder", "SPAM_FOLDER_NOT_LISTED")
             spam_page, spam_item = listed_item(mcp, spam_folder, marker + " updated")
-            if not spam_item:
+            if not spam_item or not spam_item.get("uid_validity"):
                 raise CandidateError("mail.special_folder", "SPAM_COPY_NOT_LISTED")
             mcp.reviewed("mail.special_folder", {
-                "account": ACCOUNT, "uid": spam_item["uid"], "uid_validity": spam_page["uid_validity"],
+                "account": ACCOUNT, "uid": spam_item["uid"], "uid_validity": spam_item["uid_validity"],
                 "destination_folder": folder_b, "action": "restore_from_spam",
             })
             page_b, moved = listed_item(mcp, folder_b, marker + " updated")
-            message.update(folder=folder_b, uid=moved["uid"], uid_validity=page_b["uid_validity"])
+            if not moved or not moved.get("uid_validity"):
+                raise CandidateError("mail.special_folder", "SPAM_RESTORE_NOT_LISTED")
+            message.update(folder=folder_b, uid=moved["uid"], uid_validity=moved["uid_validity"])
             add_case(report, output, "mail.spam+restore")
         else:
             add_case(report, output, "mail.spam+restore", "UNSUPPORTED", reason="provider_did_not_advertise_junk")
@@ -382,14 +392,16 @@ def main():
         if not trash_folder:
             raise CandidateError("mail.special_folder", "TRASH_FOLDER_NOT_LISTED")
         trash_page, trash_item = listed_item(mcp, trash_folder, marker + " updated")
-        if not trash_item:
+        if not trash_item or not trash_item.get("uid_validity"):
             raise CandidateError("mail.special_folder", "TRASH_COPY_NOT_LISTED")
         mcp.reviewed("mail.special_folder", {
-            "account": ACCOUNT, "uid": trash_item["uid"], "uid_validity": trash_page["uid_validity"],
+            "account": ACCOUNT, "uid": trash_item["uid"], "uid_validity": trash_item["uid_validity"],
             "destination_folder": folder_b, "action": "restore_from_trash",
         })
         page_b, moved = listed_item(mcp, folder_b, marker + " updated")
-        message.update(folder=folder_b, uid=moved["uid"], uid_validity=page_b["uid_validity"])
+        if not moved or not moved.get("uid_validity"):
+            raise CandidateError("mail.special_folder", "TRASH_RESTORE_NOT_LISTED")
+        message.update(folder=folder_b, uid=moved["uid"], uid_validity=moved["uid_validity"])
         add_case(report, output, "mail.trash+restore")
 
         mcp.reviewed("mail.special_folder", {
