@@ -1369,7 +1369,7 @@ fn tool_definitions(ui_enabled: bool, roots_enabled: bool) -> Result<Vec<Value>>
         tool("yacli.contacts.delete", "Условно удалить контакт CardDAV по href и сильному ETag.", json!({"type":"object","properties":{"account":{"type":"string"},"href":{"type":"string"},"etag":{"type":"string"}},"required":["href","etag"],"additionalProperties":false}), None, ui_enabled),
         tool(
             "yacli.mail.list",
-            "List messages from a folder.",
+            "Постранично показать письма в папке; элементы ответа содержат UIDVALIDITY, если сервер сообщил его при SELECT.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1385,7 +1385,7 @@ fn tool_definitions(ui_enabled: bool, roots_enabled: bool) -> Result<Vec<Value>>
         ),
         tool(
             "yacli.mail.search",
-            "Искать письма по тексту в выбранной папке или во всех папках; можно ограничить период датами IMAP. Глобальный режим ограничен 5000 совпадениями.",
+            "Искать письма по тексту в папке или во всех папках, ограничить период датами IMAP; элементы ответа содержат UIDVALIDITY, если сервер сообщил его при SELECT. Глобальный режим ограничен 5000 совпадениями.",
             json!({
                 "type": "object",
                 "properties": {

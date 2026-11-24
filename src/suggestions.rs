@@ -1900,6 +1900,7 @@ mod tests {
         let messages = vec![
             MailMessageSummary {
                 uid: 77,
+                uid_validity: None,
                 subject: Some("Re: Ревью платформы".to_string()),
                 from: Some("organizer@example.com".to_string()),
                 date: None,
@@ -1908,6 +1909,7 @@ mod tests {
             },
             MailMessageSummary {
                 uid: 88,
+                uid_validity: None,
                 subject: Some("Другая тема".to_string()),
                 from: Some("other@example.com".to_string()),
                 date: None,
@@ -1939,6 +1941,7 @@ mod tests {
         };
         let message = MailMessageSummary {
             uid: 77,
+            uid_validity: None,
             subject: Some("Re: Ревью платформы".to_string()),
             from: Some("organizer@example.com".to_string()),
             date: None,
@@ -1980,6 +1983,7 @@ mod tests {
         };
         let message = MailMessageSummary {
             uid: 77,
+            uid_validity: None,
             subject: Some("Re: Ревью платформы".to_string()),
             from: Some("organizer@example.com".to_string()),
             date: None,

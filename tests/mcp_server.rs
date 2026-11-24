@@ -1049,6 +1049,12 @@ client_id = "client-123"
         .iter()
         .find(|tool| tool["name"] == "yacli.mail.list")
         .expect("mail list tool");
+    assert!(
+        mail_list["description"]
+            .as_str()
+            .unwrap()
+            .contains("UIDVALIDITY")
+    );
     assert_eq!(
         mail_list["inputSchema"]["properties"]["offset"]["minimum"],
         0

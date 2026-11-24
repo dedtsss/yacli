@@ -159,6 +159,8 @@ pub struct MailFolderDeleteReview {
 pub struct MailMessageSummary {
     pub uid: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub uid_validity: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub subject: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
@@ -604,7 +606,7 @@ pub fn list_mail_drafts_page(
         .ok_or_else(|| {
             YacliError::Api("IMAP server did not advertise a \\Drafts mailbox".into())
         })?;
-    session.select_mailbox(&encode_modified_utf7(&drafts.name))?;
+    let mailbox_status = session.select_mailbox_with_status(&encode_modified_utf7(&drafts.name))?;
     let uids = session.search_all_uids()?;
     if uids.is_empty() {
         let _ = session.logout();
@@ -620,7 +622,10 @@ pub fn list_mail_drafts_page(
         let _ = session.logout();
         return Ok((drafts.name, Vec::new()));
     }
-    let items = session.fetch_message_summaries(&selected_uids)?;
+    let mut items = session.fetch_message_summaries(&selected_uids)?;
+    for item in &mut items {
+        item.uid_validity = mailbox_status.uid_validity;
+    }
     let _ = session.logout();
     Ok((drafts.name, items))
 }
@@ -1119,7 +1124,7 @@ pub fn list_mail_messages_page(
     let mut session = open_authenticated_session(imap_host, imap_port, auth)?;
 
     let encoded_mailbox = encode_modified_utf7(mailbox_name);
-    session.select_mailbox(&encoded_mailbox)?;
+    let mailbox_status = session.select_mailbox_with_status(&encoded_mailbox)?;
     let uids = session.search_all_uids()?;
     if uids.is_empty() {
         let _ = session.logout();
@@ -1132,7 +1137,10 @@ pub fn list_mail_messages_page(
         .skip(offset)
         .take(limit)
         .collect::<Vec<_>>();
-    let messages = session.fetch_message_summaries(&selected_uids)?;
+    let mut messages = session.fetch_message_summaries(&selected_uids)?;
+    for message in &mut messages {
+        message.uid_validity = mailbox_status.uid_validity;
+    }
     let _ = session.logout();
     Ok(messages)
 }
@@ -1190,7 +1198,7 @@ pub fn search_mail_messages_filtered_page(
     let mut session = open_authenticated_session(imap_host, imap_port, auth)?;
 
     let encoded_mailbox = encode_modified_utf7(mailbox_name);
-    session.select_mailbox(&encoded_mailbox)?;
+    let mailbox_status = session.select_mailbox_with_status(&encoded_mailbox)?;
     let uids =
         session.search_uids_by_text_and_dates(&query, since.as_deref(), before.as_deref())?;
     if uids.is_empty() {
@@ -1204,7 +1212,10 @@ pub fn search_mail_messages_filtered_page(
         .skip(filter.offset)
         .take(filter.limit)
         .collect::<Vec<_>>();
-    let messages = session.fetch_message_summaries(&selected_uids)?;
+    let mut messages = session.fetch_message_summaries(&selected_uids)?;
+    for message in &mut messages {
+        message.uid_validity = mailbox_status.uid_validity;
+    }
     let _ = session.logout();
     Ok(messages)
 }
@@ -1235,7 +1246,7 @@ pub fn search_mail_all_folders_page(
         {
             continue;
         }
-        session.select_mailbox(&folder.raw_name)?;
+        let mailbox_status = session.select_mailbox_with_status(&folder.raw_name)?;
         let uids =
             session.search_uids_by_text_and_dates(&query, since.as_deref(), before.as_deref())?;
         if uids.is_empty() {
@@ -1246,7 +1257,8 @@ pub fn search_mail_all_folders_page(
                 "Глобальный поиск ограничен {MAX_GLOBAL_SEARCH_MATCHES} совпадениями за запрос; уточните текст или период"
             )));
         }
-        for message in session.fetch_message_summaries(&uids)? {
+        for mut message in session.fetch_message_summaries(&uids)? {
+            message.uid_validity = mailbox_status.uid_validity;
             hits.push(MailSearchHit {
                 folder: folder.name.clone(),
                 message,
@@ -3400,6 +3412,7 @@ fn build_message_summary(metadata: FetchMetadata, headers: &[u8]) -> Result<Mail
 
     Ok(MailMessageSummary {
         uid: metadata.uid,
+        uid_validity: None,
         subject,
         from,
         date,
@@ -4481,18 +4494,18 @@ mod tests {
     use super::{
         FetchMetadata, ImapSession, MailAttachmentExportRequest, MailAttachmentPart,
         MailAttachmentPayload, MailAttachmentSelector, MailAttachmentSummary, MailFlagUpdate,
-        MailFolder, MailMessage, MailSendRequest, MailSessionAuth, MailSmtpAuth, MailThreadHeaders,
-        OutgoingMessage, SMTP_SAFE_MESSAGE_BYTES, SentMail, SmtpSession, build_forward_body,
-        build_message_summary, build_outgoing_message, build_read_message, build_xoauth2_payload,
-        decode_modified_utf7, encode_modified_utf7, export_attachment_from_message,
-        extract_message_content, finish_sent_copy, format_mail_uid_set, format_uid_store_flag,
-        inspect_invite_from_message, load_mail_attachments, normalize_forward_subject,
-        normalize_reply_subject, normalize_search_date, normalize_search_query,
-        parse_fetch_metadata, parse_imap_token, parse_list_line, parse_search_uids,
-        prepare_mail_submission, quote_imap_string, review_mail_submission, send_mail_message,
-        validate_folder_name, validate_mail_attachment_export_request,
-        validate_mail_attachment_read_request, validate_mail_flag_update,
-        validate_mail_page_offset, validate_mail_uid,
+        MailFolder, MailMessage, MailMessageSummary, MailSendRequest, MailSessionAuth,
+        MailSmtpAuth, MailThreadHeaders, OutgoingMessage, SMTP_SAFE_MESSAGE_BYTES, SentMail,
+        SmtpSession, build_forward_body, build_message_summary, build_outgoing_message,
+        build_read_message, build_xoauth2_payload, decode_modified_utf7, encode_modified_utf7,
+        export_attachment_from_message, extract_message_content, finish_sent_copy,
+        format_mail_uid_set, format_uid_store_flag, inspect_invite_from_message,
+        load_mail_attachments, normalize_forward_subject, normalize_reply_subject,
+        normalize_search_date, normalize_search_query, parse_fetch_metadata, parse_imap_token,
+        parse_list_line, parse_search_uids, prepare_mail_submission, quote_imap_string,
+        review_mail_submission, send_mail_message, validate_folder_name,
+        validate_mail_attachment_export_request, validate_mail_attachment_read_request,
+        validate_mail_flag_update, validate_mail_page_offset, validate_mail_uid,
     };
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
@@ -4788,6 +4801,22 @@ mod tests {
         assert!(
             super::parse_imap_mailbox_select_status(&["* OK [UIDNEXT 0] invalid".into()]).is_err()
         );
+    }
+
+    #[test]
+    fn message_summaries_carry_uid_validity_when_available() {
+        let summary = MailMessageSummary {
+            uid: 12,
+            uid_validity: Some(345),
+            subject: Some("Тест".into()),
+            from: None,
+            date: None,
+            flags: Vec::new(),
+            size: Some(64),
+        };
+        let value = serde_json::to_value(summary).expect("summary JSON");
+        assert_eq!(value["uid"], 12);
+        assert_eq!(value["uid_validity"], 345);
     }
 
     #[test]

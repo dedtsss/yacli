@@ -6165,6 +6165,7 @@ mod tests {
             "смета",
             &[MailMessageSummary {
                 uid: 42,
+                uid_validity: None,
                 date: Some("Fri,\n13 Mar 2026".to_string()),
                 from: Some("Sender\tName <sender@example.com>".to_string()),
                 subject: Some("Тема\r\nписьма".to_string()),
