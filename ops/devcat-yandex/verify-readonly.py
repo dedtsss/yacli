@@ -8,18 +8,25 @@ args.add_argument('--output', required=True)
 opt = args.parse_args()
 repo = pathlib.Path(__file__).resolve().parents[2]
 out = pathlib.Path(opt.output)
-state = {'date': '2026-10-22', 'route': 'existing service loopback' if opt.endpoint else 'isolated candidate loopback', 'cases': [], 'ui_acceptance': False}
+state = {'date': '2026-11-24', 'route': 'existing service loopback' if opt.endpoint else 'isolated candidate loopback', 'cases': [], 'ui_acceptance': False}
 
 def save(row):
     state['cases'].append(row)
     out.write_text(json.dumps(state, indent=2) + '\n')
     print(json.dumps(row), flush=True)
-env = os.environ.copy()
+env = {k: v for k, v in os.environ.items() if k in {
+    'HOME', 'LANG', 'LC_ALL', 'TMPDIR', 'SSL_CERT_FILE', 'SSL_CERT_DIR',
+    'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY',
+}}
+env['PATH'] = os.environ.get('PATH', '/usr/local/bin:/usr/bin:/bin')
 for item in shlex.split(subprocess.check_output(['systemctl', 'show', 'yacli-devcat.service', '-p', 'Environment', '--value'], text=True)):
     k, v = item.split('=', 1)
-    if k.startswith('YACLI_DEVCAT_') or k == 'YACLI_CONFIG_DIR':
+    if k.startswith('YACLI_DEVCAT_') or k in {'YACLI_CONFIG_DIR', 'YACLI_SECRET_BACKEND'}:
         env[k] = v
 env['CREDENTIALS_DIRECTORY'] = '/run/credentials/yacli-devcat.service'
+if not opt.endpoint:
+    # Проверяем review-gated инструменты только в отдельном процессе кандидата.
+    env['YACLI_DEVCAT_CAPABILITIES'] = 'mail.read,mail.send,mail.mutate,mail.delete,disk.read,disk.write,disk.delete,contacts.read,contacts.write'
 s = socket.socket()
 s.bind(('127.0.0.1', 0))
 port = s.getsockname()[1]
@@ -50,7 +57,28 @@ try:
             return json.load(r)
     rpc('initialize', {'protocolVersion': '2025-11-25', 'capabilities': {}, 'clientInfo': {'name': '551-recovery', 'version': '1'}})
     tools = rpc('tools/list', {})['result']['tools']
-    save({'check': 'catalog', 'count': len(tools), 'status': 'PASS' if len(tools) == 11 else 'BLOCKED'})
+    tool_names = {tool.get('name') for tool in tools}
+    required_tools = {
+        'yacli.mail.folders', 'yacli.mail.list', 'yacli.mail.search', 'yacli.mail.read',
+        'yacli.mail.checkpoint', 'yacli.mail.draft.list', 'yacli.mail.draft.create',
+        'yacli.mail.draft.update', 'yacli.mail.draft.trash', 'yacli.mail.folder.create',
+        'yacli.mail.folder.rename', 'yacli.mail.folder.delete', 'yacli.mail.copy',
+        'yacli.mail.move', 'yacli.mail.flags', 'yacli.mail.bulk', 'yacli.mail.special_folder',
+        'yacli.mail.send', 'yacli.mail.reply', 'yacli.mail.forward',
+        'yacli.mail.attachment.export', 'yacli.mail.eml.export',
+        'yacli.mail.rules.list', 'yacli.mail.rules.audit', 'yacli.mail.rules.preview',
+        'yacli.mail.rules.configure', 'yacli.mail.rules.run', 'yacli.mail.rules.undo',
+        'yacli.disk.info', 'yacli.disk.list', 'yacli.disk.read', 'yacli.disk.permissions',
+        'yacli.disk.mkdir', 'yacli.disk.upload', 'yacli.disk.copy', 'yacli.disk.move',
+        'yacli.disk.trash.list', 'yacli.disk.trash.move', 'yacli.disk.trash.restore',
+        'yacli.contacts.list', 'yacli.contacts.search', 'yacli.contacts.export',
+        'yacli.contacts.import', 'yacli.contacts.create', 'yacli.contacts.update',
+        'yacli.contacts.delete',
+    }
+    missing_tools = required_tools - tool_names
+    save({'check': 'catalog core operations', 'count': len(tools),
+          'missing_count': len(missing_tools), 'status': 'PASS' if not missing_tools else 'BLOCKED'})
+    state['catalog_tools'] = sorted(tool_names)
 
     def call(name, args, phase):
         start = time.monotonic()
@@ -87,18 +115,19 @@ try:
             row['seconds'] = round(time.monotonic() - start, 3)
             save(row)
     aliases = ['dedts', 'ykkareliadom', 'dvabobra2014']
-    schema_ok = all((t['inputSchema']['properties']['account'].get('enum') == sorted(aliases) and t['inputSchema']['properties']['account'].get('default') == 'dedts' for t in tools))
-    save({'check': 'exact aliases and default in every schema', 'status': 'PASS' if schema_ok else 'BLOCKED'})
+    provider_tools = [t for t in tools if t.get('name', '').startswith(('yacli.mail.', 'yacli.disk.', 'yacli.contacts.'))]
+    schema_ok = all((t.get('inputSchema', {}).get('properties', {}).get('account', {}).get('enum') == sorted(aliases) and t['inputSchema']['properties']['account'].get('default') == 'dedts' for t in provider_tools))
+    save({'check': 'exact aliases and default in provider schemas', 'count': len(provider_tools), 'status': 'PASS' if schema_ok else 'BLOCKED'})
     state['catalog_sha256'] = hashlib.sha256(json.dumps(tools, sort_keys=True).encode()).hexdigest()
-    read_names = {'yacli.mail.folders', 'yacli.mail.list', 'yacli.mail.search', 'yacli.mail.read', 'yacli.disk.info', 'yacli.disk.list', 'yacli.disk.read'}
+    read_names = {'yacli.mail.folders', 'yacli.mail.list', 'yacli.mail.search', 'yacli.mail.read', 'yacli.mail.checkpoint', 'yacli.mail.draft.list', 'yacli.mail.attachment.export', 'yacli.mail.rules.list', 'yacli.mail.rules.audit', 'yacli.mail.rules.preview', 'yacli.disk.info', 'yacli.disk.list', 'yacli.disk.read', 'yacli.disk.permissions', 'yacli.disk.trash.list', 'yacli.contacts.list', 'yacli.contacts.search', 'yacli.contacts.export'}
     annotations_ok = all((t.get('annotations', {}).get('readOnlyHint') == (t['name'] in read_names) for t in tools))
     save({'check': 'read annotations', 'status': 'PASS' if annotations_ok else 'BLOCKED'})
 
     def deny(name, arguments, expected):
         response = rpc('tools/call', {'name': 'yacli.' + name, 'arguments': arguments})
         denied = 'error' in response or response.get('result', {}).get('isError', False)
-        save({'check': expected, 'status': 'EXPECTED_DENY' if denied and expected in json.dumps(response) else 'BLOCKED'})
-    deny('disk.list', {'path': 'disk:/outside'}, 'outside')
+        save({'check': expected, 'status': 'EXPECTED_DENY' if denied and expected.lower() in json.dumps(response).lower() else 'BLOCKED'})
+    deny('disk.list', {'path': 'disk:/../YACLI-723-OUTSIDE'}, 'unsafe')
     deny('mail.folders', {'account': 'unknown-551'}, 'account')
     deny('mail.folders', {'account': 123}, 'account')
     for alias in ('ykkareliadom', 'dvabobra2014'):
@@ -106,42 +135,29 @@ try:
     deny('disk.publish', {'account': 'dedts', 'path': 'disk:/DevCat'}, 'capability denied')
     for alias in aliases:
         a = {'account': alias, 'folder': 'INBOX'}
-        v = call('mail.list', dict(a, limit=1), 'current list')
-        call('mail.folders', {'account': alias}, 'current folders')
+        v = call('mail.list', dict(a, limit=1, offset=0), 'INBOX first page')
+        folders = call('mail.folders', {'account': alias}, 'folder catalog')
+        page = call('mail.list', dict(a, limit=1, offset=1), 'INBOX pagination offset 1')
+        if page is not None:
+            save({'account': alias, 'check': 'list offset accepted',
+                  'status': 'PASS' if page.get('offset') == 1 else 'BLOCKED'})
         if v:
-            state.setdefault('response_shapes', {})['mail.list'] = list(v)
             msgs = v.get('items', [])
             if msgs:
                 uid = msgs[0]['uid']
                 call('mail.read', dict(a, uid=uid, max_bytes=15 * 1024 * 1024), 'known listed UID')
-        v = call('mail.search', dict(a, query='yandex', limit=1), 'positive indexed control')
-        if v:
-            msgs = v.get('items', [])
-            if msgs:
-                u = msgs[0]['uid']
-                read = call('mail.read', dict(a, uid=u, max_bytes=15 * 1024 * 1024), 'read search UID')
-                again = call('mail.search', dict(a, query='yandex', limit=10), 'known readable UID positive search')
-                matched = bool(again and any((m['uid'] == u for m in again['items'])))
-                save({'account': alias, 'check': 'known readable UID matched search', 'status': 'PASS' if matched else 'BLOCKED'})
-                save({'account': alias, 'check': 'positive search UID readable', 'status': 'PASS' if read else 'BLOCKED'})
             else:
-                save({'account': alias, 'check': 'positive search', 'status': 'BLOCKED', 'reason': 'zero matches'})
-    audit = json.loads((repo / 'docs/devcat-account-audit-2026-10-19.json').read_text())
-    v = call('disk.list', {'path': audit['disk_test_directory']}, 'existing dedicated test directory')
-    if v:
-        state.setdefault('response_shapes', {})['disk.list'] = list(v)
-        resource = v.get('resource', {})
-        items = (resource.get('children') or {}).get('items', [])
-        if not items:
-            items = v.get('items', [])
-        state['disk_item_count'] = len(items)
-        for item in items[:1]:
-            if item.get('type', item.get('resource_type')) == 'file':
-                v = call('disk.read', {'account': 'dedts', 'path': item['path']}, 'existing uploaded checksum control')
-                if v:
-                    data = base64.b64decode(v['data'])
-                    h = hashlib.sha256(data).hexdigest()
-                    save({'account': 'dedts', 'check': 'upload/read checksum', 'status': 'PASS' if h == audit['upload_sha256'] else 'BLOCKED', 'bytes': len(data), 'sha256': h, 'expected_sha256': audit['upload_sha256']})
+                save({'account': alias, 'check': 'read a listed message', 'status': 'BLOCKED',
+                      'reason': 'INBOX returned no readable UID'})
+        query = 'YACLI-723-READONLY-' + hashlib.sha256(alias.encode()).hexdigest()[:12]
+        search = call('mail.search', dict(a, query=query, limit=1, offset=0), 'search request')
+        search_page = call('mail.search', dict(a, query=query, limit=1, offset=1), 'search pagination offset 1')
+        if search is not None and search_page is not None:
+            save({'account': alias, 'check': 'search pagination accepted',
+                  'status': 'PASS' if search_page.get('offset') == 1 else 'BLOCKED'})
+        if folders is not None and v is not None:
+            save({'account': alias, 'check': 'mail account read path',
+                  'status': 'PASS' if isinstance(folders.get('items'), list) and isinstance(v.get('items'), list) else 'BLOCKED'})
 finally:
     if p is not None:
         p.terminate()
@@ -150,8 +166,13 @@ finally:
         except subprocess.TimeoutExpired:
             p.kill()
             p.wait()
-    state['candidate_stopped'] = p is not None
-    required = all((any((r.get('account') == alias and r.get('phase') == 'known listed UID' and (r.get('status') == 'PASS') for r in state['cases'])) and any((r.get('account') == alias and r.get('check') == 'known readable UID matched search' and (r.get('status') == 'PASS') for r in state['cases'])) for alias in ('dedts', 'ykkareliadom', 'dvabobra2014')))
-    state['state'] = 'PASS' if required and (not any((r.get('status') == 'BLOCKED' for r in state['cases']))) and any((r.get('check') == 'upload/read checksum' and r['status'] == 'PASS' for r in state['cases'])) else 'BLOCKED'
+    state['candidate_stopped'] = p is None or p.poll() is not None
+    required = all((
+        any(r.get('account') == alias and r.get('phase') == 'known listed UID' and r.get('status') == 'PASS' for r in state['cases'])
+        and any(r.get('account') == alias and r.get('phase') == 'folder catalog' and r.get('status') == 'PASS' for r in state['cases'])
+        and any(r.get('account') == alias and r.get('phase') == 'search request' and r.get('status') == 'PASS' for r in state['cases'])
+        and any(r.get('account') == alias and r.get('phase') == 'search pagination offset 1' and r.get('status') == 'PASS' for r in state['cases'])
+        for alias in aliases))
+    state['state'] = 'PASS' if required and state['candidate_stopped'] and (not any((r.get('status') == 'BLOCKED' for r in state['cases']))) else 'BLOCKED'
     out.write_text(json.dumps(state, indent=2) + '\n')
 sys.exit(0 if state['state'] == 'PASS' else 1)

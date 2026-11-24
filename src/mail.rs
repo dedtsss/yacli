@@ -138,8 +138,54 @@ pub struct MailFolder {
 }
 
 #[derive(Clone, Debug, Serialize, Eq, PartialEq)]
+pub struct MailboxCheckpoint {
+    pub folder: String,
+    pub uid_validity: u64,
+    pub uid_next: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
+pub struct MailDraftTrashReview {
+    pub uid: u64,
+    pub uid_validity: u64,
+    pub draft_folder: String,
+    pub trash_folder: String,
+    pub exists_in_drafts: bool,
+    pub allowed: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
+pub struct MailDraftUpdateReview {
+    pub uid: u64,
+    pub uid_validity: u64,
+    pub source_bytes: u64,
+    pub source_sha256: String,
+}
+
+#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
+pub struct MailDraftUpdateResult {
+    pub uid: u64,
+    pub uid_validity: u64,
+    pub replacement_message_id: String,
+    pub old_moved_to_trash: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
+pub struct MailFolderDeleteReview {
+    pub folder: String,
+    pub allowed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_count: Option<usize>,
+    pub has_children: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
 pub struct MailMessageSummary {
     pub uid: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uid_validity: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subject: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -150,6 +196,20 @@ pub struct MailMessageSummary {
     pub flags: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
+pub struct MailSearchHit {
+    pub folder: String,
+    pub message: MailMessageSummary,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MailSearchFilter<'a> {
+    pub since: Option<&'a str>,
+    pub before: Option<&'a str>,
+    pub limit: usize,
+    pub offset: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Eq, PartialEq)]
@@ -323,6 +383,31 @@ pub struct MailAttachmentExportRequest {
 }
 
 #[derive(Clone, Debug)]
+pub struct MailEmlExportRequest {
+    pub uid: u64,
+    pub output: PathBuf,
+    pub force: bool,
+    pub max_bytes: u64,
+    pub expected_sha256: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
+pub struct MailEmlExportReview {
+    pub message_uid: u64,
+    pub max_bytes: u64,
+    pub sha256: String,
+    pub bytes: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
+pub struct ExportedMailEml {
+    pub message_uid: u64,
+    pub output_path: String,
+    pub bytes_written: u64,
+    pub sha256: String,
+}
+
+#[derive(Clone, Debug)]
 pub struct MailInviteInspectRequest {
     pub uid: u64,
     pub selector: MailAttachmentSelector,
@@ -350,6 +435,39 @@ pub enum MailSessionAuth {
     },
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MailFlagUpdate {
+    pub seen: Option<bool>,
+    pub flagged: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MailBulkAction {
+    MarkRead,
+    MarkUnread,
+    Flag,
+    Unflag,
+    Copy,
+    Move,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MailSpecialFolderAction {
+    MoveToTrash,
+    RestoreFromTrash,
+    MoveToSpam,
+    RestoreFromSpam,
+}
+
+#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
+pub struct CreatedMailDraft {
+    pub folder: String,
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    pub subject: String,
+    pub message_id: String,
+}
+
 #[derive(Clone, Debug, Serialize, Eq, PartialEq)]
 pub struct RepliedMail {
     pub original_uid: u64,
@@ -362,6 +480,8 @@ pub struct RepliedMail {
 #[derive(Clone, Debug)]
 pub struct MailReplyRequest {
     pub uid: u64,
+    pub account_email: String,
+    pub reply_all: bool,
     pub cc: Vec<String>,
     pub text: Option<String>,
     pub html: Option<String>,
@@ -418,6 +538,12 @@ pub struct MailForwardRequest {
     pub max_source_bytes: u64,
 }
 
+#[derive(Clone, Debug)]
+pub struct MailForwardReviewBinding {
+    pub request: MailForwardRequest,
+    pub source_sha256: String,
+}
+
 struct NormalizedOutgoingBody {
     text: Option<String>,
     html: Option<String>,
@@ -462,6 +588,1012 @@ pub fn list_mail_folders(
     Ok(folders)
 }
 
+pub fn mail_mailbox_checkpoint(
+    imap_host: &str,
+    imap_port: u16,
+    auth: MailSessionAuth,
+    folder: &str,
+) -> Result<MailboxCheckpoint> {
+    validate_folder_name(folder)?;
+    let mut session = open_authenticated_session(imap_host, imap_port, auth)?;
+    let status = session.select_mailbox_with_status(&encode_modified_utf7(folder))?;
+    let _ = session.logout();
+    Ok(MailboxCheckpoint {
+        folder: folder.to_string(),
+        uid_validity: status.uid_validity.ok_or_else(|| {
+            YacliError::Api("IMAP SELECT omitted UIDVALIDITY; checkpoint unavailable".into())
+        })?,
+        uid_next: status.uid_next.ok_or_else(|| {
+            YacliError::Api("IMAP SELECT omitted UIDNEXT; checkpoint unavailable".into())
+        })?,
+    })
+}
+
+pub fn list_mail_messages_after_uid(
+    imap_host: &str,
+    imap_port: u16,
+    auth: MailSessionAuth,
+    folder: &str,
+    expected_uid_validity: u64,
+    after_uid: u64,
+    limit: usize,
+) -> Result<(MailboxCheckpoint, Vec<MailMessageSummary>, bool)> {
+    if limit == 0 || limit > 50 {
+        return Err(YacliError::Validation(
+            "Пакет правил должен содержать от 1 до 50 писем".into(),
+        ));
+    }
+    validate_folder_name(folder)?;
+    let mut session = open_authenticated_session(imap_host, imap_port, auth)?;
+    let status = session.select_mailbox_with_status(&encode_modified_utf7(folder))?;
+    let uid_validity = status.uid_validity.ok_or_else(|| {
+        YacliError::Api("IMAP SELECT omitted UIDVALIDITY; rule checkpoint unavailable".into())
+    })?;
+    let uid_next = status.uid_next.ok_or_else(|| {
+        YacliError::Api("IMAP SELECT omitted UIDNEXT; rule checkpoint unavailable".into())
+    })?;
+    if uid_validity != expected_uid_validity {
+        return Err(YacliError::Validation(
+            "UIDVALIDITY изменилась; автоматическое правило остановлено до проверки".into(),
+        ));
+    }
+    let uids = session.search_uids_after(after_uid)?;
+    if uids.len() > 5_000 {
+        return Err(YacliError::UnsupportedOperation(
+            "Пакет правил превышает 5000 UID; курсор не изменён, повторите с меньшим интервалом"
+                .into(),
+        ));
+    }
+    let mut selected = uids
+        .into_iter()
+        .filter(|uid| *uid > after_uid)
+        .collect::<Vec<_>>();
+    selected.sort_unstable();
+    let has_more = selected.len() > limit;
+    selected.truncate(limit);
+    let mut messages = if selected.is_empty() {
+        Vec::new()
+    } else {
+        session.fetch_message_summaries(&selected)?
+    };
+    for message in &mut messages {
+        message.uid_validity = Some(uid_validity);
+    }
+    messages.sort_by_key(|message| message.uid);
+    let _ = session.logout();
+    Ok((
+        MailboxCheckpoint {
+            folder: folder.into(),
+            uid_validity,
+            uid_next,
+        },
+        messages,
+        has_more,
+    ))
+}
+
+pub fn list_mail_messages_by_uid(
+    imap_host: &str,
+    imap_port: u16,
+    auth: MailSessionAuth,
+    folder: &str,
+    expected_uid_validity: u64,
+    uids: &[u64],
+) -> Result<Vec<MailMessageSummary>> {
+    if uids.is_empty() || uids.len() > 50 {
+        return Err(YacliError::Validation(
+            "Чтение правил требует от 1 до 50 UID".into(),
+        ));
+    }
+    format_mail_uid_set(uids)?;
+    validate_folder_name(folder)?;
+    let mut session = open_authenticated_session(imap_host, imap_port, auth)?;
+    select_mailbox_with_expected_uid_validity(
+        &mut session,
+        &encode_modified_utf7(folder),
+        expected_uid_validity,
+    )?;
+    let mut messages = session.fetch_message_summaries(uids)?;
+    if messages.len() != uids.len() {
+        return Err(YacliError::Validation(
+            "Одно или несколько писем исчезли до применения правила".into(),
+        ));
+    }
+    for message in &mut messages {
+        message.uid_validity = Some(expected_uid_validity);
+    }
+    messages.sort_by_key(|message| message.uid);
+    let _ = session.logout();
+    Ok(messages)
+}
+
+pub fn list_mail_drafts_page(
+    imap_host: &str,
+    imap_port: u16,
+    auth: MailSessionAuth,
+    limit: usize,
+    offset: usize,
+) -> Result<(String, Vec<MailMessageSummary>)> {
+    validate_mail_summary_limit("mail draft list", limit)?;
+    validate_mail_page_offset(offset)?;
+
+    let mut session = open_authenticated_session(imap_host, imap_port, auth)?;
+    let drafts = session
+        .list_folders()?
+        .into_iter()
+        .find(|folder| {
+            folder
+                .attributes
+                .iter()
+                .any(|attribute| attribute.eq_ignore_ascii_case(r"\Drafts"))
+        })
+        .ok_or_else(|| {
+            YacliError::Api("IMAP server did not advertise a \\Drafts mailbox".into())
+        })?;
+    let mailbox_status = session.select_mailbox_with_status(&encode_modified_utf7(&drafts.name))?;
+    let uids = session.search_all_uids()?;
+    if uids.is_empty() {
+        let _ = session.logout();
+        return Ok((drafts.name, Vec::new()));
+    }
+    let selected_uids = uids
+        .into_iter()
+        .rev()
+        .skip(offset)
+        .take(limit)
+        .collect::<Vec<_>>();
+    if selected_uids.is_empty() {
+        let _ = session.logout();
+        return Ok((drafts.name, Vec::new()));
+    }
+    let mut items = session.fetch_message_summaries(&selected_uids)?;
+    for item in &mut items {
+        item.uid_validity = mailbox_status.uid_validity;
+    }
+    let _ = session.logout();
+    Ok((drafts.name, items))
+}
+
+pub fn review_mail_draft_trash(
+    imap_host: &str,
+    imap_port: u16,
+    auth: MailSessionAuth,
+    uid: u64,
+    uid_validity: u64,
+) -> Result<MailDraftTrashReview> {
+    validate_mail_uid(uid)?;
+    if uid_validity == 0 {
+        return Err(YacliError::Validation(
+            "UIDVALIDITY must be greater than zero".into(),
+        ));
+    }
+    let mut session = open_authenticated_session(imap_host, imap_port, auth)?;
+    let folders = session.list_folders()?;
+    let drafts = find_special_mail_folder(&folders, "\\Drafts")?;
+    let trash = find_special_mail_folder(&folders, "\\Trash")?;
+    if drafts.raw_name == trash.raw_name {
+        return Err(YacliError::Api(
+            "IMAP Drafts and Trash folders resolve to the same mailbox".into(),
+        ));
+    }
+    let status = session.select_mailbox_with_status(&drafts.raw_name)?;
+    let exists_in_drafts = status.uid_validity == Some(uid_validity)
+        && session
+            .search_all_uids()?
+            .into_iter()
+            .any(|found| found == uid);
+    let _ = session.logout();
+    Ok(MailDraftTrashReview {
+        uid,
+        uid_validity,
+        draft_folder: drafts.name.clone(),
+        trash_folder: trash.name.clone(),
+        exists_in_drafts,
+        allowed: exists_in_drafts,
+    })
+}
+
+pub fn move_mail_draft_to_trash(
+    imap_host: &str,
+    imap_port: u16,
+    auth: MailSessionAuth,
+    uid: u64,
+    uid_validity: u64,
+) -> Result<MailDraftTrashReview> {
+    validate_mail_uid(uid)?;
+    if uid_validity == 0 {
+        return Err(YacliError::Validation(
+            "UIDVALIDITY must be greater than zero".into(),
+        ));
+    }
+    let mut session = open_authenticated_session(imap_host, imap_port, auth)?;
+    let review = move_mail_draft_to_trash_session(&mut session, uid, uid_validity)?;
+    let _ = session.logout();
+    Ok(review)
+}
+
+fn move_mail_draft_to_trash_session<S: Read + Write>(
+    session: &mut ImapSession<S>,
+    uid: u64,
+    uid_validity: u64,
+) -> Result<MailDraftTrashReview> {
+    let folders = session.list_folders()?;
+    let drafts = find_special_mail_folder(&folders, "\\Drafts")?;
+    let trash = find_special_mail_folder(&folders, "\\Trash")?;
+    if drafts.raw_name == trash.raw_name {
+        return Err(YacliError::Api(
+            "IMAP Drafts and Trash folders resolve to the same mailbox".into(),
+        ));
+    }
+    select_mailbox_with_expected_uid_validity(session, &drafts.raw_name, uid_validity)?;
+    if !session
+        .search_all_uids()?
+        .into_iter()
+        .any(|found| found == uid)
+    {
+        return Err(YacliError::Validation(
+            "Черновик исчез перед перемещением; список нужно обновить".into(),
+        ));
+    }
+    session.uid_move(uid, &trash.raw_name)?;
+    Ok(MailDraftTrashReview {
+        uid,
+        uid_validity,
+        draft_folder: drafts.name.clone(),
+        trash_folder: trash.name.clone(),
+        exists_in_drafts: true,
+        allowed: true,
+    })
+}
+
+pub fn review_mail_draft_update(
+    imap_host: &str,
+    imap_port: u16,
+    auth: MailSessionAuth,
+    uid: u64,
+    uid_validity: u64,
+) -> Result<MailDraftUpdateReview> {
+    validate_mail_uid(uid)?;
+    let mut session = open_authenticated_session(imap_host, imap_port, auth)?;
+    let folders = session.list_folders()?;
+    let drafts = find_special_mail_folder(&folders, "\\Drafts")?;
+    let source = fetch_mail_draft_source(&mut session, &drafts.raw_name, uid, uid_validity)?;
+    let review = MailDraftUpdateReview {
+        uid,
+        uid_validity,
+        source_bytes: source.len() as u64,
+        source_sha256: format!("{:x}", Sha256::digest(&source)),
+    };
+    let _ = session.logout();
+    Ok(review)
+}
+
+pub fn update_mail_draft(
+    imap_host: &str,
+    imap_port: u16,
+    auth: MailSessionAuth,
+    uid: u64,
+    uid_validity: u64,
+    expected_source_sha256: &str,
+    request: MailSendRequest,
+) -> Result<MailDraftUpdateResult> {
+    validate_mail_uid(uid)?;
+    if uid_validity == 0 {
+        return Err(YacliError::Validation(
+            "UIDVALIDITY must be greater than zero".into(),
+        ));
+    }
+    if expected_source_sha256.len() != 64
+        || !expected_source_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(YacliError::Validation(
+            "Не задан SHA-256 исходного черновика из preview".into(),
+        ));
+    }
+    let prepared = prepare_mail_submission(auth.clone(), request)?;
+    ensure_smtp_safe_submission(&prepared)?;
+    let mut session = open_authenticated_session(imap_host, imap_port, auth)?;
+    let folders = session.list_folders()?;
+    let drafts = find_special_mail_folder(&folders, "\\Drafts")?;
+    let trash = find_special_mail_folder(&folders, "\\Trash")?;
+    if drafts.raw_name == trash.raw_name {
+        return Err(YacliError::Api(
+            "IMAP Drafts and Trash folders resolve to the same mailbox".into(),
+        ));
+    }
+    let result = update_mail_draft_session(
+        &mut session,
+        MailDraftUpdatePlan {
+            uid,
+            uid_validity,
+            expected_source_sha256,
+            draft_folder: &drafts.raw_name,
+            trash_folder: &trash.raw_name,
+            replacement_message: &prepared.message,
+            replacement_message_id: &prepared.sent.message_id,
+        },
+    )?;
+    let _ = session.logout();
+    Ok(result)
+}
+
+struct MailDraftUpdatePlan<'a> {
+    uid: u64,
+    uid_validity: u64,
+    expected_source_sha256: &'a str,
+    draft_folder: &'a str,
+    trash_folder: &'a str,
+    replacement_message: &'a str,
+    replacement_message_id: &'a str,
+}
+
+fn update_mail_draft_session<S: Read + Write>(
+    session: &mut ImapSession<S>,
+    plan: MailDraftUpdatePlan<'_>,
+) -> Result<MailDraftUpdateResult> {
+    let MailDraftUpdatePlan {
+        uid,
+        uid_validity,
+        expected_source_sha256,
+        draft_folder,
+        trash_folder,
+        replacement_message,
+        replacement_message_id,
+    } = plan;
+    let source = fetch_mail_draft_source(session, draft_folder, uid, uid_validity)?;
+    let current_sha256 = format!("{:x}", Sha256::digest(&source));
+    if current_sha256 != expected_source_sha256.to_ascii_lowercase() {
+        return Err(YacliError::Validation(
+            "Исходный черновик изменился после preview; обновите список и повторите проверку"
+                .into(),
+        ));
+    }
+    let append_mailbox_status =
+        select_mailbox_with_expected_uid_validity_status(session, draft_folder, uid_validity)?;
+    if session
+        .append_draft(draft_folder, replacement_message.as_bytes())
+        .is_err()
+    {
+        // Сервер может сохранить APPEND, а затем вернуть отрицательный ответ.
+        // Не повторяем запись: ищем замену по созданному Message-ID и продолжаем
+        // только при подтверждении ровно одного совпадения.
+        match confirm_appended_draft(
+            session,
+            draft_folder,
+            uid_validity,
+            append_mailbox_status.uid_next,
+            replacement_message_id,
+        ) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(YacliError::Api(
+                    "IMAP APPEND вернул ошибку; новая версия не подтверждена, исходный черновик сохранён. Проверьте Drafts и Trash перед повтором".into(),
+                ));
+            }
+            Err(_) => {
+                return Err(YacliError::Api(
+                    "IMAP APPEND вернул ошибку; состояние новой версии проверить не удалось, исходный черновик сохранён. Проверьте Drafts и Trash перед повтором".into(),
+                ));
+            }
+        }
+    }
+
+    let source_after_append = fetch_mail_draft_source(session, draft_folder, uid, uid_validity)
+        .map_err(|_| YacliError::Api(format!(
+            "Новая версия черновика {replacement_message_id} добавлена, но исходная запись осталась в Черновиках; проверьте папку перед повтором"
+        )))?;
+    let source_after_sha256 = format!("{:x}", Sha256::digest(&source_after_append));
+    if source_after_sha256 != expected_source_sha256.to_ascii_lowercase() {
+        return Err(YacliError::Api(format!(
+            "Новая версия черновика {} добавлена, но исходный черновик изменился и остался в папке; проверьте папку перед повтором",
+            replacement_message_id
+        )));
+    }
+    session.uid_move(uid, trash_folder).map_err(|_| {
+        YacliError::Api(format!(
+            "Новая версия черновика {replacement_message_id} добавлена, но исходная осталась в Черновиках; проверьте обе папки перед повтором"
+        ))
+    })?;
+    Ok(MailDraftUpdateResult {
+        uid,
+        uid_validity,
+        replacement_message_id: replacement_message_id.to_string(),
+        old_moved_to_trash: true,
+    })
+}
+
+fn confirm_appended_draft<S: Read + Write>(
+    session: &mut ImapSession<S>,
+    draft_folder: &str,
+    uid_validity: u64,
+    first_possible_uid: Option<u64>,
+    expected_message_id: &str,
+) -> Result<bool> {
+    let Some(first_possible_uid) = first_possible_uid.filter(|uid| *uid > 0) else {
+        return Ok(false);
+    };
+    let status =
+        select_mailbox_with_expected_uid_validity_status(session, draft_folder, uid_validity)?;
+    if !matches!(status.uid_next, Some(uid_next) if uid_next > first_possible_uid) {
+        return Ok(false);
+    }
+    let candidate_uids = session.search_uids_after(first_possible_uid - 1)?;
+    if candidate_uids.is_empty() || candidate_uids.len() > 50 {
+        return Ok(false);
+    }
+    let mut exact_matches = 0;
+    for uid in candidate_uids {
+        let (_, headers) = session.fetch_message_headers(uid, &["MESSAGE-ID"])?;
+        if mail_message_id_header_matches(&headers, expected_message_id) {
+            exact_matches += 1;
+            if exact_matches > 1 {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(exact_matches == 1)
+}
+
+fn mail_message_id_header_matches(headers: &[u8], expected: &str) -> bool {
+    let Ok(parsed) = mailparse::parse_mail(headers) else {
+        return false;
+    };
+    let Some(actual) = parsed.headers.get_first_value("Message-ID") else {
+        return false;
+    };
+    normalize_message_id(&actual) == normalize_message_id(expected)
+}
+
+fn normalize_message_id(value: &str) -> &str {
+    value
+        .trim()
+        .strip_prefix('<')
+        .and_then(|value| value.strip_suffix('>'))
+        .unwrap_or(value.trim())
+}
+
+fn fetch_mail_draft_source<S: Read + Write>(
+    session: &mut ImapSession<S>,
+    draft_folder: &str,
+    uid: u64,
+    uid_validity: u64,
+) -> Result<Vec<u8>> {
+    select_mailbox_with_expected_uid_validity(session, draft_folder, uid_validity)?;
+    if !session
+        .search_all_uids()?
+        .into_iter()
+        .any(|found| found == uid)
+    {
+        return Err(YacliError::Validation(
+            "Черновик не найден в папке \\Drafts или UIDVALIDITY изменилась".into(),
+        ));
+    }
+    session.fetch_message_rfc822_limited(uid, SMTP_SAFE_MESSAGE_BYTES as u64)
+}
+
+pub fn create_mail_folder(
+    imap_host: &str,
+    imap_port: u16,
+    auth: MailSessionAuth,
+    folder: &str,
+) -> Result<()> {
+    let folder = validate_folder_name(folder)?;
+    let mut session = open_authenticated_session(imap_host, imap_port, auth)?;
+    session.create_mailbox(&encode_modified_utf7(folder))?;
+    let _ = session.logout();
+    Ok(())
+}
+
+pub fn review_mail_folder_delete(
+    imap_host: &str,
+    imap_port: u16,
+    auth: MailSessionAuth,
+    folder: &str,
+) -> Result<MailFolderDeleteReview> {
+    let folder = validate_folder_name(folder)?;
+    let mut session = open_authenticated_session(imap_host, imap_port, auth)?;
+    let (review, _) = inspect_mail_folder_delete(&mut session, folder)?;
+    let _ = session.logout();
+    Ok(review)
+}
+
+pub fn delete_mail_folder(
+    imap_host: &str,
+    imap_port: u16,
+    auth: MailSessionAuth,
+    folder: &str,
+) -> Result<MailFolderDeleteReview> {
+    let folder = validate_folder_name(folder)?;
+    let mut session = open_authenticated_session(imap_host, imap_port, auth)?;
+    let (review, raw_name) = inspect_mail_folder_delete(&mut session, folder)?;
+    if !review.allowed {
+        return Err(YacliError::Validation(
+            review
+                .reason
+                .clone()
+                .unwrap_or_else(|| "Папку нельзя безопасно удалить.".into()),
+        ));
+    }
+    let raw_name =
+        raw_name.ok_or_else(|| YacliError::Api("Папка исчезла перед удалением.".into()))?;
+    session.unselect_mailbox()?;
+    session.delete_mailbox(&raw_name)?;
+    let _ = session.logout();
+    Ok(review)
+}
+
+fn inspect_mail_folder_delete(
+    session: &mut ImapSession,
+    folder_name: &str,
+) -> Result<(MailFolderDeleteReview, Option<String>)> {
+    let folders = session.list_folders()?;
+    let Some(folder) = folders.iter().find(|folder| folder.name == folder_name) else {
+        return Ok((
+            MailFolderDeleteReview {
+                folder: folder_name.to_string(),
+                allowed: false,
+                reason: Some("Папка не найдена.".into()),
+                message_count: None,
+                has_children: false,
+            },
+            None,
+        ));
+    };
+    if is_protected_mail_folder(folder) || folder.attributes.iter().any(|attr| attr == r"\Noselect")
+    {
+        return Ok((
+            MailFolderDeleteReview {
+                folder: folder.name.clone(),
+                allowed: false,
+                reason: Some("Системную или недоступную для выбора папку удалять нельзя.".into()),
+                message_count: None,
+                has_children: false,
+            },
+            None,
+        ));
+    }
+    let has_children = folders.iter().any(|candidate| {
+        if candidate.raw_name == folder.raw_name {
+            return false;
+        }
+        folder
+            .delimiter
+            .as_deref()
+            .filter(|delimiter| !delimiter.is_empty())
+            .is_some_and(|delimiter| {
+                candidate
+                    .raw_name
+                    .starts_with(&format!("{}{delimiter}", folder.raw_name))
+            })
+    });
+    if has_children {
+        return Ok((
+            MailFolderDeleteReview {
+                folder: folder.name.clone(),
+                allowed: false,
+                reason: Some("Сначала переместите или удалите подпапки.".into()),
+                message_count: None,
+                has_children: true,
+            },
+            None,
+        ));
+    }
+    session.select_mailbox(&folder.raw_name)?;
+    let message_count = session.search_all_uids()?.len();
+    let review = MailFolderDeleteReview {
+        folder: folder.name.clone(),
+        allowed: message_count == 0,
+        reason: (message_count != 0).then(|| "Удалять можно только пустую папку.".into()),
+        message_count: Some(message_count),
+        has_children: false,
+    };
+    Ok((
+        review.clone(),
+        review.allowed.then(|| folder.raw_name.clone()),
+    ))
+}
+
+fn is_protected_mail_folder(folder: &MailFolder) -> bool {
+    const PROTECTED_ATTRIBUTES: &[&str] = &[
+        r"\Inbox",
+        r"\Drafts",
+        r"\Sent",
+        r"\Trash",
+        r"\Junk",
+        r"\Archive",
+        r"\All",
+        r"\Flagged",
+        r"\Important",
+    ];
+    const PROTECTED_NAMES: &[&str] = &[
+        "inbox",
+        "входящие",
+        "drafts",
+        "черновики",
+        "sent",
+        "отправленные",
+        "trash",
+        "корзина",
+        "junk",
+        "spam",
+        "спам",
+        "archive",
+        "архив",
+        "all mail",
+        "вся почта",
+    ];
+    folder.attributes.iter().any(|attribute| {
+        PROTECTED_ATTRIBUTES
+            .iter()
+            .any(|protected| attribute.eq_ignore_ascii_case(protected))
+    }) || {
+        let normalized_name = folder.name.to_lowercase();
+        PROTECTED_NAMES.iter().any(|name| normalized_name == *name)
+    }
+}
+
+pub fn rename_mail_folder(
+    imap_host: &str,
+    imap_port: u16,
+    auth: MailSessionAuth,
+    current_name: &str,
+    new_name: &str,
+) -> Result<()> {
+    let (current_name, new_name) = validate_mail_folder_rename(current_name, new_name)?;
+    let mut session = open_authenticated_session(imap_host, imap_port, auth)?;
+    session.rename_mailbox(
+        &encode_modified_utf7(current_name),
+        &encode_modified_utf7(new_name),
+    )?;
+    let _ = session.logout();
+    Ok(())
+}
+
+pub fn validate_mail_folder_rename<'a, 'b>(
+    current_name: &'a str,
+    new_name: &'b str,
+) -> Result<(&'a str, &'b str)> {
+    let current_name = validate_folder_name(current_name)?;
+    let new_name = validate_folder_name(new_name)?;
+    if current_name == new_name {
+        return Err(YacliError::Validation(
+            "Новое имя папки должно отличаться от исходного".into(),
+        ));
+    }
+    Ok((current_name, new_name))
+}
+
+pub fn copy_mail_message(
+    imap_host: &str,
+    imap_port: u16,
+    auth: MailSessionAuth,
+    source_folder: &str,
+    uid: u64,
+    uid_validity: u64,
+    destination_folder: &str,
+) -> Result<()> {
+    validate_mail_uid(uid)?;
+    validate_folder_name(source_folder)?;
+    validate_folder_name(destination_folder)?;
+    let mut session = open_authenticated_session(imap_host, imap_port, auth)?;
+    select_mailbox_with_expected_uid_validity(
+        &mut session,
+        &encode_modified_utf7(source_folder),
+        uid_validity,
+    )?;
+    session.uid_copy(uid, &encode_modified_utf7(destination_folder))?;
+    let _ = session.logout();
+    Ok(())
+}
+
+pub fn move_mail_message(
+    imap_host: &str,
+    imap_port: u16,
+    auth: MailSessionAuth,
+    source_folder: &str,
+    uid: u64,
+    uid_validity: u64,
+    destination_folder: &str,
+) -> Result<()> {
+    validate_mail_uid(uid)?;
+    validate_folder_name(source_folder)?;
+    validate_folder_name(destination_folder)?;
+    let mut session = open_authenticated_session(imap_host, imap_port, auth)?;
+    select_mailbox_with_expected_uid_validity(
+        &mut session,
+        &encode_modified_utf7(source_folder),
+        uid_validity,
+    )?;
+    session.uid_move(uid, &encode_modified_utf7(destination_folder))?;
+    let _ = session.logout();
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn move_mail_message_to_special_folder(
+    imap_host: &str,
+    imap_port: u16,
+    auth: MailSessionAuth,
+    uid: u64,
+    uid_validity: u64,
+    action: MailSpecialFolderAction,
+    source_folder: Option<&str>,
+    destination_folder: Option<&str>,
+) -> Result<()> {
+    validate_mail_uid(uid)?;
+    let is_move_to_special = matches!(
+        action,
+        MailSpecialFolderAction::MoveToTrash | MailSpecialFolderAction::MoveToSpam
+    );
+    if is_move_to_special && destination_folder.is_some()
+        || !is_move_to_special && source_folder.is_some()
+    {
+        return Err(YacliError::Validation(
+            "Укажите только поле папки, относящееся к выбранному действию".into(),
+        ));
+    }
+    let mut session = open_authenticated_session(imap_host, imap_port, auth)?;
+    let folders = session.list_folders()?;
+    let (source, destination) = match action {
+        MailSpecialFolderAction::MoveToTrash | MailSpecialFolderAction::MoveToSpam => {
+            let source = validate_folder_name(source_folder.unwrap_or("INBOX"))?;
+            let target_attribute = if action == MailSpecialFolderAction::MoveToTrash {
+                "\\Trash"
+            } else {
+                "\\Junk"
+            };
+            let destination = find_special_mail_folder(&folders, target_attribute)?;
+            (encode_modified_utf7(source), destination.raw_name.clone())
+        }
+        MailSpecialFolderAction::RestoreFromTrash | MailSpecialFolderAction::RestoreFromSpam => {
+            let target_attribute = if action == MailSpecialFolderAction::RestoreFromTrash {
+                "\\Trash"
+            } else {
+                "\\Junk"
+            };
+            let source = find_special_mail_folder(&folders, target_attribute)?;
+            let destination = validate_folder_name(destination_folder.unwrap_or("INBOX"))?;
+            (source.raw_name.clone(), encode_modified_utf7(destination))
+        }
+    };
+    select_mailbox_with_expected_uid_validity(&mut session, &source, uid_validity)?;
+    session.uid_move(uid, &destination)?;
+    let _ = session.logout();
+    Ok(())
+}
+
+fn find_special_mail_folder<'a>(
+    folders: &'a [MailFolder],
+    attribute: &str,
+) -> Result<&'a MailFolder> {
+    folders
+        .iter()
+        .find(|folder| {
+            folder.attributes.iter().any(|candidate| {
+                candidate.eq_ignore_ascii_case(attribute)
+                    || attribute.eq_ignore_ascii_case("\\Junk")
+                        && candidate.eq_ignore_ascii_case("\\Spam")
+            })
+        })
+        .ok_or_else(|| {
+            YacliError::UnsupportedOperation(format!(
+                "IMAP server did not advertise the {attribute} mailbox"
+            ))
+        })
+}
+
+pub fn update_mail_flags(
+    imap_host: &str,
+    imap_port: u16,
+    auth: MailSessionAuth,
+    mailbox_name: &str,
+    uid: u64,
+    uid_validity: u64,
+    update: MailFlagUpdate,
+) -> Result<()> {
+    validate_mail_uid(uid)?;
+    validate_folder_name(mailbox_name)?;
+    validate_mail_flag_update(update)?;
+    let mut session = open_authenticated_session(imap_host, imap_port, auth)?;
+    select_mailbox_with_expected_uid_validity(
+        &mut session,
+        &encode_modified_utf7(mailbox_name),
+        uid_validity,
+    )?;
+    if let Some(enabled) = update.seen {
+        session.uid_store_flag(uid, "\\Seen", enabled)?;
+    }
+    if let Some(enabled) = update.flagged {
+        session.uid_store_flag(uid, "\\Flagged", enabled)?;
+    }
+    let _ = session.logout();
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn apply_mail_bulk_action(
+    imap_host: &str,
+    imap_port: u16,
+    auth: MailSessionAuth,
+    mailbox_name: &str,
+    uids: &[u64],
+    uid_validity: u64,
+    action: MailBulkAction,
+    destination_folder: Option<&str>,
+) -> Result<()> {
+    let uid_set = format_mail_uid_set(uids)?;
+    validate_folder_name(mailbox_name)?;
+    let destination = match action {
+        MailBulkAction::Copy | MailBulkAction::Move => Some(validate_folder_name(
+            destination_folder.ok_or_else(|| {
+                YacliError::Validation(
+                    "Для копирования или перемещения нужна папка назначения".into(),
+                )
+            })?,
+        )?),
+        _ => {
+            if destination_folder.is_some() {
+                return Err(YacliError::Validation(
+                    "Папка назначения допустима только для copy/move".into(),
+                ));
+            }
+            None
+        }
+    };
+
+    let mut session = open_authenticated_session(imap_host, imap_port, auth)?;
+    select_mailbox_with_expected_uid_validity(
+        &mut session,
+        &encode_modified_utf7(mailbox_name),
+        uid_validity,
+    )?;
+    match action {
+        MailBulkAction::MarkRead => session.uid_store_flags(&uid_set, "\\Seen", true)?,
+        MailBulkAction::MarkUnread => session.uid_store_flags(&uid_set, "\\Seen", false)?,
+        MailBulkAction::Flag => session.uid_store_flags(&uid_set, "\\Flagged", true)?,
+        MailBulkAction::Unflag => session.uid_store_flags(&uid_set, "\\Flagged", false)?,
+        MailBulkAction::Copy => session.uid_copy_set(
+            &uid_set,
+            &encode_modified_utf7(destination.ok_or_else(|| {
+                YacliError::Validation("Для копирования нужна папка назначения".into())
+            })?),
+        )?,
+        MailBulkAction::Move => session.uid_move_set(
+            &uid_set,
+            &encode_modified_utf7(destination.ok_or_else(|| {
+                YacliError::Validation("Для перемещения нужна папка назначения".into())
+            })?),
+        )?,
+    }
+    let _ = session.logout();
+    Ok(())
+}
+
+fn format_mail_uid_set(uids: &[u64]) -> Result<String> {
+    if uids.is_empty() || uids.len() > 50 {
+        return Err(YacliError::Validation(
+            "Массовое действие требует от 1 до 50 UID".into(),
+        ));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for uid in uids {
+        validate_mail_uid(*uid)?;
+        if !seen.insert(*uid) {
+            return Err(YacliError::Validation(
+                "Список UID не должен содержать повторов".into(),
+            ));
+        }
+    }
+    Ok(seen
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(","))
+}
+
+pub fn create_mail_draft(
+    imap_host: &str,
+    imap_port: u16,
+    auth: MailSessionAuth,
+    request: MailSendRequest,
+) -> Result<CreatedMailDraft> {
+    let session_auth = auth.clone();
+    let prepared = prepare_mail_submission(auth, request)?;
+    ensure_smtp_safe_submission(&prepared)?;
+    let mut session = open_authenticated_session(imap_host, imap_port, session_auth)?;
+    let draft_folder = session
+        .list_folders()?
+        .into_iter()
+        .find(|folder| {
+            folder
+                .attributes
+                .iter()
+                .any(|attr| attr.eq_ignore_ascii_case("\\Drafts"))
+        })
+        .ok_or_else(|| {
+            YacliError::Api("IMAP server did not advertise a \\Drafts mailbox".into())
+        })?;
+    session.append_draft(&draft_folder.raw_name, prepared.message.as_bytes())?;
+    let _ = session.logout();
+    Ok(CreatedMailDraft {
+        folder: draft_folder.name,
+        to: prepared.sent.to,
+        cc: prepared.sent.cc,
+        subject: prepared.sent.subject,
+        message_id: prepared.sent.message_id,
+    })
+}
+
+fn validate_mail_flag_update(update: MailFlagUpdate) -> Result<()> {
+    if update.seen.is_none() && update.flagged.is_none() {
+        return Err(YacliError::Validation(
+            "mail flag update must include seen or flagged".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn format_uid_store_flag(uid: u64, flag: &str, enabled: bool) -> Result<String> {
+    validate_mail_uid(uid)?;
+    if !matches!(flag, "\\Seen" | "\\Flagged") {
+        return Err(YacliError::Validation("unsupported mail flag".into()));
+    }
+    Ok(format!(
+        "UID STORE {uid} {}FLAGS.SILENT ({flag})",
+        if enabled { "+" } else { "-" }
+    ))
+}
+
+fn validate_mail_uid(uid: u64) -> Result<()> {
+    if uid == 0 {
+        Err(YacliError::Validation(
+            "mail UID must be greater than zero".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn select_mailbox_with_expected_uid_validity<S: Read + Write>(
+    session: &mut ImapSession<S>,
+    mailbox_name: &str,
+    expected_uid_validity: u64,
+) -> Result<()> {
+    select_mailbox_with_expected_uid_validity_status(session, mailbox_name, expected_uid_validity)
+        .map(|_| ())
+}
+
+fn select_mailbox_with_expected_uid_validity_status<S: Read + Write>(
+    session: &mut ImapSession<S>,
+    mailbox_name: &str,
+    expected_uid_validity: u64,
+) -> Result<ImapMailboxSelectStatus> {
+    if expected_uid_validity == 0 {
+        return Err(YacliError::Validation(
+            "UIDVALIDITY must be greater than zero".into(),
+        ));
+    }
+    let status = session.select_mailbox_with_status(mailbox_name)?;
+    if status.uid_validity != Some(expected_uid_validity) {
+        return Err(YacliError::Validation(
+            "Папка изменила UIDVALIDITY после получения списка; обновите список писем и повторите проверку".into(),
+        ));
+    }
+    Ok(status)
+}
+
+fn validate_folder_name(folder: &str) -> Result<&str> {
+    let folder = folder.trim();
+    if folder.is_empty() || folder.chars().any(char::is_control) {
+        return Err(YacliError::Validation(
+            "mail folder name is empty or contains control characters".into(),
+        ));
+    }
+    Ok(folder)
+}
+
 pub fn list_mail_messages(
     imap_host: &str,
     imap_port: u16,
@@ -469,20 +1601,40 @@ pub fn list_mail_messages(
     mailbox_name: &str,
     limit: usize,
 ) -> Result<Vec<MailMessageSummary>> {
+    list_mail_messages_page(imap_host, imap_port, auth, mailbox_name, limit, 0)
+}
+
+pub fn list_mail_messages_page(
+    imap_host: &str,
+    imap_port: u16,
+    auth: MailSessionAuth,
+    mailbox_name: &str,
+    limit: usize,
+    offset: usize,
+) -> Result<Vec<MailMessageSummary>> {
     validate_mail_summary_limit("mail list", limit)?;
+    validate_mail_page_offset(offset)?;
 
     let mut session = open_authenticated_session(imap_host, imap_port, auth)?;
 
     let encoded_mailbox = encode_modified_utf7(mailbox_name);
-    session.select_mailbox(&encoded_mailbox)?;
+    let mailbox_status = session.select_mailbox_with_status(&encoded_mailbox)?;
     let uids = session.search_all_uids()?;
     if uids.is_empty() {
         let _ = session.logout();
         return Ok(Vec::new());
     }
 
-    let selected_uids = uids.into_iter().rev().take(limit).collect::<Vec<_>>();
-    let messages = session.fetch_message_summaries(&selected_uids)?;
+    let selected_uids = uids
+        .into_iter()
+        .rev()
+        .skip(offset)
+        .take(limit)
+        .collect::<Vec<_>>();
+    let mut messages = session.fetch_message_summaries(&selected_uids)?;
+    for message in &mut messages {
+        message.uid_validity = mailbox_status.uid_validity;
+    }
     let _ = session.logout();
     Ok(messages)
 }
@@ -495,23 +1647,176 @@ pub fn search_mail_messages(
     query: &str,
     limit: usize,
 ) -> Result<Vec<MailMessageSummary>> {
-    validate_mail_summary_limit("mail search", limit)?;
+    search_mail_messages_page(imap_host, imap_port, auth, mailbox_name, query, limit, 0)
+}
+
+pub fn search_mail_messages_page(
+    imap_host: &str,
+    imap_port: u16,
+    auth: MailSessionAuth,
+    mailbox_name: &str,
+    query: &str,
+    limit: usize,
+    offset: usize,
+) -> Result<Vec<MailMessageSummary>> {
+    search_mail_messages_filtered_page(
+        imap_host,
+        imap_port,
+        auth,
+        mailbox_name,
+        query,
+        MailSearchFilter {
+            since: None,
+            before: None,
+            limit,
+            offset,
+        },
+    )
+}
+
+pub fn search_mail_messages_filtered_page(
+    imap_host: &str,
+    imap_port: u16,
+    auth: MailSessionAuth,
+    mailbox_name: &str,
+    query: &str,
+    filter: MailSearchFilter<'_>,
+) -> Result<Vec<MailMessageSummary>> {
+    validate_mail_summary_limit("mail search", filter.limit)?;
+    validate_mail_page_offset(filter.offset)?;
     let query = normalize_search_query(query)?;
+    let since = normalize_search_date(filter.since)?;
+    let before = normalize_search_date(filter.before)?;
+    validate_mail_search_range(since.as_deref(), before.as_deref())?;
 
     let mut session = open_authenticated_session(imap_host, imap_port, auth)?;
 
     let encoded_mailbox = encode_modified_utf7(mailbox_name);
-    session.select_mailbox(&encoded_mailbox)?;
-    let uids = session.search_uids_by_text(&query)?;
+    let mailbox_status = session.select_mailbox_with_status(&encoded_mailbox)?;
+    let uids =
+        session.search_uids_by_text_and_dates(&query, since.as_deref(), before.as_deref())?;
     if uids.is_empty() {
         let _ = session.logout();
         return Ok(Vec::new());
     }
 
-    let selected_uids = uids.into_iter().rev().take(limit).collect::<Vec<_>>();
-    let messages = session.fetch_message_summaries(&selected_uids)?;
+    let selected_uids = uids
+        .into_iter()
+        .rev()
+        .skip(filter.offset)
+        .take(filter.limit)
+        .collect::<Vec<_>>();
+    let mut messages = session.fetch_message_summaries(&selected_uids)?;
+    for message in &mut messages {
+        message.uid_validity = mailbox_status.uid_validity;
+    }
     let _ = session.logout();
     Ok(messages)
+}
+
+pub fn search_mail_all_folders_page(
+    imap_host: &str,
+    imap_port: u16,
+    auth: MailSessionAuth,
+    query: &str,
+    filter: MailSearchFilter<'_>,
+) -> Result<Vec<MailSearchHit>> {
+    const MAX_GLOBAL_SEARCH_MATCHES: usize = 5_000;
+    validate_mail_summary_limit("mail search", filter.limit)?;
+    validate_mail_page_offset(filter.offset)?;
+    let query = normalize_search_query(query)?;
+    let since = normalize_search_date(filter.since)?;
+    let before = normalize_search_date(filter.before)?;
+    validate_mail_search_range(since.as_deref(), before.as_deref())?;
+
+    let mut session = open_authenticated_session(imap_host, imap_port, auth)?;
+    let folders = session.list_folders()?;
+    let mut hits = Vec::new();
+    for folder in folders {
+        if folder
+            .attributes
+            .iter()
+            .any(|attribute| attribute.eq_ignore_ascii_case("\\Noselect"))
+        {
+            continue;
+        }
+        let mailbox_status = session.select_mailbox_with_status(&folder.raw_name)?;
+        let uids =
+            session.search_uids_by_text_and_dates(&query, since.as_deref(), before.as_deref())?;
+        if uids.is_empty() {
+            continue;
+        }
+        if hits.len().saturating_add(uids.len()) > MAX_GLOBAL_SEARCH_MATCHES {
+            return Err(YacliError::UnsupportedOperation(format!(
+                "Глобальный поиск ограничен {MAX_GLOBAL_SEARCH_MATCHES} совпадениями за запрос; уточните текст или период"
+            )));
+        }
+        for mut message in session.fetch_message_summaries(&uids)? {
+            message.uid_validity = mailbox_status.uid_validity;
+            hits.push(MailSearchHit {
+                folder: folder.name.clone(),
+                message,
+            });
+        }
+    }
+    let _ = session.logout();
+    hits.sort_by(|left, right| {
+        let left_date = left
+            .message
+            .date
+            .as_deref()
+            .and_then(|date| chrono::DateTime::parse_from_rfc2822(date).ok());
+        let right_date = right
+            .message
+            .date
+            .as_deref()
+            .and_then(|date| chrono::DateTime::parse_from_rfc2822(date).ok());
+        right_date
+            .cmp(&left_date)
+            .then_with(|| left.folder.cmp(&right.folder))
+            .then_with(|| right.message.uid.cmp(&left.message.uid))
+    });
+    Ok(hits
+        .into_iter()
+        .skip(filter.offset)
+        .take(filter.limit)
+        .collect())
+}
+
+fn normalize_search_date(value: Option<&str>) -> Result<Option<String>> {
+    value
+        .map(|value| {
+            let date = chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").map_err(|_| {
+                YacliError::Validation("Дата поиска должна иметь формат ГГГГ-ММ-ДД".into())
+            })?;
+            Ok(date.format("%d-%b-%Y").to_string())
+        })
+        .transpose()
+}
+
+fn validate_mail_search_range(since: Option<&str>, before: Option<&str>) -> Result<()> {
+    if let (Some(since), Some(before)) = (since, before)
+        && parse_imap_search_date(since)? >= parse_imap_search_date(before)?
+    {
+        return Err(YacliError::Validation(
+            "Дата since должна предшествовать before; before не включается в период".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn parse_imap_search_date(value: &str) -> Result<chrono::NaiveDate> {
+    chrono::NaiveDate::parse_from_str(value, "%d-%b-%Y")
+        .map_err(|_| YacliError::Validation("Некорректная дата поиска IMAP".into()))
+}
+
+fn validate_mail_page_offset(offset: usize) -> Result<()> {
+    if offset > 1_000_000 {
+        return Err(YacliError::Validation(
+            "mail page offset must not exceed 1000000".into(),
+        ));
+    }
+    Ok(())
 }
 
 pub fn read_mail_message(
@@ -549,7 +1854,7 @@ pub fn read_mail_message(
         )));
     }
 
-    let raw_message = session.fetch_message_rfc822(uid)?;
+    let raw_message = session.fetch_message_rfc822_limited(uid, max_bytes)?;
     let message = build_read_message(metadata, &headers, &raw_message)?;
     let _ = session.logout();
     Ok(message)
@@ -729,6 +2034,93 @@ pub fn export_mail_attachment(
     export_attachment_from_message(&message, &selector, &output, force)
 }
 
+pub fn review_mail_eml_export(
+    imap_host: &str,
+    imap_port: u16,
+    auth: MailSessionAuth,
+    mailbox_name: &str,
+    uid: u64,
+    max_bytes: u64,
+) -> Result<MailEmlExportReview> {
+    validate_mail_eml_export(uid, max_bytes)?;
+    let mut session = open_authenticated_session(imap_host, imap_port, auth)?;
+    session.select_mailbox(&encode_modified_utf7(mailbox_name))?;
+    let contents = session.fetch_message_rfc822_limited(uid, max_bytes)?;
+    let _ = session.logout();
+    Ok(mail_eml_export_review(uid, max_bytes, &contents))
+}
+
+pub fn export_mail_eml(
+    imap_host: &str,
+    imap_port: u16,
+    auth: MailSessionAuth,
+    mailbox_name: &str,
+    request: MailEmlExportRequest,
+) -> Result<ExportedMailEml> {
+    validate_mail_eml_export(request.uid, request.max_bytes)?;
+    validate_mail_eml_output_path(&request.output)?;
+    let mut session = open_authenticated_session(imap_host, imap_port, auth)?;
+    session.select_mailbox(&encode_modified_utf7(mailbox_name))?;
+    let contents = session.fetch_message_rfc822_limited(request.uid, request.max_bytes)?;
+    let _ = session.logout();
+    let preview = mail_eml_export_review(request.uid, request.max_bytes, &contents);
+    if request
+        .expected_sha256
+        .as_deref()
+        .is_some_and(|expected| expected != preview.sha256)
+    {
+        return Err(YacliError::Auth(
+            "Содержимое письма изменилось после предварительной проверки; повторите review.".into(),
+        ));
+    }
+    let written = write_attachment_to_path(&contents, &request.output, request.force)?;
+    Ok(ExportedMailEml {
+        message_uid: request.uid,
+        output_path: written.output_path,
+        bytes_written: written.bytes_written,
+        sha256: written.sha256,
+    })
+}
+
+pub fn validate_mail_eml_output_path(output: &Path) -> Result<()> {
+    if !output
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("eml"))
+    {
+        return Err(YacliError::Validation(
+            "Путь для экспорта письма должен иметь расширение .eml".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_mail_eml_export(uid: u64, max_bytes: u64) -> Result<()> {
+    if uid == 0 {
+        return Err(YacliError::Validation(
+            "mail eml export uid must be greater than zero".into(),
+        ));
+    }
+    if max_bytes == 0 || max_bytes > SMTP_SAFE_MESSAGE_BYTES as u64 {
+        return Err(YacliError::Validation(format!(
+            "mail eml export max_bytes must be between 1 and {}",
+            SMTP_SAFE_MESSAGE_BYTES
+        )));
+    }
+    Ok(())
+}
+
+fn mail_eml_export_review(uid: u64, max_bytes: u64, contents: &[u8]) -> MailEmlExportReview {
+    let mut hasher = Sha256::new();
+    hasher.update(contents);
+    MailEmlExportReview {
+        message_uid: uid,
+        max_bytes,
+        sha256: format!("{:x}", hasher.finalize()),
+        bytes: contents.len() as u64,
+    }
+}
+
 pub fn inspect_mail_invite(
     imap_host: &str,
     imap_port: u16,
@@ -762,49 +2154,122 @@ pub fn reply_to_mail_message(
     mailbox_name: &str,
     request: MailReplyRequest,
 ) -> Result<RepliedMail> {
+    reply_to_mail_message_with_attachments(
+        imap_host,
+        imap_port,
+        smtp_host,
+        smtp_port,
+        auth,
+        mailbox_name,
+        request,
+        Vec::new(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn reply_to_mail_message_with_attachments(
+    imap_host: &str,
+    imap_port: u16,
+    smtp_host: &str,
+    smtp_port: u16,
+    auth: MailSessionAuth,
+    mailbox_name: &str,
+    request: MailReplyRequest,
+    attachments: Vec<MailAttachmentPayload>,
+) -> Result<RepliedMail> {
     if request.uid == 0 {
         return Err(YacliError::Validation(
             "mail reply <id> must be greater than zero".to_string(),
         ));
     }
 
-    let normalized_body = normalize_outgoing_body(request.text, request.html, "mail reply")?;
+    let original_uid = request.uid;
+    let (target, mut submission) =
+        build_mail_reply_submission(imap_host, imap_port, &auth, mailbox_name, request)?;
+    submission.attachments.extend(attachments);
+    let sent = send_mail_message_with_sent_copy(
+        smtp_host, smtp_port, imap_host, imap_port, auth, submission,
+    )?;
 
+    Ok(RepliedMail {
+        original_uid,
+        recipient: target.recipient,
+        original_subject: target.subject,
+        original_message_id: target.message_id,
+        sent,
+    })
+}
+
+#[allow(dead_code)]
+pub fn review_mail_reply_submission(
+    imap_host: &str,
+    imap_port: u16,
+    auth: MailSessionAuth,
+    mailbox_name: &str,
+    request: MailReplyRequest,
+) -> Result<MailSendReview> {
+    review_mail_reply_submission_with_attachments(
+        imap_host,
+        imap_port,
+        auth,
+        mailbox_name,
+        request,
+        Vec::new(),
+    )
+}
+
+pub fn review_mail_reply_submission_with_attachments(
+    imap_host: &str,
+    imap_port: u16,
+    auth: MailSessionAuth,
+    mailbox_name: &str,
+    request: MailReplyRequest,
+    attachments: Vec<MailAttachmentPayload>,
+) -> Result<MailSendReview> {
+    let (_, mut submission) =
+        build_mail_reply_submission(imap_host, imap_port, &auth, mailbox_name, request)?;
+    submission.attachments.extend(attachments);
+    review_mail_submission(auth, submission)
+}
+
+fn build_mail_reply_submission(
+    imap_host: &str,
+    imap_port: u16,
+    auth: &MailSessionAuth,
+    mailbox_name: &str,
+    request: MailReplyRequest,
+) -> Result<(MailReplyTarget, MailSendRequest)> {
+    validate_mail_uid(request.uid)?;
+    let normalized_body = normalize_outgoing_body(request.text, request.html, "mail reply")?;
     let target = fetch_reply_target(
         imap_host,
         imap_port,
         auth.clone(),
         mailbox_name,
         request.uid,
+        &request.account_email,
     )?;
-    let sent = send_mail_message_with_sent_copy(
-        smtp_host,
-        smtp_port,
-        imap_host,
-        imap_port,
-        auth,
-        MailSendRequest {
-            to: vec![target.recipient.clone()],
-            cc: request.cc,
-            bcc: Vec::new(),
-            subject: normalize_reply_subject(&target.subject),
-            text: normalized_body.text,
-            html: normalized_body.html,
-            attachments: Vec::new(),
-            thread_headers: Some(MailThreadHeaders {
-                in_reply_to: target.message_id.clone(),
-                references: target.references.clone(),
-            }),
-        },
-    )?;
-
-    Ok(RepliedMail {
-        original_uid: request.uid,
-        recipient: target.recipient,
-        original_subject: target.subject,
-        original_message_id: target.message_id,
-        sent,
-    })
+    let mut cc = if request.reply_all {
+        target.reply_all_cc.clone()
+    } else {
+        Vec::new()
+    };
+    cc.extend(request.cc);
+    let cc = dedupe_email_addresses(cc, std::slice::from_ref(&target.recipient));
+    let submission = MailSendRequest {
+        to: vec![target.recipient.clone()],
+        cc,
+        bcc: Vec::new(),
+        subject: normalize_reply_subject(&target.subject),
+        text: normalized_body.text,
+        html: normalized_body.html,
+        attachments: Vec::new(),
+        thread_headers: Some(MailThreadHeaders {
+            in_reply_to: target.message_id.clone(),
+            references: target.references.clone(),
+        }),
+    };
+    Ok((target, submission))
 }
 
 pub fn forward_mail_message(
@@ -816,6 +2281,123 @@ pub fn forward_mail_message(
     mailbox_name: &str,
     request: MailForwardRequest,
 ) -> Result<ForwardedMail> {
+    forward_mail_message_with_attachments(
+        imap_host,
+        imap_port,
+        smtp_host,
+        smtp_port,
+        auth,
+        mailbox_name,
+        request,
+        Vec::new(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn forward_mail_message_with_attachments(
+    imap_host: &str,
+    imap_port: u16,
+    smtp_host: &str,
+    smtp_port: u16,
+    auth: MailSessionAuth,
+    mailbox_name: &str,
+    request: MailForwardRequest,
+    attachments: Vec<MailAttachmentPayload>,
+) -> Result<ForwardedMail> {
+    let (source, mut submission) =
+        build_mail_forward_submission(imap_host, imap_port, &auth, mailbox_name, request)?;
+    submission.attachments.extend(attachments);
+    send_forwarded_mail_message(
+        imap_host, imap_port, smtp_host, smtp_port, auth, source, submission,
+    )
+}
+
+#[allow(dead_code)]
+pub fn review_mail_forward_submission(
+    imap_host: &str,
+    imap_port: u16,
+    auth: MailSessionAuth,
+    mailbox_name: &str,
+    request: MailForwardRequest,
+) -> Result<(MailSendReview, String)> {
+    review_mail_forward_submission_with_attachments(
+        imap_host,
+        imap_port,
+        auth,
+        mailbox_name,
+        request,
+        Vec::new(),
+    )
+}
+
+pub fn review_mail_forward_submission_with_attachments(
+    imap_host: &str,
+    imap_port: u16,
+    auth: MailSessionAuth,
+    mailbox_name: &str,
+    request: MailForwardRequest,
+    attachments: Vec<MailAttachmentPayload>,
+) -> Result<(MailSendReview, String)> {
+    let (source, mut submission) =
+        build_mail_forward_submission(imap_host, imap_port, &auth, mailbox_name, request)?;
+    submission.attachments.extend(attachments);
+    let source_digest = mail_forward_source_digest(&source);
+    Ok((review_mail_submission(auth, submission)?, source_digest))
+}
+
+#[allow(dead_code)]
+pub fn forward_mail_message_reviewed(
+    imap_host: &str,
+    imap_port: u16,
+    smtp_host: &str,
+    smtp_port: u16,
+    auth: MailSessionAuth,
+    mailbox_name: &str,
+    binding: MailForwardReviewBinding,
+) -> Result<ForwardedMail> {
+    forward_mail_message_reviewed_with_attachments(
+        imap_host,
+        imap_port,
+        smtp_host,
+        smtp_port,
+        auth,
+        mailbox_name,
+        binding,
+        Vec::new(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn forward_mail_message_reviewed_with_attachments(
+    imap_host: &str,
+    imap_port: u16,
+    smtp_host: &str,
+    smtp_port: u16,
+    auth: MailSessionAuth,
+    mailbox_name: &str,
+    binding: MailForwardReviewBinding,
+    attachments: Vec<MailAttachmentPayload>,
+) -> Result<ForwardedMail> {
+    let (source, mut submission) =
+        build_mail_forward_submission(imap_host, imap_port, &auth, mailbox_name, binding.request)?;
+    submission.attachments.extend(attachments);
+    if mail_forward_source_digest(&source) != binding.source_sha256 {
+        return Err(YacliError::Auth(
+            "Исходное письмо изменилось после предварительной проверки; повторите review перед отправкой.".into(),
+        ));
+    }
+    send_forwarded_mail_message(
+        imap_host, imap_port, smtp_host, smtp_port, auth, source, submission,
+    )
+}
+
+fn build_mail_forward_submission(
+    imap_host: &str,
+    imap_port: u16,
+    auth: &MailSessionAuth,
+    mailbox_name: &str,
+    request: MailForwardRequest,
+) -> Result<(MailMessage, MailSendRequest)> {
     if request.uid == 0 {
         return Err(YacliError::Validation(
             "mail forward <id> must be greater than zero".to_string(),
@@ -836,26 +2418,34 @@ pub fn forward_mail_message(
         normalized.intro_text.as_deref(),
         normalized.intro_html.as_deref(),
     );
+    let submission = MailSendRequest {
+        to: normalized.to,
+        cc: normalized.cc,
+        bcc: normalized.bcc,
+        subject: normalize_forward_subject(source.subject.as_deref()),
+        text: Some(body.text),
+        html: body.html,
+        attachments: source
+            .raw_attachments
+            .iter()
+            .map(MailAttachmentPart::payload)
+            .collect(),
+        thread_headers: None,
+    };
+    Ok((source, submission))
+}
+
+fn send_forwarded_mail_message(
+    imap_host: &str,
+    imap_port: u16,
+    smtp_host: &str,
+    smtp_port: u16,
+    auth: MailSessionAuth,
+    source: MailMessage,
+    submission: MailSendRequest,
+) -> Result<ForwardedMail> {
     let sent = send_mail_message_with_sent_copy(
-        smtp_host,
-        smtp_port,
-        imap_host,
-        imap_port,
-        auth,
-        MailSendRequest {
-            to: normalized.to,
-            cc: normalized.cc,
-            bcc: normalized.bcc,
-            subject: normalize_forward_subject(source.subject.as_deref()),
-            text: Some(body.text),
-            html: body.html,
-            attachments: source
-                .raw_attachments
-                .iter()
-                .map(MailAttachmentPart::payload)
-                .collect(),
-            thread_headers: None,
-        },
+        smtp_host, smtp_port, imap_host, imap_port, auth, submission,
     )?;
 
     Ok(ForwardedMail {
@@ -865,6 +2455,39 @@ pub fn forward_mail_message(
         attachments: source.attachments,
         sent,
     })
+}
+
+fn mail_forward_source_digest(source: &MailMessage) -> String {
+    let mut digest = Sha256::new();
+    let mut add = |bytes: &[u8]| {
+        digest.update((bytes.len() as u64).to_be_bytes());
+        digest.update(bytes);
+    };
+    add(&source.uid.to_be_bytes());
+    add(source.message_id.as_deref().unwrap_or_default().as_bytes());
+    add(source.subject.as_deref().unwrap_or_default().as_bytes());
+    add(source.from.as_deref().unwrap_or_default().as_bytes());
+    add(source.to.as_deref().unwrap_or_default().as_bytes());
+    add(source.cc.as_deref().unwrap_or_default().as_bytes());
+    add(source.date.as_deref().unwrap_or_default().as_bytes());
+    add(source.text_body.as_deref().unwrap_or_default().as_bytes());
+    add(source.html_body.as_deref().unwrap_or_default().as_bytes());
+    for attachment in &source.raw_attachments {
+        add(attachment
+            .filename
+            .as_deref()
+            .unwrap_or_default()
+            .as_bytes());
+        add(attachment.mime_type.as_bytes());
+        add(attachment
+            .content_id
+            .as_deref()
+            .unwrap_or_default()
+            .as_bytes());
+        add(&[u8::from(attachment.inline)]);
+        add(&attachment.content);
+    }
+    format!("{:x}", digest.finalize())
 }
 
 fn open_authenticated_session(
@@ -892,17 +2515,26 @@ fn fetch_reply_target(
     auth: MailSessionAuth,
     mailbox_name: &str,
     uid: u64,
+    account_email: &str,
 ) -> Result<MailReplyTarget> {
     let mut session = open_authenticated_session(imap_host, imap_port, auth)?;
     let encoded_mailbox = encode_modified_utf7(mailbox_name);
     session.select_mailbox(&encoded_mailbox)?;
     let (_, headers) = session.fetch_message_headers(
         uid,
-        &["SUBJECT", "FROM", "REPLY-TO", "MESSAGE-ID", "REFERENCES"],
+        &[
+            "SUBJECT",
+            "FROM",
+            "REPLY-TO",
+            "TO",
+            "CC",
+            "MESSAGE-ID",
+            "REFERENCES",
+        ],
     )?;
     let _ = session.logout();
 
-    build_reply_target(&headers)
+    build_reply_target_for_account(&headers, Some(account_email))
 }
 
 #[derive(Debug)]
@@ -950,6 +2582,7 @@ struct PreparedMailSubmission {
 
 struct MailReplyTarget {
     recipient: String,
+    reply_all_cc: Vec<String>,
     subject: String,
     message_id: String,
     references: Vec<String>,
@@ -967,6 +2600,12 @@ struct SmtpResponse {
 struct ImapSession<S = native_tls::TlsStream<TcpStream>> {
     reader: BufReader<S>,
     next_tag: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ImapMailboxSelectStatus {
+    uid_validity: Option<u64>,
+    uid_next: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -1081,21 +2720,169 @@ impl<S: Read + Write> ImapSession<S> {
         Ok(folders)
     }
 
+    fn create_mailbox(&mut self, mailbox_name: &str) -> Result<()> {
+        let (_, tagged) =
+            self.run_command(&format!("CREATE {}", quote_imap_string(mailbox_name)))?;
+        parse_tagged_status(
+            &self.current_tag(),
+            &tagged,
+            "IMAP CREATE",
+            TaggedErrorKind::Api,
+        )
+    }
+
+    fn rename_mailbox(&mut self, current_name: &str, new_name: &str) -> Result<()> {
+        let (_, tagged) = self.run_command(&format!(
+            "RENAME {} {}",
+            quote_imap_string(current_name),
+            quote_imap_string(new_name)
+        ))?;
+        parse_tagged_status(
+            &self.current_tag(),
+            &tagged,
+            "IMAP RENAME",
+            TaggedErrorKind::Api,
+        )
+    }
+
+    fn delete_mailbox(&mut self, mailbox_name: &str) -> Result<()> {
+        let (_, tagged) =
+            self.run_command(&format!("DELETE {}", quote_imap_string(mailbox_name)))?;
+        parse_tagged_status(
+            &self.current_tag(),
+            &tagged,
+            "IMAP DELETE",
+            TaggedErrorKind::Api,
+        )
+    }
+
+    fn unselect_mailbox(&mut self) -> Result<()> {
+        let (_, tagged) = self.run_command("UNSELECT")?;
+        parse_tagged_status(
+            &self.current_tag(),
+            &tagged,
+            "IMAP UNSELECT",
+            TaggedErrorKind::Api,
+        )
+    }
+
+    fn uid_copy(&mut self, uid: u64, mailbox_name: &str) -> Result<()> {
+        let (_, tagged) = self.run_command(&format!(
+            "UID COPY {uid} {}",
+            quote_imap_string(mailbox_name)
+        ))?;
+        parse_tagged_status(
+            &self.current_tag(),
+            &tagged,
+            "IMAP UID COPY",
+            TaggedErrorKind::Api,
+        )
+    }
+
+    fn uid_copy_set(&mut self, uid_set: &str, mailbox_name: &str) -> Result<()> {
+        let (_, tagged) = self.run_command(&format!(
+            "UID COPY {uid_set} {}",
+            quote_imap_string(mailbox_name)
+        ))?;
+        parse_tagged_status(
+            &self.current_tag(),
+            &tagged,
+            "IMAP UID COPY",
+            TaggedErrorKind::Api,
+        )
+    }
+
+    fn uid_move(&mut self, uid: u64, mailbox_name: &str) -> Result<()> {
+        let (_, tagged) = self.run_command(&format!(
+            "UID MOVE {uid} {}",
+            quote_imap_string(mailbox_name)
+        ))?;
+        parse_tagged_status(
+            &self.current_tag(),
+            &tagged,
+            "IMAP UID MOVE",
+            TaggedErrorKind::Api,
+        )
+    }
+
+    fn uid_move_set(&mut self, uid_set: &str, mailbox_name: &str) -> Result<()> {
+        let (_, tagged) = self.run_command(&format!(
+            "UID MOVE {uid_set} {}",
+            quote_imap_string(mailbox_name)
+        ))?;
+        parse_tagged_status(
+            &self.current_tag(),
+            &tagged,
+            "IMAP UID MOVE",
+            TaggedErrorKind::Api,
+        )
+    }
+
+    fn uid_store_flag(&mut self, uid: u64, flag: &str, enabled: bool) -> Result<()> {
+        let command = format_uid_store_flag(uid, flag, enabled)?;
+        let (_, tagged) = self.run_command(&command)?;
+        parse_tagged_status(
+            &self.current_tag(),
+            &tagged,
+            "IMAP UID STORE",
+            TaggedErrorKind::Api,
+        )
+    }
+
+    fn uid_store_flags(&mut self, uid_set: &str, flag: &str, enabled: bool) -> Result<()> {
+        if !matches!(flag, "\\Seen" | "\\Flagged") {
+            return Err(YacliError::Validation("unsupported mail flag".into()));
+        }
+        let command = format!(
+            "UID STORE {uid_set} {}FLAGS.SILENT ({flag})",
+            if enabled { "+" } else { "-" }
+        );
+        let (_, tagged) = self.run_command(&command)?;
+        parse_tagged_status(
+            &self.current_tag(),
+            &tagged,
+            "IMAP UID STORE",
+            TaggedErrorKind::Api,
+        )
+    }
+
     fn select_mailbox(&mut self, mailbox_name: &str) -> Result<()> {
+        self.select_mailbox_with_status(mailbox_name).map(|_| ())
+    }
+
+    fn select_mailbox_with_status(
+        &mut self,
+        mailbox_name: &str,
+    ) -> Result<ImapMailboxSelectStatus> {
         let quoted_mailbox = quote_imap_string(mailbox_name);
-        let (_, tagged) = self.run_command(&format!("SELECT {quoted_mailbox}"))?;
+        let (lines, tagged) = self.run_command(&format!("SELECT {quoted_mailbox}"))?;
         parse_tagged_status(
             &self.current_tag(),
             &tagged,
             "IMAP SELECT",
             TaggedErrorKind::Api,
-        )
+        )?;
+        parse_imap_mailbox_select_status(&lines)
     }
 
     fn append_message(&mut self, mailbox_name: &str, message: &[u8]) -> Result<()> {
+        self.append_message_with_flags(mailbox_name, None, message)
+    }
+
+    fn append_draft(&mut self, mailbox_name: &str, message: &[u8]) -> Result<()> {
+        self.append_message_with_flags(mailbox_name, Some("\\Draft"), message)
+    }
+
+    fn append_message_with_flags(
+        &mut self,
+        mailbox_name: &str,
+        flags: Option<&str>,
+        message: &[u8],
+    ) -> Result<()> {
         let tag = self.next_tag();
+        let flag_clause = flags.map(|flags| format!(" ({flags})")).unwrap_or_default();
         self.write_line(&format!(
-            "{tag} APPEND {} {{{}}}",
+            "{tag} APPEND {}{flag_clause} {{{}}}",
             quote_imap_string(mailbox_name),
             message.len()
         ))?;
@@ -1122,13 +2909,37 @@ impl<S: Read + Write> ImapSession<S> {
         parse_search_uids(&lines)
     }
 
-    fn search_uids_by_text(&mut self, query: &str) -> Result<Vec<u64>> {
+    fn search_uids_after(&mut self, after_uid: u64) -> Result<Vec<u64>> {
+        let first_uid = after_uid.checked_add(1).ok_or_else(|| {
+            YacliError::Validation("UID checkpoint is outside the supported range".into())
+        })?;
+        let (lines, tagged) = self.run_command(&format!("UID SEARCH UID {first_uid}:*"))?;
+        parse_tagged_status(
+            &self.current_tag(),
+            &tagged,
+            "IMAP UID SEARCH",
+            TaggedErrorKind::Api,
+        )?;
+        parse_search_uids(&lines)
+    }
+
+    fn search_uids_by_text_and_dates(
+        &mut self,
+        query: &str,
+        since: Option<&str>,
+        before: Option<&str>,
+    ) -> Result<Vec<u64>> {
         let tag = self.next_tag();
         let literal = query.as_bytes();
-        self.write_line(&format!(
-            "{tag} UID SEARCH CHARSET UTF-8 TEXT {{{}}}",
-            literal.len()
-        ))?;
+        let mut criteria = vec!["CHARSET UTF-8".to_string()];
+        if let Some(since) = since {
+            criteria.push(format!("SINCE {since}"));
+        }
+        if let Some(before) = before {
+            criteria.push(format!("BEFORE {before}"));
+        }
+        criteria.push(format!("TEXT {{{}}}", literal.len()));
+        self.write_line(&format!("{tag} UID SEARCH {}", criteria.join(" ")))?;
 
         let continuation = self.read_line()?;
         if !continuation.starts_with('+') {
@@ -1226,7 +3037,7 @@ impl<S: Read + Write> ImapSession<S> {
         }
     }
 
-    fn fetch_message_rfc822(&mut self, uid: u64) -> Result<Vec<u8>> {
+    fn fetch_message_rfc822_limited(&mut self, uid: u64, max_bytes: u64) -> Result<Vec<u8>> {
         let tag = self.next_tag();
         self.write_line(&format!("{tag} UID FETCH {uid} (BODY.PEEK[])"))?;
 
@@ -1246,6 +3057,11 @@ impl<S: Read + Write> ImapSession<S> {
                         "missing RFC822 literal in IMAP FETCH response: {line}"
                     ))
                 })?;
+                if literal_len as u64 > max_bytes {
+                    return Err(YacliError::Validation(format!(
+                        "message size {literal_len} exceeds mail eml export limit {max_bytes}"
+                    )));
+                }
                 let mut literal = vec![0_u8; literal_len];
                 self.reader.read_exact(&mut literal)?;
                 let trailer = self.read_line()?;
@@ -1559,7 +3375,10 @@ fn starts_with_ascii_case(value: &str, prefix: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn build_reply_target(headers: &[u8]) -> Result<MailReplyTarget> {
+fn build_reply_target_for_account(
+    headers: &[u8],
+    account_email: Option<&str>,
+) -> Result<MailReplyTarget> {
     let (parsed, _) = mailparse::parse_headers(headers)
         .map_err(|err| YacliError::Serialization(format!("failed to parse mail headers: {err}")))?;
 
@@ -1569,6 +3388,22 @@ fn build_reply_target(headers: &[u8]) -> Result<MailReplyTarget> {
         YacliError::Serialization("reply target has no Reply-To or From header".to_string())
     })?;
     let recipient = extract_primary_recipient(&recipient_header)?;
+    if account_email.is_some_and(|email| email.eq_ignore_ascii_case(&recipient)) {
+        return Err(YacliError::Validation(
+            "Нельзя ответить на письмо, отправителем которого является этот же аккаунт".into(),
+        ));
+    }
+    let mut reply_all_addresses = Vec::new();
+    for header_name in ["To", "Cc"] {
+        if let Some(value) = parsed.get_first_value(header_name) {
+            reply_all_addresses.extend(parse_recipient_addresses(&value)?);
+        }
+    }
+    let mut excluded = vec![recipient.clone()];
+    if let Some(account_email) = account_email {
+        excluded.push(account_email.to_string());
+    }
+    let reply_all_cc = dedupe_email_addresses(reply_all_addresses, &excluded);
 
     let subject = parsed.get_first_value("Subject").unwrap_or_default();
     let message_id = parsed.get_first_value("Message-ID").ok_or_else(|| {
@@ -1579,6 +3414,7 @@ fn build_reply_target(headers: &[u8]) -> Result<MailReplyTarget> {
 
     Ok(MailReplyTarget {
         recipient,
+        reply_all_cc,
         subject,
         message_id,
         references,
@@ -1586,24 +3422,43 @@ fn build_reply_target(headers: &[u8]) -> Result<MailReplyTarget> {
 }
 
 fn extract_primary_recipient(header_value: &str) -> Result<String> {
+    parse_recipient_addresses(header_value)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            YacliError::Serialization(
+                "reply target header does not contain a usable recipient address".to_string(),
+            )
+        })
+}
+
+fn parse_recipient_addresses(header_value: &str) -> Result<Vec<String>> {
     let addresses = addrparse(header_value).map_err(|err| {
         YacliError::Serialization(format!("failed to parse reply recipient header: {err}"))
     })?;
-
+    let mut recipients = Vec::new();
     for address in addresses.iter() {
         match address {
-            MailAddr::Single(single) => return Ok(single.addr.clone()),
+            MailAddr::Single(single) => recipients.push(single.addr.clone()),
             MailAddr::Group(group) => {
-                if let Some(first) = group.addrs.first() {
-                    return Ok(first.addr.clone());
-                }
+                recipients.extend(group.addrs.iter().map(|single| single.addr.clone()))
             }
         }
     }
+    Ok(recipients)
+}
 
-    Err(YacliError::Serialization(
-        "reply target header does not contain a usable recipient address".to_string(),
-    ))
+fn dedupe_email_addresses(values: Vec<String>, excluded: &[String]) -> Vec<String> {
+    let excluded = excluded
+        .iter()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut seen = excluded;
+    values
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty() && seen.insert(value.to_ascii_lowercase()))
+        .collect()
 }
 
 fn normalize_references_header(references: Option<&str>, message_id: &str) -> Result<Vec<String>> {
@@ -2065,6 +3920,7 @@ fn build_message_summary(metadata: FetchMetadata, headers: &[u8]) -> Result<Mail
 
     Ok(MailMessageSummary {
         uid: metadata.uid,
+        uid_validity: None,
         subject,
         from,
         date,
@@ -2269,6 +4125,42 @@ fn extract_trailing_literal_len(line: &str) -> Result<Option<usize>> {
         ))
     })?;
     Ok(Some(value))
+}
+
+fn parse_imap_mailbox_select_status(lines: &[String]) -> Result<ImapMailboxSelectStatus> {
+    fn value(lines: &[String], key: &str) -> Result<Option<u64>> {
+        let marker = format!("[{key} ");
+        let mut found = None;
+        for line in lines {
+            let Some(start) = line.to_ascii_uppercase().find(&marker) else {
+                continue;
+            };
+            let value_start = start + marker.len();
+            let value_text = line[value_start..]
+                .split_once(']')
+                .map(|(value, _)| value)
+                .ok_or_else(|| {
+                    YacliError::Serialization(format!("malformed IMAP {key} response"))
+                })?;
+            let parsed = value_text
+                .parse::<u64>()
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| YacliError::Serialization(format!("invalid IMAP {key} response")))?;
+            if found.is_some_and(|previous| previous != parsed) {
+                return Err(YacliError::Serialization(format!(
+                    "conflicting IMAP {key} responses"
+                )));
+            }
+            found = Some(parsed);
+        }
+        Ok(found)
+    }
+
+    Ok(ImapMailboxSelectStatus {
+        uid_validity: value(lines, "UIDVALIDITY")?,
+        uid_next: value(lines, "UIDNEXT")?,
+    })
 }
 
 fn parse_list_line(line: &str) -> Result<MailFolder> {
@@ -3109,20 +5001,23 @@ struct ExportedBytes {
 mod tests {
     use super::{
         FetchMetadata, ImapSession, MailAttachmentExportRequest, MailAttachmentPart,
-        MailAttachmentPayload, MailAttachmentSelector, MailAttachmentSummary, MailMessage,
-        MailSendRequest, MailSessionAuth, MailSmtpAuth, MailThreadHeaders, OutgoingMessage,
-        SMTP_SAFE_MESSAGE_BYTES, SentMail, SmtpSession, build_forward_body, build_message_summary,
-        build_outgoing_message, build_read_message, build_reply_target, build_xoauth2_payload,
-        decode_modified_utf7, encode_modified_utf7, export_attachment_from_message,
-        extract_message_content, finish_sent_copy, inspect_invite_from_message,
+        MailAttachmentPayload, MailAttachmentSelector, MailAttachmentSummary, MailFlagUpdate,
+        MailFolder, MailMessage, MailMessageSummary, MailSendRequest, MailSessionAuth,
+        MailSmtpAuth, MailThreadHeaders, OutgoingMessage, SMTP_SAFE_MESSAGE_BYTES, SentMail,
+        SmtpSession, build_forward_body, build_message_summary, build_outgoing_message,
+        build_read_message, build_xoauth2_payload, decode_modified_utf7, encode_modified_utf7,
+        export_attachment_from_message, extract_message_content, finish_sent_copy,
+        format_mail_uid_set, format_uid_store_flag, inspect_invite_from_message,
         load_mail_attachments, normalize_forward_subject, normalize_reply_subject,
-        normalize_search_query, parse_fetch_metadata, parse_imap_token, parse_list_line,
-        parse_search_uids, prepare_mail_submission, quote_imap_string, review_mail_submission,
-        send_mail_message, validate_mail_attachment_export_request,
-        validate_mail_attachment_read_request,
+        normalize_search_date, normalize_search_query, parse_fetch_metadata, parse_imap_token,
+        parse_list_line, parse_search_uids, prepare_mail_submission, quote_imap_string,
+        review_mail_submission, send_mail_message, validate_folder_name,
+        validate_mail_attachment_export_request, validate_mail_attachment_read_request,
+        validate_mail_flag_update, validate_mail_page_offset, validate_mail_uid,
     };
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
+    use sha2::Digest;
     use std::io::{Cursor, Read, Result as IoResult, Write};
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
@@ -3285,6 +5180,426 @@ mod tests {
     }
 
     #[test]
+    fn folder_create_and_uid_copy_move_emit_quoted_commands() {
+        let mut create = ImapSession::from_stream(FakeStream::new("A0001 OK created\r\n"));
+        create.create_mailbox("Архив").unwrap();
+        assert!(
+            create
+                .reader
+                .get_ref()
+                .written()
+                .contains("A0001 CREATE \"Архив\"\r\n")
+        );
+
+        let mut copy = ImapSession::from_stream(FakeStream::new("A0001 OK copied\r\n"));
+        copy.uid_copy(42, "Folder \"A\"").unwrap();
+        assert!(
+            copy.reader
+                .get_ref()
+                .written()
+                .contains("A0001 UID COPY 42 \"Folder \\\"A\\\"\"\r\n")
+        );
+
+        let mut moved = ImapSession::from_stream(FakeStream::new("A0001 OK moved\r\n"));
+        moved.uid_move(7, "Archive").unwrap();
+        assert!(
+            moved
+                .reader
+                .get_ref()
+                .written()
+                .contains("A0001 UID MOVE 7 \"Archive\"\r\n")
+        );
+
+        let mut deleted = ImapSession::from_stream(FakeStream::new(
+            "A0001 OK unselected\r\nA0002 OK deleted\r\n",
+        ));
+        deleted.unselect_mailbox().unwrap();
+        deleted.delete_mailbox("Пользовательская папка").unwrap();
+        assert!(
+            deleted
+                .reader
+                .get_ref()
+                .written()
+                .contains("A0002 DELETE \"Пользовательская папка\"\r\n")
+        );
+    }
+
+    #[test]
+    fn folder_delete_protection_covers_special_use_and_common_names() {
+        for folder in [
+            MailFolder {
+                name: "INBOX".into(),
+                raw_name: "INBOX".into(),
+                delimiter: Some("/".into()),
+                attributes: vec![r"\Inbox".into()],
+            },
+            MailFolder {
+                name: "Корзина".into(),
+                raw_name: "Корзина".into(),
+                delimiter: Some("/".into()),
+                attributes: vec![],
+            },
+        ] {
+            assert!(super::is_protected_mail_folder(&folder));
+        }
+        let ordinary = MailFolder {
+            name: "Пользовательская".into(),
+            raw_name: "Пользовательская".into(),
+            delimiter: Some("/".into()),
+            attributes: vec![],
+        };
+        assert!(!super::is_protected_mail_folder(&ordinary));
+    }
+
+    #[test]
+    fn fetch_mail_eml_preserves_rfc822_bytes_and_enforces_limit_before_allocation() {
+        let stream =
+            FakeStream::new("* 7 FETCH (UID 42 BODY[] {4}\r\nDATA)\r\nA0001 OK fetched\r\n");
+        let mut session = ImapSession::from_stream(stream);
+        assert_eq!(
+            session.fetch_message_rfc822_limited(42, 4).unwrap(),
+            b"DATA"
+        );
+        assert!(
+            session
+                .reader
+                .get_ref()
+                .written()
+                .contains("A0001 UID FETCH 42 (BODY.PEEK[])\r\n")
+        );
+
+        let stream =
+            FakeStream::new("* 7 FETCH (UID 42 BODY[] {5}\r\nDATA!)\r\nA0001 OK fetched\r\n");
+        let mut session = ImapSession::from_stream(stream);
+        assert!(session.fetch_message_rfc822_limited(42, 4).is_err());
+        assert!(super::validate_mail_eml_export(0, 10).is_err());
+        assert!(super::validate_mail_eml_export(42, 0).is_err());
+        assert!(super::validate_mail_eml_output_path(std::path::Path::new("mail.txt")).is_err());
+        assert!(super::validate_mail_eml_output_path(std::path::Path::new("mail.EML")).is_ok());
+    }
+
+    #[test]
+    fn mailbox_checkpoint_reads_uid_validity_and_next_from_select() {
+        let stream = FakeStream::new(
+            "* 3 EXISTS\r\n* OK [UIDVALIDITY 93124] UIDs valid\r\n* OK [UIDNEXT 442] Predicted next UID\r\nA0001 OK [READ-WRITE] selected\r\n",
+        );
+        let mut session = ImapSession::from_stream(stream);
+        let status = session
+            .select_mailbox_with_status("Drafts")
+            .expect("select status");
+        assert_eq!(status.uid_validity, Some(93124));
+        assert_eq!(status.uid_next, Some(442));
+        assert!(
+            session
+                .reader
+                .get_ref()
+                .written()
+                .contains("A0001 SELECT \"Drafts\"\r\n")
+        );
+    }
+
+    #[test]
+    fn mailbox_checkpoint_parser_rejects_conflicting_or_invalid_values() {
+        assert!(
+            super::parse_imap_mailbox_select_status(&[
+                "* OK [UIDVALIDITY 1] valid".into(),
+                "* OK [UIDVALIDITY 2] valid".into(),
+            ])
+            .is_err()
+        );
+        assert!(
+            super::parse_imap_mailbox_select_status(&["* OK [UIDNEXT 0] invalid".into()]).is_err()
+        );
+    }
+
+    #[test]
+    fn rules_search_starts_after_the_committed_uid_cursor() {
+        let mut session = ImapSession::from_stream(FakeStream::new(
+            "* SEARCH 21 22 23\r\nA0001 OK searched\r\n",
+        ));
+        assert_eq!(session.search_uids_after(20).unwrap(), vec![21, 22, 23]);
+        assert!(
+            session
+                .reader
+                .get_ref()
+                .written()
+                .contains("A0001 UID SEARCH UID 21:*\r\n")
+        );
+        assert!(session.search_uids_after(u64::MAX).is_err());
+    }
+
+    #[test]
+    fn stale_uid_validity_is_rejected_before_message_mutation() {
+        let mut session = ImapSession::from_stream(FakeStream::new(
+            "* OK [UIDVALIDITY 22] UIDs valid\r\n* OK [UIDNEXT 11] Predicted next UID\r\nA0001 OK [READ-WRITE] selected\r\n",
+        ));
+        let result = super::select_mailbox_with_expected_uid_validity(&mut session, "Inbox", 21);
+        assert!(result.is_err());
+        let commands = session.reader.get_ref().written();
+        assert!(commands.contains("A0001 SELECT \"Inbox\"\r\n"));
+        assert!(!commands.contains("UID MOVE"));
+        assert!(!commands.contains("UID COPY"));
+        assert!(!commands.contains("UID STORE"));
+    }
+
+    #[test]
+    fn moving_draft_to_trash_checks_uid_epoch_and_never_expunges() {
+        let stream = FakeStream::new(
+            "* LIST (\\Drafts) \"/\" \"Drafts\"\r\n* LIST (\\Trash) \"/\" \"Trash\"\r\nA0001 OK listed\r\n* OK [UIDVALIDITY 30] valid\r\n* OK [UIDNEXT 16] next\r\nA0002 OK selected\r\n* SEARCH 15\r\nA0003 OK searched\r\nA0004 OK moved\r\n",
+        );
+        let mut session = ImapSession::from_stream(stream);
+        let result = super::move_mail_draft_to_trash_session(&mut session, 15, 30)
+            .expect("move test draft to Trash");
+        assert_eq!(result.draft_folder, "Drafts");
+        assert_eq!(result.trash_folder, "Trash");
+        let commands = session.reader.get_ref().written();
+        assert!(commands.contains("A0004 UID MOVE 15 \"Trash\"\r\n"));
+        assert!(!commands.contains("EXPUNGE"));
+    }
+
+    #[test]
+    fn draft_update_rejects_changed_source_before_append() {
+        let stream = FakeStream::new(
+            "* OK [UIDVALIDITY 30] valid\r\n* OK [UIDNEXT 16] next\r\nA0001 OK [READ-WRITE] selected\r\n* SEARCH 15\r\nA0002 OK searched\r\n* 1 FETCH (UID 15 BODY[] {4}\r\nDATA)\r\nA0003 OK fetched\r\n",
+        );
+        let mut session = ImapSession::from_stream(stream);
+        let result = super::update_mail_draft_session(
+            &mut session,
+            super::MailDraftUpdatePlan {
+                uid: 15,
+                uid_validity: 30,
+                expected_source_sha256: &"0".repeat(64),
+                draft_folder: "Drafts",
+                trash_folder: "Trash",
+                replacement_message: "To: test@example.invalid\r\n\r\nreplacement",
+                replacement_message_id: "<replacement@example.invalid>",
+            },
+        );
+        assert!(result.is_err());
+        let commands = session.reader.get_ref().written();
+        assert!(commands.contains("UID FETCH 15 (BODY.PEEK[])"));
+        assert!(!commands.contains("APPEND"));
+        assert!(!commands.contains("UID MOVE"));
+    }
+
+    #[test]
+    fn draft_update_confirms_append_by_unique_message_id_after_negative_tagged_reply() {
+        let source = b"Subject: original\r\n\r\nsource";
+        let replacement =
+            b"Subject: replacement\r\nMessage-ID: <replacement@example.invalid>\r\n\r\nreplacement";
+        let replacement_headers = b"Message-ID: <replacement@example.invalid>\r\n\r\n";
+        let script = format!(
+            "* OK [UIDVALIDITY 30] valid\r\n* OK [UIDNEXT 16] next\r\nA0001 OK [READ-WRITE] selected\r\n* SEARCH 15\r\nA0002 OK searched\r\n* 1 FETCH (UID 15 BODY[] {{{}}}\r\n{} )\r\nA0003 OK fetched\r\n* OK [UIDVALIDITY 30] valid\r\n* OK [UIDNEXT 16] next\r\nA0004 OK [READ-WRITE] selected\r\n+ Ready for literal\r\nA0005 NO [TEMPFAIL] response failed after commit\r\n* OK [UIDVALIDITY 30] valid\r\n* OK [UIDNEXT 17] next\r\nA0006 OK [READ-WRITE] selected\r\n* SEARCH 16\r\nA0007 OK searched\r\n* 1 FETCH (UID 16 FLAGS (\\Draft) RFC822.SIZE {} BODY[HEADER.FIELDS (MESSAGE-ID)] {{{}}}\r\n{} )\r\nA0008 OK fetched\r\n* OK [UIDVALIDITY 30] valid\r\n* OK [UIDNEXT 17] next\r\nA0009 OK [READ-WRITE] selected\r\n* SEARCH 15 16\r\nA0010 OK searched\r\n* 1 FETCH (UID 15 BODY[] {{{}}}\r\n{} )\r\nA0011 OK fetched\r\nA0012 OK moved\r\n",
+            source.len(),
+            String::from_utf8_lossy(source),
+            replacement_headers.len(),
+            replacement_headers.len(),
+            String::from_utf8_lossy(replacement_headers),
+            source.len(),
+            String::from_utf8_lossy(source),
+        );
+        let mut session = ImapSession::from_stream(FakeStream::new(&script));
+        let source_sha256 = format!("{:x}", super::Sha256::digest(source));
+        let result = super::update_mail_draft_session(
+            &mut session,
+            super::MailDraftUpdatePlan {
+                uid: 15,
+                uid_validity: 30,
+                expected_source_sha256: &source_sha256,
+                draft_folder: "Drafts",
+                trash_folder: "Trash",
+                replacement_message: std::str::from_utf8(replacement).unwrap(),
+                replacement_message_id: "replacement@example.invalid",
+            },
+        )
+        .expect("подтверждённую замену проверяем до перемещения исходника");
+
+        assert!(result.old_moved_to_trash);
+        let commands = session.reader.get_ref().written();
+        assert!(commands.contains("A0007 UID SEARCH UID 16:*\r\n"));
+        assert!(commands.contains(
+            "A0008 UID FETCH 16 (UID FLAGS RFC822.SIZE BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])\r\n"
+        ));
+        assert!(commands.contains("A0012 UID MOVE 15 \"Trash\"\r\n"));
+        assert_eq!(commands.matches(" APPEND ").count(), 1);
+    }
+
+    #[test]
+    fn draft_update_keeps_source_when_append_message_id_does_not_match() {
+        let source = b"Subject: original\r\n\r\nsource";
+        let unrelated_headers = b"Message-ID: <other@example.invalid>\r\n\r\n";
+        let script = format!(
+            "* OK [UIDVALIDITY 30] valid\r\n* OK [UIDNEXT 16] next\r\nA0001 OK [READ-WRITE] selected\r\n* SEARCH 15\r\nA0002 OK searched\r\n* 1 FETCH (UID 15 BODY[] {{{}}}\r\n{} )\r\nA0003 OK fetched\r\n* OK [UIDVALIDITY 30] valid\r\n* OK [UIDNEXT 16] next\r\nA0004 OK [READ-WRITE] selected\r\n+ Ready for literal\r\nA0005 NO [TEMPFAIL] append rejected\r\n* OK [UIDVALIDITY 30] valid\r\n* OK [UIDNEXT 17] next\r\nA0006 OK [READ-WRITE] selected\r\n* SEARCH 16\r\nA0007 OK searched\r\n* 1 FETCH (UID 16 FLAGS (\\Draft) RFC822.SIZE {} BODY[HEADER.FIELDS (MESSAGE-ID)] {{{}}}\r\n{} )\r\nA0008 OK fetched\r\n",
+            source.len(),
+            String::from_utf8_lossy(source),
+            unrelated_headers.len(),
+            unrelated_headers.len(),
+            String::from_utf8_lossy(unrelated_headers),
+        );
+        let mut session = ImapSession::from_stream(FakeStream::new(&script));
+        let source_sha256 = format!("{:x}", super::Sha256::digest(source));
+        let result = super::update_mail_draft_session(
+            &mut session,
+            super::MailDraftUpdatePlan {
+                uid: 15,
+                uid_validity: 30,
+                expected_source_sha256: &source_sha256,
+                draft_folder: "Drafts",
+                trash_folder: "Trash",
+                replacement_message: "Subject: replacement\r\nMessage-ID: <replacement@example.invalid>\r\n\r\nreplacement",
+                replacement_message_id: "replacement@example.invalid",
+            },
+        );
+
+        assert!(result.is_err());
+        let commands = session.reader.get_ref().written();
+        assert!(commands.contains("UID SEARCH UID 16:*\r\n"));
+        assert!(commands.contains(
+            "UID FETCH 16 (UID FLAGS RFC822.SIZE BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])"
+        ));
+        assert!(!commands.contains("UID MOVE"));
+        assert_eq!(commands.matches(" APPEND ").count(), 1);
+    }
+
+    #[test]
+    fn message_summaries_carry_uid_validity_when_available() {
+        let summary = MailMessageSummary {
+            uid: 12,
+            uid_validity: Some(345),
+            subject: Some("Тест".into()),
+            from: None,
+            date: None,
+            flags: Vec::new(),
+            size: Some(64),
+        };
+        let value = serde_json::to_value(summary).expect("summary JSON");
+        assert_eq!(value["uid"], 12);
+        assert_eq!(value["uid_validity"], 345);
+    }
+
+    #[test]
+    fn folder_rename_quotes_names_and_rejects_identity() {
+        let mut renamed = ImapSession::from_stream(FakeStream::new("A0001 OK renamed\r\n"));
+        renamed.rename_mailbox("Старое", "Новое \"имя\"").unwrap();
+        assert!(
+            renamed
+                .reader
+                .get_ref()
+                .written()
+                .contains("A0001 RENAME \"Старое\" \"Новое \\\"имя\\\"\"\r\n")
+        );
+        assert!(super::validate_mail_folder_rename(" Same ", "Same").is_err());
+    }
+
+    #[test]
+    fn special_mail_folder_selection_requires_server_attribute() {
+        let folders = vec![
+            MailFolder {
+                name: "Корзина".into(),
+                raw_name: "Trash".into(),
+                delimiter: Some("/".into()),
+                attributes: vec!["\\Trash".into()],
+            },
+            MailFolder {
+                name: "Спам".into(),
+                raw_name: "Spam".into(),
+                delimiter: Some("/".into()),
+                attributes: vec!["\\Spam".into()],
+            },
+        ];
+        assert_eq!(
+            super::find_special_mail_folder(&folders, "\\Trash")
+                .unwrap()
+                .raw_name,
+            "Trash"
+        );
+        assert_eq!(
+            super::find_special_mail_folder(&folders, "\\Junk")
+                .unwrap()
+                .raw_name,
+            "Spam"
+        );
+        assert!(super::find_special_mail_folder(&folders, "\\Drafts").is_err());
+    }
+
+    #[test]
+    fn bulk_uid_set_is_bounded_unique_positive_and_sorted() {
+        assert_eq!(format_mail_uid_set(&[9, 2, 5]).unwrap(), "2,5,9");
+        assert!(format_mail_uid_set(&[]).is_err());
+        assert!(format_mail_uid_set(&[1, 1]).is_err());
+        assert!(format_mail_uid_set(&[0]).is_err());
+        assert!(format_mail_uid_set(&(1..=51).collect::<Vec<_>>()).is_err());
+    }
+
+    #[test]
+    fn bulk_uid_commands_use_uid_sets_and_safe_flags() {
+        let fake = FakeStream::new("A0001 OK selected\r\nA0002 OK moved\r\nA0003 OK stored\r\n");
+        let mut session = ImapSession::from_stream(fake);
+        session.select_mailbox("Inbox").unwrap();
+        session.uid_move_set("2,5,9", "Archive").unwrap();
+        session.uid_store_flags("2,5,9", "\\Seen", true).unwrap();
+        let written = session.reader.get_ref().written();
+        assert!(written.contains("A0002 UID MOVE 2,5,9 \"Archive\"\r\n"));
+        assert!(written.contains("A0003 UID STORE 2,5,9 +FLAGS.SILENT (\\Seen)\r\n"));
+        assert!(session.uid_store_flags("2,5", "\\Deleted", true).is_err());
+    }
+
+    #[test]
+    fn imap_search_adds_date_filters_before_utf8_text_literal() {
+        let fake = FakeStream::new(
+            "+ send search literal\r\n* SEARCH 4 8\r\nA0001 OK search complete\r\n",
+        );
+        let mut session = ImapSession::from_stream(fake);
+        assert_eq!(
+            session
+                .search_uids_by_text_and_dates("invoice", Some("01-Nov-2026"), Some("05-Nov-2026"),)
+                .unwrap(),
+            [4, 8]
+        );
+        let written = session.reader.get_ref().written();
+        assert!(written.contains(
+            "A0001 UID SEARCH CHARSET UTF-8 SINCE 01-Nov-2026 BEFORE 05-Nov-2026 TEXT {7}\r\n"
+        ));
+        assert!(written.ends_with("invoice\r\n"));
+    }
+
+    #[test]
+    fn mail_folder_and_uid_validation_rejects_unsafe_values() {
+        assert!(validate_folder_name(" \t ").is_err());
+        assert!(validate_folder_name("folder\r\nUID STORE 1 +FLAGS (\\Deleted)").is_err());
+        assert!(validate_mail_uid(0).is_err());
+    }
+
+    #[test]
+    fn mail_pagination_offset_is_bounded() {
+        assert!(validate_mail_page_offset(0).is_ok());
+        assert!(validate_mail_page_offset(1_000_000).is_ok());
+        assert!(validate_mail_page_offset(1_000_001).is_err());
+    }
+
+    #[test]
+    fn mail_flag_commands_only_accept_supported_flags() {
+        assert_eq!(
+            format_uid_store_flag(42, "\\Seen", true).expect("set seen"),
+            "UID STORE 42 +FLAGS.SILENT (\\Seen)"
+        );
+        assert_eq!(
+            format_uid_store_flag(42, "\\Flagged", false).expect("clear flagged"),
+            "UID STORE 42 -FLAGS.SILENT (\\Flagged)"
+        );
+        assert!(format_uid_store_flag(42, "\\Deleted", true).is_err());
+        assert!(format_uid_store_flag(0, "\\Seen", true).is_err());
+        assert!(validate_mail_flag_update(MailFlagUpdate::default()).is_err());
+        assert!(
+            validate_mail_flag_update(MailFlagUpdate {
+                seen: Some(false),
+                flagged: None,
+            })
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn decode_modified_utf7_decodes_unicode_mailbox_names() {
         let utf16 = "Отправленные"
             .encode_utf16()
@@ -3374,6 +5689,19 @@ mod tests {
     }
 
     #[test]
+    fn imap_draft_append_sets_only_draft_flag() {
+        let fake = FakeStream::new("+ continue\r\nA0001 OK appended\r\n");
+        let observer = fake.clone();
+        let mut session = ImapSession::from_stream(fake);
+        session
+            .append_draft("Drafts", b"Subject: hello\r\n\r\nbody")
+            .expect("append draft");
+        let writes = observer.written();
+        assert!(writes.contains("A0001 APPEND \"Drafts\" (\\Draft) {22}\r\n"));
+        assert_eq!(writes.matches("APPEND ").count(), 1);
+    }
+
+    #[test]
     fn sent_copy_failure_is_reported_as_partial_delivery() {
         let sent = SentMail {
             from: "sender@example.test".to_string(),
@@ -3456,6 +5784,22 @@ mod tests {
     }
 
     #[test]
+    fn mail_search_dates_validate_calendar_values_and_exclusive_end() {
+        assert_eq!(
+            normalize_search_date(Some("2026-11-02")).unwrap(),
+            Some("02-Nov-2026".into())
+        );
+        assert!(normalize_search_date(Some("2026-02-30")).is_err());
+        assert!(normalize_search_date(Some("02-Nov-2026")).is_err());
+        assert!(
+            super::validate_mail_search_range(Some("03-Nov-2026"), Some("03-Nov-2026")).is_err()
+        );
+        assert!(
+            super::validate_mail_search_range(Some("02-Nov-2026"), Some("03-Nov-2026")).is_ok()
+        );
+    }
+
+    #[test]
     fn parse_search_uids_extracts_all_matches() {
         let lines = vec![
             "* SEARCH 42 99 1353".to_string(),
@@ -3495,12 +5839,17 @@ mod tests {
 
     #[test]
     fn build_reply_target_prefers_reply_to_and_extends_references() {
-        let target = build_reply_target(
-            b"Subject: Hello\r\nFrom: Sender <sender@example.com>\r\nReply-To: Reply <reply@example.com>\r\nMessage-ID: <msg-1@example>\r\nReferences: <root@example>\r\n\r\n",
+        let target = super::build_reply_target_for_account(
+            b"Subject: Hello\r\nFrom: Sender <sender@example.com>\r\nReply-To: Reply <reply@example.com>\r\nTo: Me <me@example.com>, Team <team@example.com>\r\nCc: Reply <reply@example.com>, Other <other@example.com>, Team <team@example.com>\r\nMessage-ID: <msg-1@example>\r\nReferences: <root@example>\r\n\r\n",
+            Some("me@example.com"),
         )
         .expect("reply target");
 
         assert_eq!(target.recipient, "reply@example.com");
+        assert_eq!(
+            target.reply_all_cc,
+            ["team@example.com", "other@example.com"]
+        );
         assert_eq!(target.subject, "Hello");
         assert_eq!(target.message_id, "<msg-1@example>");
         assert_eq!(
@@ -3555,6 +5904,40 @@ mod tests {
         assert!(html.contains("<strong>Forwarded message</strong>"));
         assert!(html.contains("Original <strong>body</strong>"));
         assert!(!html.contains("Attachments omitted"));
+    }
+
+    #[test]
+    fn forward_source_digest_changes_when_original_attachment_bytes_change() {
+        let mut message = MailMessage {
+            uid: 42,
+            subject: Some("Original".into()),
+            from: Some("sender@example.test".into()),
+            to: Some("first@example.test".into()),
+            cc: None,
+            date: Some("2026-11-24".into()),
+            message_id: Some("<original@example.test>".into()),
+            flags: Vec::new(),
+            size: Some(100),
+            text_body: Some("source body".into()),
+            html_body: None,
+            attachments: Vec::new(),
+            raw_attachments: vec![MailAttachmentPart {
+                filename: Some("report.pdf".into()),
+                mime_type: "application/pdf".into(),
+                content_id: None,
+                inline: false,
+                content: b"original bytes".to_vec(),
+            }],
+        };
+        let before = super::mail_forward_source_digest(&message);
+        message.raw_attachments[0].content = b"changed bytes".to_vec();
+        let changed_attachment = super::mail_forward_source_digest(&message);
+        assert_ne!(before, changed_attachment);
+        message.to = Some("second@example.test".into());
+        assert_ne!(
+            changed_attachment,
+            super::mail_forward_source_digest(&message)
+        );
     }
 
     #[test]

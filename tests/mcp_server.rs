@@ -235,8 +235,386 @@ caldav_base_url = "https://caldav.yandex.ru"
 enabled = true
 auth_mode = "oauth"
 rest_base_url = "https://cloud-api.yandex.net"
+
+[accounts.mock.contacts]
+enabled = true
+carddav_base_url = "https://carddav.yandex.ru"
+credential_ref = "store:contacts"
 "#,
     );
+}
+
+#[test]
+fn devcat_publishes_contacts_tools_only_with_explicit_read_capability() {
+    let temp = tempdir().expect("tempdir");
+    write_mock_mail_account(temp.path());
+    let input = [
+        initialize_request(false),
+        mcp_notification("notifications/initialized", json!({})),
+        mcp_request(2, "tools/list", json!({})),
+    ]
+    .concat();
+    let output = yacli()
+        .env("YACLI_CONFIG_DIR", temp.path())
+        .env("YACLI_DEVCAT_MODE", "1")
+        .env("YACLI_DEVCAT_ACCOUNT", "mock")
+        .env("YACLI_DEVCAT_CAPABILITIES", "mail.read,disk.read")
+        .args(["mcp"])
+        .write_stdin(input.clone())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let responses = parse_responses(&output);
+    let tools = responses[1]["result"]["tools"]
+        .as_array()
+        .expect("tool list");
+    assert!(tools.iter().all(|tool| {
+        !tool["name"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("yacli.contacts.")
+    }));
+    for name in [
+        "yacli.mail.rules.list",
+        "yacli.mail.rules.audit",
+        "yacli.mail.rules.preview",
+    ] {
+        assert!(tools.iter().any(|tool| tool["name"] == name), "{name}");
+    }
+    for name in [
+        "yacli.mail.rules.configure",
+        "yacli.mail.rules.run",
+        "yacli.mail.rules.undo",
+    ] {
+        assert!(!tools.iter().any(|tool| tool["name"] == name), "{name}");
+    }
+    assert!(
+        !tools
+            .iter()
+            .any(|tool| tool["name"] == "yacli.mail.folder.delete")
+    );
+
+    let output = yacli()
+        .env("YACLI_CONFIG_DIR", temp.path())
+        .env("YACLI_DEVCAT_MODE", "1")
+        .env("YACLI_DEVCAT_ACCOUNT", "mock")
+        .env("YACLI_DEVCAT_CAPABILITIES", "mail.read,mail.mutate")
+        .env("YACLI_DEVCAT_DISK_ROOTS", temp.path())
+        .args(["mcp"])
+        .write_stdin(input.clone())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let responses = parse_responses(&output);
+    let tools = responses[1]["result"]["tools"]
+        .as_array()
+        .expect("tool list with mutation capability");
+    for name in [
+        "yacli.mail.rules.configure",
+        "yacli.mail.rules.run",
+        "yacli.mail.rules.undo",
+    ] {
+        let tool = tools.iter().find(|tool| tool["name"] == name).expect(name);
+        assert_eq!(
+            tool["inputSchema"]["properties"]["dry_run"]["type"],
+            "boolean"
+        );
+        assert_eq!(
+            tool["inputSchema"]["properties"]["review_sha256"]["type"],
+            "string"
+        );
+    }
+
+    let output = yacli()
+        .env("YACLI_CONFIG_DIR", temp.path())
+        .env("YACLI_DEVCAT_MODE", "1")
+        .env("YACLI_DEVCAT_ACCOUNT", "mock")
+        .env("YACLI_DEVCAT_CAPABILITIES", "mail.delete")
+        .env("YACLI_DEVCAT_DISK_ROOTS", temp.path())
+        .args(["mcp"])
+        .write_stdin(
+            [
+                initialize_request(false),
+                mcp_notification("notifications/initialized", json!({})),
+                mcp_request(2, "tools/list", json!({})),
+            ]
+            .concat(),
+        )
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let responses = parse_responses(&output);
+    let tools = responses[1]["result"]["tools"].as_array().unwrap();
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool["name"] == "yacli.mail.folder.delete")
+    );
+    assert!(!tools.iter().any(|tool| tool["name"] == "yacli.mail.copy"));
+
+    let output = yacli()
+        .env("YACLI_CONFIG_DIR", temp.path())
+        .env("YACLI_DEVCAT_MODE", "1")
+        .env("YACLI_DEVCAT_ACCOUNT", "mock")
+        .env("YACLI_DEVCAT_CAPABILITIES", "contacts.read")
+        .args(["mcp"])
+        .write_stdin(input)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let responses = parse_responses(&output);
+    let tools = responses[1]["result"]["tools"]
+        .as_array()
+        .expect("tool list");
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool["name"] == "yacli.contacts.list")
+    );
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool["name"] == "yacli.contacts.search")
+    );
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool["name"] == "yacli.contacts.export")
+    );
+
+    let input = [
+        initialize_request(false),
+        mcp_notification("notifications/initialized", json!({})),
+        mcp_request(2, "tools/list", json!({})),
+        mcp_request(3, "tools/call", json!({
+            "name":"yacli.contacts.delete",
+            "arguments":{"account":"mock","href":"/addressbook/mock/person.vcf","etag":"\"v1\"","dry_run":true}
+        })),
+    ].concat();
+    let output = yacli()
+        .env("YACLI_CONFIG_DIR", temp.path())
+        .env("YACLI_DEVCAT_MODE", "1")
+        .env("YACLI_DEVCAT_ACCOUNT", "mock")
+        .env("YACLI_DEVCAT_CAPABILITIES", "contacts.read,contacts.write")
+        .args(["mcp"])
+        .write_stdin(input)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let responses = parse_responses(&output);
+    let tools = responses[1]["result"]["tools"].as_array().unwrap();
+    for name in [
+        "yacli.contacts.create",
+        "yacli.contacts.update",
+        "yacli.contacts.delete",
+    ] {
+        assert!(tools.iter().any(|tool| tool["name"] == name));
+        assert_eq!(
+            tools.iter().find(|tool| tool["name"] == name).unwrap()["inputSchema"]["properties"]["review_sha256"]
+                ["type"],
+            "string"
+        );
+    }
+    assert_eq!(responses[2]["result"]["structuredContent"]["dry_run"], true);
+    assert_eq!(
+        responses[2]["result"]["structuredContent"]["review_sha256"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
+
+    let vcard_path = temp.path().join("import.vcf");
+    fs::write(
+        &vcard_path,
+        "BEGIN:VCARD\nVERSION:3.0\nFN:Fixture\nEMAIL:fixture@example.test\nEND:VCARD\n",
+    )
+    .unwrap();
+    let input = [
+        initialize_request(false),
+        mcp_notification("notifications/initialized", json!({})),
+        mcp_request(2, "tools/list", json!({})),
+        mcp_request(3, "tools/call", json!({"name":"yacli.contacts.import","arguments":{"account":"mock","source_path":vcard_path,"dry_run":true}})),
+    ].concat();
+    let output = yacli()
+        .env("YACLI_CONFIG_DIR", temp.path())
+        .env("YACLI_DEVCAT_MODE", "1")
+        .env("YACLI_DEVCAT_ACCOUNT", "mock")
+        .env("YACLI_DEVCAT_CAPABILITIES", "contacts.write")
+        .env("YACLI_DEVCAT_UPLOAD_ROOTS", temp.path())
+        .args(["mcp"])
+        .write_stdin(input)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let responses = parse_responses(&output);
+    assert_eq!(responses[2]["result"]["structuredContent"]["dry_run"], true);
+    assert_eq!(responses[2]["result"]["structuredContent"]["count"], 1);
+}
+
+#[test]
+fn devcat_mail_rule_configure_preview_does_not_write_rule_file() {
+    let temp = tempdir().expect("tempdir");
+    write_mock_mail_account(temp.path());
+    let input = [
+        initialize_request(false),
+        mcp_notification("notifications/initialized", json!({})),
+        mcp_request(
+            2,
+            "tools/call",
+            json!({
+                "name":"yacli.mail.rules.configure",
+                "arguments":{
+                    "account":"mock",
+                    "operation":"add",
+                    "id":"triage",
+                    "from_contains":"alerts@example.test",
+                    "action":"mark_read",
+                    "dry_run":true
+                }
+            }),
+        ),
+    ]
+    .concat();
+    let output = yacli()
+        .env("YACLI_CONFIG_DIR", temp.path())
+        .env("YACLI_DEVCAT_MODE", "1")
+        .env("YACLI_DEVCAT_ACCOUNT", "mock")
+        .env("YACLI_DEVCAT_CAPABILITIES", "mail.mutate")
+        .env("YACLI_DEVCAT_DISK_ROOTS", temp.path())
+        .args(["mcp"])
+        .write_stdin(input)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let responses = parse_responses(&output);
+    assert_eq!(
+        responses[1]["result"]["structuredContent"]["status"],
+        "review_required"
+    );
+    assert!(responses[1]["result"]["structuredContent"]["review_sha256"].is_string());
+    assert!(!temp.path().join("mail-rules.toml").exists());
+}
+
+#[test]
+fn mail_rule_mcp_update_changes_action_value() {
+    let temp = tempdir().expect("tempdir");
+    write_mock_mail_account(temp.path());
+    fs::write(
+        temp.path().join("mail-rules.toml"),
+        r#"version = 1
+
+[[rules]]
+id = "triage"
+enabled = false
+account = "mock"
+mailbox = "INBOX"
+subject_contains = "alert"
+action = "mark_read"
+"#,
+    )
+    .expect("write rule config");
+    let input = [
+        initialize_request(false),
+        mcp_notification("notifications/initialized", json!({})),
+        mcp_request(
+            2,
+            "tools/call",
+            json!({
+                "name":"yacli.mail.rules.configure",
+                "arguments":{
+                    "account":"mock",
+                    "operation":"update",
+                    "id":"triage",
+                    "action":"star"
+                }
+            }),
+        ),
+    ]
+    .concat();
+    let output = yacli()
+        .env("YACLI_CONFIG_DIR", temp.path())
+        .args(["mcp"])
+        .write_stdin(input)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let responses = parse_responses(&output);
+    assert_eq!(
+        responses[1]["result"]["structuredContent"]["rule"]["action"],
+        "star"
+    );
+    assert!(
+        fs::read_to_string(temp.path().join("mail-rules.toml"))
+            .expect("updated rule config")
+            .contains("action = \"star\"")
+    );
+}
+
+#[test]
+fn devcat_mail_rule_undo_pending_returns_both_plan_and_mcp_review_digests() {
+    let temp = tempdir().expect("tempdir");
+    write_mock_mail_account(temp.path());
+    fs::write(
+        temp.path().join("mail-rules-audit.toml"),
+        format!(
+            "version = 1\n\n[[runs]]\nrun_id = \"run-1\"\nrule_id = \"triage\"\naccount = \"mock\"\nmailbox = \"INBOX\"\nuid_validity = 9\naction = \"mark_read\"\napplied_at_epoch_secs = 1\n\n[[runs.messages]]\nuid = 11\nwas_seen = false\nwas_flagged = false\nbecame_seen = true\nbecame_flagged = false\n\n[runs.undo_pending]\nreview_sha256 = \"{}\"\n\n[[runs.undo_pending.messages]]\nuid = 11\nexpected_seen = true\nrestore_seen = false\n",
+            "a".repeat(64)
+        ),
+    )
+    .expect("write pending audit");
+    let input = [
+        initialize_request(false),
+        mcp_notification("notifications/initialized", json!({})),
+        mcp_request(
+            2,
+            "tools/call",
+            json!({
+                "name":"yacli.mail.rules.undo",
+                "arguments":{
+                    "account":"mock",
+                    "run_id":"run-1",
+                    "dry_run":true
+                }
+            }),
+        ),
+    ]
+    .concat();
+    let output = yacli()
+        .env("YACLI_CONFIG_DIR", temp.path())
+        .env("YACLI_DEVCAT_MODE", "1")
+        .env("YACLI_DEVCAT_ACCOUNT", "mock")
+        .env("YACLI_DEVCAT_CAPABILITIES", "mail.mutate")
+        .env("YACLI_DEVCAT_DISK_ROOTS", temp.path())
+        .args(["mcp"])
+        .write_stdin(input)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let responses = parse_responses(&output);
+    let structured = &responses[1]["result"]["structuredContent"];
+    assert_eq!(structured["dry_run"], true);
+    assert_eq!(structured["plan_sha256"], "a".repeat(64));
+    assert!(structured["review_sha256"].is_string());
+    assert_ne!(structured["plan_sha256"], structured["review_sha256"]);
 }
 
 fn write_mock_calendar_account(config_dir: &std::path::Path, caldav_base_url: &str) {
@@ -826,12 +1204,147 @@ client_id = "client-123"
         .as_array()
         .expect("tools array");
     assert!(tools.iter().any(|tool| tool["name"] == "yacli.mail.send"));
+    assert!(tools.iter().any(|tool| tool["name"] == "yacli.mail.flags"));
+    assert!(tools.iter().any(|tool| tool["name"] == "yacli.mail.bulk"));
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool["name"] == "yacli.mail.special_folder")
+    );
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool["name"] == "yacli.mail.folder.rename")
+    );
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool["name"] == "yacli.mail.draft.create")
+    );
+    let draft_list = tools
+        .iter()
+        .find(|tool| tool["name"] == "yacli.mail.draft.list")
+        .expect("draft list tool");
+    assert_eq!(
+        draft_list["inputSchema"]["properties"]["limit"]["maximum"],
+        100
+    );
+    assert!(
+        draft_list["description"]
+            .as_str()
+            .unwrap()
+            .contains(r"\Drafts")
+    );
+    let draft_trash = tools
+        .iter()
+        .find(|tool| tool["name"] == "yacli.mail.draft.trash")
+        .expect("draft trash tool");
+    assert!(
+        draft_trash["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field == "uid_validity")
+    );
+    let draft_update = tools
+        .iter()
+        .find(|tool| tool["name"] == "yacli.mail.draft.update")
+        .expect("draft update tool");
+    assert!(
+        draft_update["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field == "uid_validity")
+    );
+    assert!(
+        draft_update["description"]
+            .as_str()
+            .unwrap()
+            .contains("SHA-256")
+    );
+    let mailbox_checkpoint = tools
+        .iter()
+        .find(|tool| tool["name"] == "yacli.mail.checkpoint")
+        .expect("mailbox checkpoint tool");
+    assert!(
+        mailbox_checkpoint["description"]
+            .as_str()
+            .unwrap()
+            .contains("UIDVALIDITY")
+    );
+    let mail_list = tools
+        .iter()
+        .find(|tool| tool["name"] == "yacli.mail.list")
+        .expect("mail list tool");
+    assert!(
+        mail_list["description"]
+            .as_str()
+            .unwrap()
+            .contains("UIDVALIDITY")
+    );
+    for name in [
+        "yacli.mail.copy",
+        "yacli.mail.move",
+        "yacli.mail.flags",
+        "yacli.mail.bulk",
+        "yacli.mail.special_folder",
+    ] {
+        let tool = tools.iter().find(|tool| tool["name"] == name).expect(name);
+        assert!(
+            tool["inputSchema"]["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|field| field == "uid_validity")
+        );
+    }
+    assert_eq!(
+        mail_list["inputSchema"]["properties"]["offset"]["minimum"],
+        0
+    );
+    assert_eq!(
+        mail_list["inputSchema"]["properties"]["offset"]["maximum"],
+        1_000_000
+    );
+    let mail_search = tools
+        .iter()
+        .find(|tool| tool["name"] == "yacli.mail.search")
+        .expect("mail search tool");
+    assert_eq!(
+        mail_search["inputSchema"]["properties"]["offset"]["minimum"],
+        0
+    );
+    assert_eq!(
+        mail_search["inputSchema"]["properties"]["all_folders"]["type"],
+        "boolean"
+    );
+    assert_eq!(
+        mail_search["inputSchema"]["properties"]["since"]["pattern"],
+        r"^\d{4}-\d{2}-\d{2}$"
+    );
+    assert_eq!(
+        mail_search["inputSchema"]["properties"]["before"]["pattern"],
+        r"^\d{4}-\d{2}-\d{2}$"
+    );
     assert!(
         tools
             .iter()
             .any(|tool| tool["name"] == "yacli.mail.send_link")
     );
     assert!(tools.iter().any(|tool| tool["name"] == "yacli.mail.reply"));
+    let mail_reply = tools
+        .iter()
+        .find(|tool| tool["name"] == "yacli.mail.reply")
+        .expect("mail reply tool");
+    assert_eq!(
+        mail_reply["inputSchema"]["properties"]["reply_all"]["type"],
+        "boolean"
+    );
+    assert_eq!(
+        mail_reply["inputSchema"]["properties"]["dry_run"]["type"],
+        "boolean"
+    );
     assert!(
         tools
             .iter()
@@ -2152,6 +2665,28 @@ client_id = "client-123"
         .expect("tools array");
     assert!(tools.iter().any(|tool| tool["name"] == "yacli.disk.mkdir"));
     assert!(tools.iter().any(|tool| tool["name"] == "yacli.disk.upload"));
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool["name"] == "yacli.disk.download")
+    );
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool["name"] == "yacli.disk.permissions")
+    );
+    for name in [
+        "yacli.disk.copy",
+        "yacli.disk.move",
+        "yacli.disk.trash.list",
+        "yacli.disk.trash.move",
+        "yacli.disk.trash.restore",
+    ] {
+        assert!(
+            tools.iter().any(|tool| tool["name"] == name),
+            "missing {name}"
+        );
+    }
     let disk_upload_tool = tools
         .iter()
         .find(|tool| tool["name"] == "yacli.disk.upload")

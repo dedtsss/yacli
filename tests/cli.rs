@@ -13,6 +13,68 @@ fn yacli() -> Command {
 }
 
 #[test]
+fn mail_rules_cli_stores_new_rules_disabled_and_supports_explicit_enablement() {
+    let temp = tempdir().expect("tempdir");
+    let added = yacli()
+        .env("YACLI_CONFIG_DIR", temp.path())
+        .args([
+            "mail",
+            "rules",
+            "add",
+            "--id",
+            "billing",
+            "--account",
+            "mock",
+            "--subject-contains",
+            "invoice",
+            "--action",
+            "mark-read",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value: Value = serde_json::from_slice(&added).expect("rule creation json");
+    assert_eq!(value["rule"]["enabled"], false);
+    assert!(temp.path().join("mail-rules.toml").exists());
+
+    yacli()
+        .env("YACLI_CONFIG_DIR", temp.path())
+        .args(["mail", "rules", "enable", "billing"])
+        .assert()
+        .success();
+    let rules = fs::read_to_string(temp.path().join("mail-rules.toml")).expect("rules file");
+    assert!(rules.contains("enabled = true"));
+    assert!(!temp.path().join("mail-rules-state.toml").exists());
+
+    yacli()
+        .env("YACLI_CONFIG_DIR", temp.path())
+        .args([
+            "mail",
+            "rules",
+            "update",
+            "billing",
+            "--from-contains",
+            "billing@example.test",
+            "--action",
+            "star",
+        ])
+        .assert()
+        .success();
+    let rules = fs::read_to_string(temp.path().join("mail-rules.toml")).expect("updated rules");
+    assert!(rules.contains("from_contains = \"billing@example.test\""));
+    assert!(rules.contains("action = \"star\""));
+
+    yacli()
+        .env("YACLI_CONFIG_DIR", temp.path())
+        .args(["mail", "rules", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("billing"));
+}
+
+#[test]
 fn devcat_oauth_uses_owned_client_and_read_only_scopes_without_local_tokens() {
     let temp = tempdir().expect("tempdir");
     write_accounts_file(
@@ -1401,6 +1463,7 @@ fn mail_reply_help_uses_positional_text() {
         .stdout(predicate::str::contains(
             "yacli mail reply [OPTIONS] <ID> [ТЕКСТ]",
         ))
+        .stdout(predicate::str::contains("--reply-all"))
         .stdout(predicate::str::contains("--text").not());
 }
 

@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::io::{self, IsTerminal, Write};
 
+use chrono::Utc;
 use serde::Serialize;
 use serde_json::json;
 
@@ -20,7 +21,8 @@ use crate::calendar::{
 use crate::cli::{
     AccountCommand, ActivityCommand, AuthCommand, AuthServiceArg, CalendarCommand, Cli, Command,
     DiskCommand, DiskPublicCommand, GuideTopicArg, MailAttachmentCommand, MailCommand,
-    MailInviteCommand, McpClientArg, McpCommand, McpTransportArg, OutputFormat, WorkflowCommand,
+    MailInviteCommand, MailRuleActionArg, MailRulesCommand, McpClientArg, McpCommand,
+    McpTransportArg, OutputFormat, WorkflowCommand,
 };
 use crate::credential_store::{CredentialStore, StoredAppPasswordCredential};
 use crate::disk::{
@@ -45,12 +47,13 @@ use crate::goal_router::goal_route_payload;
 use crate::home::home_payload;
 use crate::mail::{
     ExportedMailAttachment, ForwardedMail, InspectedMailInvite, MailAttachmentExportRequest,
-    MailAttachmentSelector, MailAttachmentSummary, MailFolder, MailForwardRequest,
+    MailAttachmentSelector, MailAttachmentSummary, MailFlagUpdate, MailFolder, MailForwardRequest,
     MailInviteInspectRequest, MailMessage, MailMessageSummary, MailReplyRequest, MailSendRequest,
     MailSendReview, RepliedMail, SentMail, export_mail_attachment, forward_mail_message,
-    inspect_mail_invite, list_mail_folders, list_mail_messages, load_mail_attachments,
-    read_mail_message, reply_to_mail_message, review_mail_submission, search_mail_messages,
-    send_mail_message_with_sent_copy,
+    inspect_mail_invite, list_mail_folders, list_mail_messages, list_mail_messages_after_uid,
+    list_mail_messages_by_uid, load_mail_attachments, mail_mailbox_checkpoint, read_mail_message,
+    reply_to_mail_message, review_mail_submission, search_mail_messages,
+    send_mail_message_with_sent_copy, update_mail_flags,
 };
 use crate::mail_invite_flow::{
     MailInviteCreateEventPartialFailure, invite_create_event_command,
@@ -62,6 +65,11 @@ use crate::mail_link::{
     review_mail_send_link, review_mail_send_published_link, send_link_via_mail_with_sent_copy,
     send_published_link_command, send_published_link_via_mail_with_sent_copy,
 };
+use crate::mail_rules::{
+    MailRule, MailRuleAction, MailRuleAuditMessage, MailRuleAuditRecord, MailRuleCheckpoint,
+    MailRulePreview, MailRuleUndoPreview, MailRulesAuditFile, MailRulesFile, MailRulesState,
+    PendingRuleAction,
+};
 use crate::mcp::install::execute_install;
 use crate::model::{AccountConfig, CalendarAuthMode, DiskAuthMode, MailAuthMode, NewAccountInput};
 use crate::next_actions::next_actions_payload;
@@ -70,6 +78,7 @@ use crate::oauth::{
 };
 use crate::oauth_session_store::{PendingOauthSession, PendingOauthSessionStore};
 use crate::output::RenderedOutput;
+use crate::paths::{mail_rules_audit_path, mail_rules_path, mail_rules_state_path};
 use crate::runtime_context::{
     auth_state, ensure_calendar_supports_app_password, resolve_calendar_private_context,
     resolve_disk_private_context, resolve_mail_private_context,
@@ -2881,6 +2890,7 @@ fn execute_mail(format: OutputFormat, action: MailCommand) -> Result<RenderedOut
             uid,
             body,
             cc,
+            reply_all,
             html,
         } => {
             let (resolved_account, auth, context) =
@@ -2894,6 +2904,8 @@ fn execute_mail(format: OutputFormat, action: MailCommand) -> Result<RenderedOut
                 &folder,
                 MailReplyRequest {
                     uid,
+                    account_email: context.email.clone(),
+                    reply_all,
                     cc,
                     text: body,
                     html,
@@ -2961,6 +2973,7 @@ fn execute_mail(format: OutputFormat, action: MailCommand) -> Result<RenderedOut
         }
         MailCommand::Attachment { action } => execute_mail_attachment(format, action),
         MailCommand::Invite { action } => execute_mail_invite(format, action),
+        MailCommand::Rules { action } => execute_mail_rules(format, action),
     }
 }
 
@@ -3011,6 +3024,920 @@ fn execute_mail_attachment(
             )
         }
     }
+}
+
+pub(crate) fn execute_mail_rules(
+    format: OutputFormat,
+    action: MailRulesCommand,
+) -> Result<RenderedOutput> {
+    match action {
+        MailRulesCommand::List => {
+            let rules = MailRulesFile::load(&mail_rules_path()?)?;
+            let state = MailRulesState::load(&mail_rules_state_path()?)?;
+            let items = rules
+                .rules
+                .iter()
+                .map(|rule| {
+                    json!({
+                        "rule": rule,
+                        "checkpoint": state.checkpoint(&rule.id),
+                    })
+                })
+                .collect::<Vec<_>>();
+            let table = render_mail_rules_table(&rules);
+            ok_output(
+                format,
+                "mail.rules.list",
+                json!({"items":items,"count":items.len()}),
+                table,
+            )
+        }
+        MailRulesCommand::Audit { limit } => {
+            if limit == 0 || limit > 1000 {
+                return Err(YacliError::Validation(
+                    "Лимит аудита должен быть от 1 до 1000 записей".into(),
+                ));
+            }
+            let audit = MailRulesAuditFile::load(&mail_rules_audit_path()?)?;
+            let runs = audit.runs.iter().rev().take(limit).collect::<Vec<_>>();
+            let items = runs
+                .iter()
+                .map(|run| {
+                    json!({
+                        "run_id":run.run_id,
+                        "rule_id":run.rule_id,
+                        "account":run.account,
+                        "mailbox":run.mailbox,
+                        "action":run.action,
+                        "message_count":run.messages.len(),
+                        "applied_at_epoch_secs":run.applied_at_epoch_secs,
+                        "undone_at_epoch_secs":run.undone_at_epoch_secs,
+                        "undo_pending":run.undo_pending.is_some()
+                    })
+                })
+                .collect::<Vec<_>>();
+            let count = items.len();
+            let table = render_mail_rules_audit_table(&runs);
+            ok_output(
+                format,
+                "mail.rules.audit",
+                json!({"items":items,"count":count}),
+                table,
+            )
+        }
+        MailRulesCommand::Add {
+            id,
+            account,
+            mailbox,
+            from_contains,
+            subject_contains,
+            action,
+        } => {
+            let path = mail_rules_path()?;
+            let mut rules = MailRulesFile::load(&path)?;
+            if rules.rules.iter().any(|rule| rule.id == id) {
+                return Err(YacliError::Validation(format!(
+                    "Правило {id} уже существует"
+                )));
+            }
+            let rule = MailRule {
+                id,
+                enabled: false,
+                account,
+                mailbox,
+                from_contains,
+                subject_contains,
+                action: mail_rule_action_from_arg(action),
+            };
+            rule.validate()?;
+            rules.rules.push(rule.clone());
+            rules.validate()?;
+            rules.save(&path)?;
+            ok_output(
+                format,
+                "mail.rules.add",
+                json!({"rule":rule,"enabled":false}),
+                render_key_value_table(&[
+                    ("rule.id", rule.id),
+                    ("account", rule.account),
+                    ("mailbox", rule.mailbox),
+                    ("enabled", "false".into()),
+                    ("state", "добавлено; правило выключено".into()),
+                ]),
+            )
+        }
+        MailRulesCommand::Update {
+            id,
+            account,
+            mailbox,
+            from_contains,
+            subject_contains,
+            clear_from,
+            clear_subject,
+            action,
+        } => {
+            if clear_from && from_contains.is_some() || clear_subject && subject_contains.is_some()
+            {
+                return Err(YacliError::Validation(
+                    "Нельзя одновременно задать и очистить одно условие".into(),
+                ));
+            }
+            if account.is_none()
+                && mailbox.is_none()
+                && from_contains.is_none()
+                && subject_contains.is_none()
+                && !clear_from
+                && !clear_subject
+                && action.is_none()
+            {
+                return Err(YacliError::Validation(
+                    "Укажите хотя бы одно поле правила для изменения".into(),
+                ));
+            }
+            let path = mail_rules_path()?;
+            let mut rules = MailRulesFile::load(&path)?;
+            let Some(rule) = rules.rules.iter_mut().find(|rule| rule.id == id) else {
+                return Err(YacliError::Validation(format!("Правило {id} не найдено")));
+            };
+            if let Some(account) = account {
+                rule.account = account;
+            }
+            if let Some(mailbox) = mailbox {
+                rule.mailbox = mailbox;
+            }
+            if clear_from {
+                rule.from_contains = None;
+            } else if let Some(from) = from_contains {
+                rule.from_contains = Some(from);
+            }
+            if clear_subject {
+                rule.subject_contains = None;
+            } else if let Some(subject) = subject_contains {
+                rule.subject_contains = Some(subject);
+            }
+            if let Some(action) = action {
+                rule.action = mail_rule_action_from_arg(action);
+            }
+            rule.validate()?;
+            let rule = rule.clone();
+            rules.save(&path)?;
+            ok_output(
+                format,
+                "mail.rules.update",
+                json!({"rule":rule}),
+                render_key_value_table(&[
+                    ("rule.id", rule.id),
+                    ("account", rule.account),
+                    ("mailbox", rule.mailbox),
+                    ("enabled", rule.enabled.to_string()),
+                    ("state", "обновлено".into()),
+                ]),
+            )
+        }
+        MailRulesCommand::Enable { id } => set_mail_rule_enabled(format, &id, true),
+        MailRulesCommand::Disable { id } => set_mail_rule_enabled(format, &id, false),
+        MailRulesCommand::Baseline { id } => mail_rule_baseline(format, &id),
+        MailRulesCommand::Reset { id } => {
+            let config = MailRulesFile::load(&mail_rules_path()?)?;
+            if !config.rules.iter().any(|rule| rule.id == id) {
+                return Err(YacliError::Validation(format!("Правило {id} не найдено")));
+            }
+            let path = mail_rules_state_path()?;
+            let mut state = MailRulesState::load(&path)?;
+            if state
+                .checkpoint(&id)
+                .is_some_and(|checkpoint| checkpoint.pending.is_some())
+            {
+                return Err(YacliError::Validation(
+                    "Нельзя сбросить контрольную точку с незавершённым действием".into(),
+                ));
+            }
+            state
+                .checkpoints
+                .retain(|checkpoint| checkpoint.rule_id != id);
+            state.save(&path)?;
+            ok_output(
+                format,
+                "mail.rules.reset",
+                json!({"rule_id":id,"status":"baseline_required"}),
+                render_key_value_table(&[
+                    ("rule.id", id),
+                    ("checkpoint", "сброшена".into()),
+                    ("next_run", "только новый baseline".into()),
+                ]),
+            )
+        }
+        MailRulesCommand::Delete { id } => {
+            let config_path = mail_rules_path()?;
+            let mut rules = MailRulesFile::load(&config_path)?;
+            let Some(index) = rules.rules.iter().position(|rule| rule.id == id) else {
+                return Err(YacliError::Validation(format!("Правило {id} не найдено")));
+            };
+            let mut state = MailRulesState::load(&mail_rules_state_path()?)?;
+            if state
+                .checkpoint(&id)
+                .is_some_and(|checkpoint| checkpoint.pending.is_some())
+            {
+                return Err(YacliError::Validation(
+                    "Нельзя удалить правило с незавершённым действием; сначала проверьте pending checkpoint".into(),
+                ));
+            }
+            let removed = rules.rules.remove(index);
+            rules.save(&config_path)?;
+            state
+                .checkpoints
+                .retain(|checkpoint| checkpoint.rule_id != id);
+            state.save(&mail_rules_state_path()?)?;
+            ok_output(
+                format,
+                "mail.rules.delete",
+                json!({"deleted":removed.id}),
+                render_key_value_table(&[("deleted.rule", removed.id)]),
+            )
+        }
+        MailRulesCommand::Run {
+            rule,
+            apply,
+            review_sha256,
+        } => {
+            if apply != review_sha256.is_some() {
+                return Err(YacliError::Validation(
+                    "Для --apply нужен --review-sha256 из точного preview; без --apply хеш не принимается".into(),
+                ));
+            }
+            execute_mail_rules_run(
+                format,
+                rule.as_deref(),
+                apply,
+                review_sha256.as_deref(),
+                false,
+            )
+        }
+        MailRulesCommand::Poll => execute_mail_rules_run(format, None, true, None, true),
+        MailRulesCommand::Undo {
+            run_id,
+            apply,
+            review_sha256,
+        } => {
+            if apply != review_sha256.is_some() {
+                return Err(YacliError::Validation(
+                    "Для --apply нужен --review-sha256 из точного preview отката".into(),
+                ));
+            }
+            execute_mail_rules_undo(format, &run_id, apply, review_sha256.as_deref())
+        }
+    }
+}
+
+fn set_mail_rule_enabled(format: OutputFormat, id: &str, enabled: bool) -> Result<RenderedOutput> {
+    let path = mail_rules_path()?;
+    let mut rules = MailRulesFile::load(&path)?;
+    let Some(rule) = rules.rules.iter_mut().find(|rule| rule.id == id) else {
+        return Err(YacliError::Validation(format!("Правило {id} не найдено")));
+    };
+    rule.enabled = enabled;
+    let rule = rule.clone();
+    rules.save(&path)?;
+    ok_output(
+        format,
+        if enabled {
+            "mail.rules.enable"
+        } else {
+            "mail.rules.disable"
+        },
+        json!({"rule":rule}),
+        render_key_value_table(&[("rule.id", rule.id), ("enabled", enabled.to_string())]),
+    )
+}
+
+fn mail_rule_baseline(format: OutputFormat, id: &str) -> Result<RenderedOutput> {
+    if crate::mcp::devcat::enabled() && !crate::mcp::devcat::has_capability("mail.mutate") {
+        return Err(YacliError::Auth(
+            "Создание контрольной точки требует явной возможности DevCat mail.mutate".into(),
+        ));
+    }
+    let rules = MailRulesFile::load(&mail_rules_path()?)?;
+    let rule = rules
+        .rules
+        .iter()
+        .find(|rule| rule.id == id)
+        .ok_or_else(|| YacliError::Validation(format!("Правило {id} не найдено")))?;
+    let (account, auth, context) = resolve_mail_private_context(Some(&rule.account))?;
+    if account != rule.account {
+        return Err(YacliError::Validation(
+            "Разрешённый аккаунт не совпал с точным alias правила".into(),
+        ));
+    }
+    let current =
+        mail_mailbox_checkpoint(&context.imap_host, context.imap_port, auth, &rule.mailbox)?;
+    let path = mail_rules_state_path()?;
+    let mut state = MailRulesState::load(&path)?;
+    if state
+        .checkpoint(id)
+        .is_some_and(|checkpoint| checkpoint.pending.is_some())
+    {
+        return Err(YacliError::Validation(
+            "Нельзя заменить контрольную точку с незавершённым действием".into(),
+        ));
+    }
+    state
+        .checkpoints
+        .retain(|checkpoint| checkpoint.rule_id != id);
+    let checkpoint = MailRuleCheckpoint {
+        rule_id: rule.id.clone(),
+        account: rule.account.clone(),
+        mailbox: rule.mailbox.clone(),
+        uid_validity: current.uid_validity,
+        cursor_uid: current.uid_next.saturating_sub(1),
+        pending: None,
+    };
+    state.checkpoints.push(checkpoint.clone());
+    state.save(&path)?;
+    ok_output(
+        format,
+        "mail.rules.baseline",
+        json!({"rule_id":id,"checkpoint":checkpoint,"status":"baseline_created"}),
+        render_key_value_table(&[
+            ("rule.id", id.to_string()),
+            ("uid_validity", checkpoint.uid_validity.to_string()),
+            ("cursor_uid", checkpoint.cursor_uid.to_string()),
+            (
+                "status",
+                "baseline создан; старые письма пропускаются".into(),
+            ),
+        ]),
+    )
+}
+
+fn mail_rule_action_from_arg(action: MailRuleActionArg) -> MailRuleAction {
+    match action {
+        MailRuleActionArg::MarkRead => MailRuleAction::MarkRead,
+        MailRuleActionArg::MarkUnread => MailRuleAction::MarkUnread,
+        MailRuleActionArg::Star => MailRuleAction::Star,
+        MailRuleActionArg::Unstar => MailRuleAction::Unstar,
+    }
+}
+
+fn execute_mail_rules_run(
+    format: OutputFormat,
+    selected_rule: Option<&str>,
+    apply: bool,
+    supplied_review: Option<&str>,
+    automatic: bool,
+) -> Result<RenderedOutput> {
+    if apply && crate::mcp::devcat::enabled() && !crate::mcp::devcat::has_capability("mail.mutate")
+    {
+        return Err(YacliError::Auth(
+            "Локальные правила требуют явной возможности DevCat mail.mutate".into(),
+        ));
+    }
+    let rules_file = MailRulesFile::load(&mail_rules_path()?)?;
+    let state_path = mail_rules_state_path()?;
+    let mut state = MailRulesState::load(&state_path)?;
+    let selected = rules_file
+        .rules
+        .iter()
+        .filter(|candidate| {
+            selected_rule.is_some_and(|id| candidate.id == id)
+                || selected_rule.is_none()
+                    && (candidate.enabled
+                        || state
+                            .checkpoint(&candidate.id)
+                            .is_some_and(|checkpoint| checkpoint.pending.is_some()))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if selected.is_empty() {
+        return Err(YacliError::Validation(
+            "Нет включённых правил для запуска".into(),
+        ));
+    }
+    if apply && selected.len() != 1 {
+        return Err(YacliError::Validation(
+            "Для применения выберите ровно одно правило через --rule ID".into(),
+        ));
+    }
+
+    let mut results = Vec::new();
+    for rule in selected {
+        if !rule.enabled
+            && state
+                .checkpoint(&rule.id)
+                .is_none_or(|checkpoint| checkpoint.pending.is_none())
+        {
+            results.push(json!({"rule_id":rule.id,"status":"disabled"}));
+            continue;
+        }
+        let (account, auth, context) = resolve_mail_private_context(Some(&rule.account))?;
+        if account != rule.account {
+            return Err(YacliError::Validation(
+                "Разрешённый аккаунт не совпал с точным alias правила".into(),
+            ));
+        }
+        if state.checkpoint(&rule.id).is_none() {
+            let current = mail_mailbox_checkpoint(
+                &context.imap_host,
+                context.imap_port,
+                auth,
+                &rule.mailbox,
+            )?;
+            if automatic {
+                state.checkpoints.push(MailRuleCheckpoint {
+                    rule_id: rule.id.clone(),
+                    account: rule.account.clone(),
+                    mailbox: rule.mailbox.clone(),
+                    uid_validity: current.uid_validity,
+                    cursor_uid: current.uid_next.saturating_sub(1),
+                    pending: None,
+                });
+                state.save(&state_path)?;
+            }
+            results.push(json!({
+                "rule_id":rule.id,
+                "status":if automatic {"baseline_created"} else {"baseline_required"},
+                "checkpoint":{"uid_validity":current.uid_validity,"cursor_uid":current.uid_next.saturating_sub(1)},
+                "note":"Старые письма не попадут под это правило; сохраните baseline явной операцией"
+            }));
+            continue;
+        }
+        let previous = state
+            .checkpoint(&rule.id)
+            .cloned()
+            .ok_or_else(|| YacliError::Config("Не удалось прочитать checkpoint правила".into()))?;
+        if previous.account != rule.account || previous.mailbox != rule.mailbox {
+            return Err(YacliError::Validation(
+                "Аккаунт или папка правила изменились; требуется новый checkpoint с ручной проверкой".into(),
+            ));
+        }
+        if let Some(pending) = previous.pending.clone() {
+            if !apply {
+                results.push(json!({
+                    "rule_id":rule.id,
+                    "status":"pending_review",
+                    "action":pending.action,
+                    "uids":pending.messages.iter().map(|message| message.uid).collect::<Vec<_>>(),
+                    "review_sha256":pending.review_sha256,
+                    "target_cursor_uid":pending.target_cursor_uid
+                }));
+                continue;
+            }
+            if !automatic && supplied_review != Some(pending.review_sha256.as_str()) {
+                return Err(YacliError::Validation(
+                    "Review hash не совпадает с незавершённым действием правила".into(),
+                ));
+            }
+            let record = apply_pending_mail_rule(
+                &rule,
+                &previous,
+                &pending,
+                MailRuleApplyContext {
+                    auth,
+                    imap_host: &context.imap_host,
+                    imap_port: context.imap_port,
+                    state_path: &state_path,
+                    state: &mut state,
+                },
+            )?;
+            results.push(json!({"rule_id":rule.id,"status":"applied_pending","run_id":record.run_id,"messages":record.messages.len()}));
+            continue;
+        }
+        let (current, messages, has_more) = list_mail_messages_after_uid(
+            &context.imap_host,
+            context.imap_port,
+            auth.clone(),
+            &rule.mailbox,
+            previous.uid_validity,
+            previous.cursor_uid,
+            crate::mail_rules::MAX_RULE_BATCH,
+        )?;
+        let preview = MailRulePreview::new(&rule, &previous, &current, messages, has_more)?;
+        if !apply {
+            results.push(json!({"rule_id":rule.id,"status":"preview","preview":preview}));
+            continue;
+        }
+        if !automatic && supplied_review != Some(preview.review_sha256.as_str()) {
+            return Err(YacliError::Validation(
+                "Review hash не совпадает с текущим preview; проверьте новый preview".into(),
+            ));
+        }
+        let Some(pending) = preview.pending_action()? else {
+            let checkpoint = state
+                .checkpoint_mut(&rule.id)
+                .ok_or_else(|| YacliError::Config("Checkpoint правила исчез".into()))?;
+            checkpoint.cursor_uid = preview.target_cursor_uid;
+            state.save(&state_path)?;
+            results.push(json!({"rule_id":rule.id,"status":"no_matches","cursor_uid":preview.target_cursor_uid}));
+            continue;
+        };
+        let checkpoint = state
+            .checkpoint_mut(&rule.id)
+            .ok_or_else(|| YacliError::Config("Checkpoint правила исчез".into()))?;
+        checkpoint.pending = Some(pending.clone());
+        state.save(&state_path)?;
+        let record = apply_pending_mail_rule(
+            &rule,
+            &previous,
+            &pending,
+            MailRuleApplyContext {
+                auth,
+                imap_host: &context.imap_host,
+                imap_port: context.imap_port,
+                state_path: &state_path,
+                state: &mut state,
+            },
+        )?;
+        results.push(json!({"rule_id":rule.id,"status":"applied","run_id":record.run_id,"messages":record.messages.len()}));
+    }
+    let table = render_key_value_table(&[
+        ("operation", "mail.rules.run".into()),
+        ("apply", apply.to_string()),
+        ("rules", results.len().to_string()),
+    ]);
+    ok_output(
+        format,
+        "mail.rules.run",
+        json!({"apply":apply,"results":results}),
+        table,
+    )
+}
+
+struct MailRuleApplyContext<'a> {
+    auth: crate::mail::MailSessionAuth,
+    imap_host: &'a str,
+    imap_port: u16,
+    state_path: &'a std::path::Path,
+    state: &'a mut MailRulesState,
+}
+
+fn apply_pending_mail_rule(
+    rule: &MailRule,
+    previous: &MailRuleCheckpoint,
+    pending: &PendingRuleAction,
+    context: MailRuleApplyContext<'_>,
+) -> Result<MailRuleAuditRecord> {
+    let MailRuleApplyContext {
+        auth,
+        imap_host,
+        imap_port,
+        state_path,
+        state,
+    } = context;
+    let uids = pending
+        .messages
+        .iter()
+        .map(|message| message.uid)
+        .collect::<Vec<_>>();
+    let current = list_mail_messages_by_uid(
+        imap_host,
+        imap_port,
+        auth.clone(),
+        &rule.mailbox,
+        previous.uid_validity,
+        &uids,
+    )?;
+    let desired = mail_rule_desired_flags(&pending.action);
+    for (prior, message) in pending.messages.iter().zip(&current) {
+        if crate::mail_rules::rule_source_digest(message)? != prior.source_sha256 {
+            return Err(YacliError::Validation(format!(
+                "UID {}: From/Subject изменились после preview; действие остановлено",
+                message.uid
+            )));
+        }
+        let seen_now = crate::mail_rules::has_flag(message, r"\Seen");
+        let flagged_now = crate::mail_rules::has_flag(message, r"\Flagged");
+        if desired
+            .seen
+            .is_some_and(|target| seen_now != prior.was_seen && seen_now != target)
+            || desired
+                .flagged
+                .is_some_and(|target| flagged_now != prior.was_flagged && flagged_now != target)
+        {
+            return Err(YacliError::Validation(format!(
+                "UID {} изменён после подготовки действия; пакет сохранён для ручной проверки",
+                message.uid
+            )));
+        }
+    }
+    for message in &current {
+        let current_seen = crate::mail_rules::has_flag(message, r"\Seen");
+        let current_flagged = crate::mail_rules::has_flag(message, r"\Flagged");
+        let update = MailFlagUpdate {
+            seen: desired.seen.filter(|target| current_seen != *target),
+            flagged: desired.flagged.filter(|target| current_flagged != *target),
+        };
+        if update.seen.is_some() || update.flagged.is_some() {
+            update_mail_flags(
+                imap_host,
+                imap_port,
+                auth.clone(),
+                &rule.mailbox,
+                message.uid,
+                previous.uid_validity,
+                update,
+            )?;
+        }
+    }
+
+    let record = MailRuleAuditRecord {
+        run_id: pending.review_sha256.clone(),
+        rule_id: rule.id.clone(),
+        account: rule.account.clone(),
+        mailbox: rule.mailbox.clone(),
+        uid_validity: previous.uid_validity,
+        action: pending.action.clone(),
+        applied_at_epoch_secs: Utc::now().timestamp().max(0) as u64,
+        messages: pending
+            .messages
+            .iter()
+            .map(|prior| {
+                let (became_seen, became_flagged) =
+                    desired_flags_after(&pending.action, prior.was_seen, prior.was_flagged);
+                MailRuleAuditMessage {
+                    uid: prior.uid,
+                    was_seen: prior.was_seen,
+                    was_flagged: prior.was_flagged,
+                    became_seen,
+                    became_flagged,
+                }
+            })
+            .collect(),
+        undone_at_epoch_secs: None,
+        undo_pending: None,
+    };
+    let audit_path = mail_rules_audit_path()?;
+    let mut audit = MailRulesAuditFile::load(&audit_path)?;
+    audit.record(record.clone());
+    audit.save(&audit_path)?;
+    let checkpoint = state
+        .checkpoint_mut(&rule.id)
+        .ok_or_else(|| YacliError::Config("Checkpoint правила исчез".into()))?;
+    checkpoint.cursor_uid = pending.target_cursor_uid;
+    checkpoint.pending = None;
+    state.save(state_path)?;
+    Ok(record)
+}
+
+fn execute_mail_rules_undo(
+    format: OutputFormat,
+    run_id: &str,
+    apply: bool,
+    supplied_review: Option<&str>,
+) -> Result<RenderedOutput> {
+    if apply && crate::mcp::devcat::enabled() && !crate::mcp::devcat::has_capability("mail.mutate")
+    {
+        return Err(YacliError::Auth(
+            "Откат локального правила требует явной возможности DevCat mail.mutate".into(),
+        ));
+    }
+    let audit_path = mail_rules_audit_path()?;
+    let mut audit = MailRulesAuditFile::load(&audit_path)?;
+    let record = audit
+        .run(run_id)
+        .cloned()
+        .ok_or_else(|| YacliError::Validation("Запуск правила не найден в аудите".into()))?;
+    if record.undone_at_epoch_secs.is_some() {
+        return Err(YacliError::Validation(
+            "Этот запуск правил уже отменён".into(),
+        ));
+    }
+    if let Some(pending) = record.undo_pending.clone() {
+        if !apply {
+            return ok_output(
+                format,
+                "mail.rules.undo",
+                json!({"run_id":run_id,"status":"pending_review","uids":pending.messages.iter().map(|message|message.uid).collect::<Vec<_>>(),"review_sha256":pending.review_sha256}),
+                render_key_value_table(&[
+                    ("run_id", run_id.to_string()),
+                    ("status", "ожидает продолжения отката".into()),
+                    ("review_sha256", pending.review_sha256),
+                ]),
+            );
+        }
+        if supplied_review != Some(pending.review_sha256.as_str()) {
+            return Err(YacliError::Validation(
+                "Review hash не совпадает с незавершённым откатом".into(),
+            ));
+        }
+        let restored = apply_pending_mail_rule_undo(run_id, &audit_path)?;
+        return ok_output(
+            format,
+            "mail.rules.undo",
+            json!({"run_id":run_id,"status":"undone","restored":restored}),
+            render_key_value_table(&[
+                ("run_id", run_id.to_string()),
+                ("status", "отменено".into()),
+                ("restored", restored.to_string()),
+            ]),
+        );
+    }
+    let (account, auth, context) = resolve_mail_private_context(Some(&record.account))?;
+    if account != record.account {
+        return Err(YacliError::Validation(
+            "Разрешённый аккаунт не совпал с точным alias аудита".into(),
+        ));
+    }
+    let uids = record
+        .messages
+        .iter()
+        .map(|message| message.uid)
+        .collect::<Vec<_>>();
+    let messages = list_mail_messages_by_uid(
+        &context.imap_host,
+        context.imap_port,
+        auth,
+        &record.mailbox,
+        record.uid_validity,
+        &uids,
+    )?;
+    let preview = MailRuleUndoPreview::new(&record, &messages)?;
+    if !apply {
+        return ok_output(
+            format,
+            "mail.rules.undo",
+            json!({"status":"preview","preview":preview}),
+            render_key_value_table(&[
+                ("run_id", run_id.to_string()),
+                ("messages", preview.messages.len().to_string()),
+                ("review_sha256", preview.review_sha256),
+            ]),
+        );
+    }
+    if supplied_review != Some(preview.review_sha256.as_str()) {
+        return Err(YacliError::Validation(
+            "Review hash не совпадает с текущим preview отката".into(),
+        ));
+    }
+    if let Some(record) = audit.run_mut(run_id) {
+        record.undo_pending = Some(preview.into_pending());
+    }
+    audit.save(&audit_path)?;
+    let restored = apply_pending_mail_rule_undo(run_id, &audit_path)?;
+    ok_output(
+        format,
+        "mail.rules.undo",
+        json!({"run_id":run_id,"status":"undone","restored":restored}),
+        render_key_value_table(&[
+            ("run_id", run_id.to_string()),
+            ("status", "отменено".into()),
+            ("restored", restored.to_string()),
+        ]),
+    )
+}
+
+fn apply_pending_mail_rule_undo(run_id: &str, audit_path: &std::path::Path) -> Result<usize> {
+    let mut audit = MailRulesAuditFile::load(audit_path)?;
+    let record = audit
+        .run(run_id)
+        .cloned()
+        .ok_or_else(|| YacliError::Validation("Запуск правила не найден в аудите".into()))?;
+    let pending = record
+        .undo_pending
+        .clone()
+        .ok_or_else(|| YacliError::Config("Откат не был сохранён как pending".into()))?;
+    let (account, auth, context) = resolve_mail_private_context(Some(&record.account))?;
+    if account != record.account {
+        return Err(YacliError::Validation(
+            "Разрешённый аккаунт не совпал с точным alias аудита".into(),
+        ));
+    }
+    let uids = pending
+        .messages
+        .iter()
+        .map(|message| message.uid)
+        .collect::<Vec<_>>();
+    let current = list_mail_messages_by_uid(
+        &context.imap_host,
+        context.imap_port,
+        auth.clone(),
+        &record.mailbox,
+        record.uid_validity,
+        &uids,
+    )?;
+    for (undo, message) in pending.messages.iter().zip(&current) {
+        let seen = crate::mail_rules::has_flag(message, r"\Seen");
+        let flagged = crate::mail_rules::has_flag(message, r"\Flagged");
+        if undo
+            .expected_seen
+            .is_some_and(|expected| seen != expected && Some(seen) != undo.restore_seen)
+            || undo.expected_flagged.is_some_and(|expected| {
+                flagged != expected && Some(flagged) != undo.restore_flagged
+            })
+        {
+            return Err(YacliError::Validation(format!(
+                "UID {} изменён после подготовки отката; пакет оставлен pending",
+                message.uid
+            )));
+        }
+    }
+    let mut restored = 0;
+    for (undo, message) in pending.messages.iter().zip(&current) {
+        let seen = crate::mail_rules::has_flag(message, r"\Seen");
+        let flagged = crate::mail_rules::has_flag(message, r"\Flagged");
+        let update = MailFlagUpdate {
+            seen: undo.restore_seen.filter(|target| seen != *target),
+            flagged: undo.restore_flagged.filter(|target| flagged != *target),
+        };
+        if update.seen.is_some() || update.flagged.is_some() {
+            update_mail_flags(
+                &context.imap_host,
+                context.imap_port,
+                auth.clone(),
+                &record.mailbox,
+                message.uid,
+                record.uid_validity,
+                update,
+            )?;
+            restored += 1;
+        }
+    }
+    let record = audit
+        .run_mut(run_id)
+        .ok_or_else(|| YacliError::Config("Запуск правила исчез из аудита".into()))?;
+    record.undone_at_epoch_secs = Some(Utc::now().timestamp().max(0) as u64);
+    record.undo_pending = None;
+    audit.save(audit_path)?;
+    Ok(restored)
+}
+
+fn mail_rule_desired_flags(action: &MailRuleAction) -> MailFlagUpdate {
+    match action {
+        MailRuleAction::MarkRead => MailFlagUpdate {
+            seen: Some(true),
+            flagged: None,
+        },
+        MailRuleAction::MarkUnread => MailFlagUpdate {
+            seen: Some(false),
+            flagged: None,
+        },
+        MailRuleAction::Star => MailFlagUpdate {
+            seen: None,
+            flagged: Some(true),
+        },
+        MailRuleAction::Unstar => MailFlagUpdate {
+            seen: None,
+            flagged: Some(false),
+        },
+    }
+}
+
+fn desired_flags_after(action: &MailRuleAction, was_seen: bool, was_flagged: bool) -> (bool, bool) {
+    match action {
+        MailRuleAction::MarkRead => (true, was_flagged),
+        MailRuleAction::MarkUnread => (false, was_flagged),
+        MailRuleAction::Star => (was_seen, true),
+        MailRuleAction::Unstar => (was_seen, false),
+    }
+}
+
+fn render_mail_rules_table(rules: &MailRulesFile) -> String {
+    let mut lines = vec!["ID\tENABLED\tACCOUNT\tMAILBOX\tACTION\tCONDITIONS".into()];
+    for rule in &rules.rules {
+        let conditions = [
+            rule.from_contains
+                .as_ref()
+                .map(|value| format!("from~{}", sanitize_table_cell(value))),
+            rule.subject_contains
+                .as_ref()
+                .map(|value| format!("subject~{}", sanitize_table_cell(value))),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" AND ");
+        lines.push(format!(
+            "{}\t{}\t{}\t{}\t{:?}\t{}",
+            rule.id,
+            rule.enabled,
+            sanitize_table_cell(&rule.account),
+            sanitize_table_cell(&rule.mailbox),
+            rule.action,
+            conditions
+        ));
+    }
+    if rules.rules.is_empty() {
+        lines.push("(правил нет)".into());
+    }
+    lines.join("\n")
+}
+
+fn render_mail_rules_audit_table(runs: &[&MailRuleAuditRecord]) -> String {
+    let mut lines = vec!["RUN_ID\tRULE_ID\tACCOUNT\tMAILBOX\tACTION\tMESSAGES\tUNDONE".into()];
+    lines.extend(runs.iter().map(|run| {
+        format!(
+            "{}\t{}\t{}\t{}\t{:?}\t{}\t{}",
+            run.run_id,
+            run.rule_id,
+            sanitize_table_cell(&run.account),
+            sanitize_table_cell(&run.mailbox),
+            run.action,
+            run.messages.len(),
+            run.undone_at_epoch_secs.is_some()
+        )
+    }));
+    if runs.is_empty() {
+        lines.push("(журнала нет)".into());
+    }
+    lines.join("\n")
 }
 
 fn execute_mail_invite(format: OutputFormat, action: MailInviteCommand) -> Result<RenderedOutput> {
@@ -6162,6 +7089,7 @@ mod tests {
             "смета",
             &[MailMessageSummary {
                 uid: 42,
+                uid_validity: None,
                 date: Some("Fri,\n13 Mar 2026".to_string()),
                 from: Some("Sender\tName <sender@example.com>".to_string()),
                 subject: Some("Тема\r\nписьма".to_string()),

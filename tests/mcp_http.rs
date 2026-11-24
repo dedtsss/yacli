@@ -372,7 +372,17 @@ fn devcat_slow_or_abandoned_tool_does_not_block_sessions_and_reviews_bind_accoun
         "slow/abandoned tool held the session registry"
     );
     let tools = catalog["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 11);
+    assert_eq!(tools.len(), 26);
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool["name"] == "yacli.mail.attachment.export")
+    );
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool["name"] == "yacli.mail.eml.export")
+    );
     for tool in tools {
         let schema = &tool["inputSchema"]["properties"]["account"];
         assert_eq!(schema["enum"], json!(["mock", "second"]));
@@ -384,13 +394,39 @@ fn devcat_slow_or_abandoned_tool_does_not_block_sessions_and_reviews_bind_accoun
                 .contains("second: mail=configured, disk=NOT_CONFIGURED")
         );
         let name = tool["name"].as_str().unwrap();
+        if matches!(name, "yacli.mail.forward" | "yacli.mail.eml.export") {
+            assert_eq!(
+                tool["inputSchema"]["properties"]["dry_run"]["type"],
+                "boolean"
+            );
+            assert_eq!(
+                tool["inputSchema"]["properties"]["review_sha256"]["type"],
+                "string"
+            );
+        }
         assert_eq!(
             tool["annotations"]["destructiveHint"],
-            name == "yacli.disk.upload"
+            matches!(
+                name,
+                "yacli.disk.upload"
+                    | "yacli.disk.mkdir"
+                    | "yacli.disk.copy"
+                    | "yacli.disk.move"
+                    | "yacli.disk.download"
+                    | "yacli.disk.trash.move"
+                    | "yacli.disk.trash.restore"
+                    | "yacli.mail.send"
+                    | "yacli.mail.send_published_link"
+                    | "yacli.mail.reply"
+                    | "yacli.mail.forward"
+                    | "yacli.mail.eml.export"
+            )
         );
         assert_eq!(
             tool["annotations"]["openWorldHint"],
             name.starts_with("yacli.mail.send")
+                || name == "yacli.mail.reply"
+                || name == "yacli.mail.forward"
         );
         assert_eq!(
             tool["annotations"]["readOnlyHint"],
@@ -398,8 +434,16 @@ fn devcat_slow_or_abandoned_tool_does_not_block_sessions_and_reviews_bind_accoun
                 name,
                 "yacli.disk.upload"
                     | "yacli.disk.mkdir"
+                    | "yacli.disk.copy"
+                    | "yacli.disk.move"
+                    | "yacli.disk.download"
+                    | "yacli.disk.trash.move"
+                    | "yacli.disk.trash.restore"
                     | "yacli.mail.send"
                     | "yacli.mail.send_published_link"
+                    | "yacli.mail.reply"
+                    | "yacli.mail.forward"
+                    | "yacli.mail.eml.export"
             )
         );
     }

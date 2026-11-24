@@ -1,9 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, hash_map::DefaultHasher};
 use std::convert::Infallible;
 use std::hash::{Hash, Hasher};
+use std::io::Read;
 use std::io::{self, BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::Duration;
@@ -26,7 +29,10 @@ use url::Url;
 use crate::account_store::AccountStore;
 use crate::activity_store::{ActivityStore, NewActivityEntry, record_activity};
 use crate::activity_undo::{apply_activity_undo, calendar_create_undo, disk_publish_undo};
-use crate::commands::{apply_safe_doctor_remediation, doctor_safe_remediation_activity_entry};
+use crate::cli::{MailRuleActionArg, MailRulesCommand, OutputFormat};
+use crate::commands::{
+    apply_safe_doctor_remediation, doctor_safe_remediation_activity_entry, execute_mail_rules,
+};
 use crate::credential_store::CredentialStore;
 use crate::disk_link::{DiskUploadLinkRequest, review_disk_upload_link, upload_link_to_disk};
 use crate::doctor::doctor_payload;
@@ -41,11 +47,13 @@ use crate::mail_link::{
     review_mail_send_published_link, send_link_via_mail_with_sent_copy,
     send_published_link_command, send_published_link_via_mail_with_sent_copy,
 };
+use crate::mail_rules::{MailRulesAuditFile, MailRulesFile};
 use crate::next_actions::next_actions_payload;
 use crate::onboarding::onboarding_resource_payload;
+use crate::paths::{mail_rules_audit_path, mail_rules_path};
 use crate::runtime_context::{
-    auth_state, resolve_calendar_private_context, resolve_disk_private_context,
-    resolve_mail_private_context,
+    auth_state, resolve_calendar_private_context, resolve_contacts_private_context,
+    resolve_disk_private_context, resolve_mail_private_context,
 };
 use crate::suggestions::suggestions_payload;
 use crate::update::check_for_update;
@@ -56,19 +64,36 @@ use crate::{
         calendar_create_request_from_invites, create_calendar_event, delete_calendar_event,
         list_calendar_events, list_calendars, parse_event_window, review_calendar_event_creation,
     },
+    contacts::{
+        create_contact, delete_contact, fetch_contacts, search as search_contacts, update_contact,
+    },
     disk::{
-        DownloadedFile, PrivateDiskDownloadRequest, PrivateDiskListRequest,
-        PrivateDiskMkdirRequest, PrivateDiskPublishRequest, PrivateDiskUnpublishRequest,
-        PrivateDiskUploadRequest, create_private_directory, download_private_resource,
-        fetch_disk_info, fetch_private_resource, publish_private_resource, review_private_publish,
-        review_private_unpublish, review_private_upload, unpublish_private_resource,
-        upload_private_resource,
+        DownloadedFile, PrivateDiskCopyMoveRequest, PrivateDiskDownloadRequest,
+        PrivateDiskListRequest, PrivateDiskMkdirRequest, PrivateDiskPublishRequest,
+        PrivateDiskTrashListRequest, PrivateDiskTrashRestoreRequest, PrivateDiskUnpublishRequest,
+        PrivateDiskUploadRequest, copy_private_resource, create_private_directory,
+        download_private_resource, fetch_disk_info, fetch_private_resource, list_private_trash,
+        move_private_resource, move_private_resource_to_trash, publish_private_resource,
+        restore_private_trash_resource, review_private_publish, review_private_unpublish,
+        review_private_upload, unpublish_private_resource, upload_private_resource,
+        validate_private_trash_path, validate_trash_restore_name,
     },
     mail::{
-        MailAttachmentExportRequest, MailAttachmentSelector, MailInviteInspectRequest,
-        export_mail_attachment, inspect_mail_invite, list_mail_folders, list_mail_messages,
-        load_mail_attachments, read_mail_message, review_mail_submission, search_mail_messages,
-        send_mail_message_with_sent_copy,
+        MailAttachmentExportRequest, MailAttachmentSelector, MailBulkAction, MailEmlExportRequest,
+        MailFlagUpdate, MailForwardRequest, MailForwardReviewBinding, MailInviteInspectRequest,
+        MailSearchFilter, MailSpecialFolderAction, apply_mail_bulk_action, copy_mail_message,
+        create_mail_draft, create_mail_folder, delete_mail_folder, export_mail_attachment,
+        export_mail_eml, forward_mail_message_reviewed_with_attachments,
+        forward_mail_message_with_attachments, inspect_mail_invite, list_mail_drafts_page,
+        list_mail_folders, list_mail_messages_page, load_mail_attachments, mail_mailbox_checkpoint,
+        move_mail_draft_to_trash, move_mail_message, move_mail_message_to_special_folder,
+        read_mail_message, rename_mail_folder, reply_to_mail_message_with_attachments,
+        review_mail_draft_trash, review_mail_draft_update, review_mail_eml_export,
+        review_mail_folder_delete, review_mail_forward_submission_with_attachments,
+        review_mail_reply_submission_with_attachments, review_mail_submission,
+        search_mail_all_folders_page, search_mail_messages_filtered_page,
+        send_mail_message_with_sent_copy, update_mail_draft, update_mail_flags,
+        validate_mail_eml_output_path, validate_mail_folder_rename,
     },
 };
 use chrono::{DateTime, Utc};
@@ -76,6 +101,15 @@ use chrono::{DateTime, Utc};
 use super::{devcat, prompts, skills};
 
 const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
+static NATIVE_FILE_DNS_LOOKUP_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+struct NativeFileDnsLookupGuard;
+
+impl Drop for NativeFileDnsLookupGuard {
+    fn drop(&mut self) {
+        NATIVE_FILE_DNS_LOOKUP_ACTIVE.store(false, Ordering::Release);
+    }
+}
 const APP_RESOURCE_URI: &str = "ui://yacli/dashboard";
 const APP_RESOURCE_URI_TEMPLATE: &str =
     "ui://yacli/dashboard{?account,section,resource,tool,skill,prompt,workflow,activity,goal}";
@@ -133,6 +167,7 @@ struct DashboardResourceState {
     preferred_goal: Option<String>,
 }
 
+#[derive(Clone)]
 struct MailForwardToolRequest {
     folder: String,
     uid: u64,
@@ -153,6 +188,24 @@ struct MailSendToolRequest {
     html: Option<String>,
     attachment_paths: Vec<String>,
     dry_run: bool,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeMailFile {
+    download_url: String,
+    file_id: String,
+    mime_type: Option<String>,
+    file_name: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct DownloadedNativeMailFile {
+    file_id: String,
+    filename: String,
+    mime_type: String,
+    sha256: String,
+    content: Vec<u8>,
 }
 
 struct MailSendLinkToolRequest {
@@ -1293,15 +1346,43 @@ fn tool_definitions(ui_enabled: bool, roots_enabled: bool) -> Result<Vec<Value>>
             None,
             ui_enabled,
         ),
+        tool("yacli.mail.folder.create", "Создать папку почтового ящика; в DevCat требуется предварительная проверка.", json!({"type":"object","properties":{"account":{"type":"string"},"folder":{"type":"string"}},"required":["folder"],"additionalProperties":false}), None, ui_enabled),
+        tool("yacli.mail.folder.rename", "Переименовать папку почтового ящика; сервер также переименует вложенные папки. Перед изменением требуется review.", json!({"type":"object","properties":{"account":{"type":"string"},"folder":{"type":"string"},"new_folder":{"type":"string"}},"required":["folder","new_folder"],"additionalProperties":false}), None, ui_enabled),
+        tool("yacli.mail.folder.delete", "Удалить только явно указанную пустую пользовательскую папку без подпапок; системные папки и папки с письмами отклоняются. В DevCat требуется mail.delete и одноразовый review.", json!({"type":"object","properties":{"account":{"type":"string"},"folder":{"type":"string"}},"required":["folder"],"additionalProperties":false}), None, ui_enabled),
+        tool("yacli.mail.copy", "Скопировать письмо по UID и обязательному UIDVALIDITY из результата списка; если эпоха папки изменилась, операция отклоняется. В DevCat требуется review.", json!({"type":"object","properties":{"account":{"type":"string"},"source_folder":{"type":"string"},"uid":{"type":"integer","minimum":1},"uid_validity":{"type":"integer","minimum":1},"destination_folder":{"type":"string"}},"required":["uid","uid_validity","destination_folder"],"additionalProperties":false}), None, ui_enabled),
+        tool("yacli.mail.move", "Переместить письмо по UID и обязательному UIDVALIDITY из результата списка; если эпоха папки изменилась, операция отклоняется. В DevCat требуется review.", json!({"type":"object","properties":{"account":{"type":"string"},"source_folder":{"type":"string"},"uid":{"type":"integer","minimum":1},"uid_validity":{"type":"integer","minimum":1},"destination_folder":{"type":"string"}},"required":["uid","uid_validity","destination_folder"],"additionalProperties":false}), None, ui_enabled),
+        tool("yacli.mail.flags", "Установить прочитанность и избранное по UID и обязательному UIDVALIDITY из списка; эпоха перепроверяется перед изменением. В DevCat требуется review.", json!({"type":"object","properties":{"account":{"type":"string"},"folder":{"type":"string"},"uid":{"type":"integer","minimum":1},"uid_validity":{"type":"integer","minimum":1},"seen":{"type":"boolean"},"flagged":{"type":"boolean"}},"required":["uid","uid_validity"],"additionalProperties":false}), None, ui_enabled),
+        tool("yacli.mail.bulk", "Выполнить одно массовое действие не более чем над 50 письмами; весь набор должен принадлежать указанному UIDVALIDITY. В DevCat требуется review.", json!({"type":"object","properties":{"account":{"type":"string"},"folder":{"type":"string"},"uids":{"type":"array","minItems":1,"maxItems":50,"items":{"type":"integer","minimum":1}},"uid_validity":{"type":"integer","minimum":1},"action":{"type":"string","enum":["mark_read","mark_unread","flag","unflag","copy","move"]},"destination_folder":{"type":"string"}},"required":["uids","uid_validity","action"],"additionalProperties":false}), None, ui_enabled),
+        tool("yacli.mail.special_folder", "Переместить письмо между обычной папкой, Корзиной или Спамом, проверив UIDVALIDITY; это только IMAP-перенос, не жалоба антиспам-службе. В DevCat требуется review.", json!({"type":"object","properties":{"account":{"type":"string"},"uid":{"type":"integer","minimum":1},"uid_validity":{"type":"integer","minimum":1},"action":{"type":"string","enum":["move_to_trash","restore_from_trash","move_to_spam","restore_from_spam"]},"source_folder":{"type":"string"},"destination_folder":{"type":"string"}},"required":["uid","uid_validity","action"],"additionalProperties":false}), None, ui_enabled),
+        tool(
+            "yacli.contacts.list",
+            "Получить список контактов из отдельно настроенной адресной книги Яндекс CardDAV.",
+            json!({"type":"object","properties":{"account":{"type":"string"}},"additionalProperties":false}),
+            None,
+            ui_enabled,
+        ),
+        tool(
+            "yacli.contacts.search",
+            "Найти контакты в отдельно настроенной адресной книге Яндекс CardDAV.",
+            json!({"type":"object","properties":{"account":{"type":"string"},"query":{"type":"string","minLength":1}},"required":["query"],"additionalProperties":false}),
+            None,
+            ui_enabled,
+        ),
+        tool("yacli.contacts.export", "Экспортировать ограниченный набор контактов в формате vCard.", json!({"type":"object","properties":{"account":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":50}},"additionalProperties":false}), None, ui_enabled),
+        tool("yacli.contacts.import", "Импортировать до 50 контактов из разрешенного локального файла vCard.", json!({"type":"object","properties":{"account":{"type":"string"},"source_path":{"type":"string"}},"required":["source_path"],"additionalProperties":false}), None, ui_enabled),
+        tool("yacli.contacts.create", "Создать контакт из vCard; в DevCat требуется предварительная проверка и одноразовый digest.", json!({"type":"object","properties":{"account":{"type":"string"},"vcard":{"type":"string"}},"required":["vcard"],"additionalProperties":false}), None, ui_enabled),
+        tool("yacli.contacts.update", "Условно обновить контакт CardDAV по href и сильному ETag.", json!({"type":"object","properties":{"account":{"type":"string"},"href":{"type":"string"},"etag":{"type":"string"},"vcard":{"type":"string"}},"required":["href","etag","vcard"],"additionalProperties":false}), None, ui_enabled),
+        tool("yacli.contacts.delete", "Условно удалить контакт CardDAV по href и сильному ETag.", json!({"type":"object","properties":{"account":{"type":"string"},"href":{"type":"string"},"etag":{"type":"string"}},"required":["href","etag"],"additionalProperties":false}), None, ui_enabled),
         tool(
             "yacli.mail.list",
-            "List messages from a folder.",
+            "Постранично показать письма в папке; элементы ответа содержат UIDVALIDITY, если сервер сообщил его при SELECT.",
             json!({
                 "type": "object",
                 "properties": {
                     "account": { "type": "string" },
                     "folder": { "type": "string" },
-                    "limit": { "type": "integer", "minimum": 1 }
+                    "limit": { "type": "integer", "minimum": 1 },
+                    "offset": { "type": "integer", "minimum": 0, "maximum": 1000000 }
                 },
                 "additionalProperties": false
             }),
@@ -1310,14 +1391,18 @@ fn tool_definitions(ui_enabled: bool, roots_enabled: bool) -> Result<Vec<Value>>
         ),
         tool(
             "yacli.mail.search",
-            "Search messages in a folder.",
+            "Искать письма по тексту в папке или во всех папках, ограничить период датами IMAP; элементы ответа содержат UIDVALIDITY, если сервер сообщил его при SELECT. Глобальный режим ограничен 5000 совпадениями.",
             json!({
                 "type": "object",
                 "properties": {
                     "account": { "type": "string" },
                     "folder": { "type": "string" },
+                    "all_folders": { "type": "boolean" },
                     "query": { "type": "string" },
-                    "limit": { "type": "integer", "minimum": 1 }
+                    "since": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$", "description": "Включительная начальная дата, ГГГГ-ММ-ДД." },
+                    "before": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$", "description": "Исключительная конечная дата, ГГГГ-ММ-ДД." },
+                    "limit": { "type": "integer", "minimum": 1 },
+                    "offset": { "type": "integer", "minimum": 0, "maximum": 1000000 }
                 },
                 "required": ["query"],
                 "additionalProperties": false
@@ -1343,6 +1428,101 @@ fn tool_definitions(ui_enabled: bool, roots_enabled: bool) -> Result<Vec<Value>>
             ui_enabled,
         ),
         tool(
+            "yacli.mail.checkpoint",
+            "Получить UIDVALIDITY и UIDNEXT выбранной IMAP-папки для проверки устойчивости UID после изменений ящика.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "account": { "type": "string" },
+                    "folder": { "type": "string" }
+                },
+                "additionalProperties": false
+            }),
+            None,
+            ui_enabled,
+        ),
+        tool(
+            "yacli.mail.draft.list",
+            "Показать черновики из папки, которую IMAP-сервер пометил как \\Drafts; список ограничен пагинацией.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "account": { "type": "string" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 100 },
+                    "offset": { "type": "integer", "minimum": 0, "maximum": 1000000 }
+                },
+                "additionalProperties": false
+            }),
+            None,
+            ui_enabled,
+        ),
+        tool(
+            "yacli.mail.draft.trash",
+            "Переместить только указанный черновик из IMAP \\Drafts в серверную \\Trash; UIDVALIDITY проверяется до операции, требуется dry-run и review.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "account": { "type": "string" },
+                    "uid": { "type": "integer", "minimum": 1 },
+                    "uid_validity": { "type": "integer", "minimum": 1 }
+                },
+                "required": ["uid", "uid_validity"],
+                "additionalProperties": false
+            }),
+            None,
+            ui_enabled,
+        ),
+        tool(
+            "yacli.mail.draft.update",
+            "Заменить только указанный черновик: добавить новую версию с \\Draft, повторно проверить исходный SHA-256 и UIDVALIDITY, затем перенести прежнюю запись в \\Trash. При частичной ошибке обе версии сохраняются.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "account": { "type": "string" },
+                    "uid": { "type": "integer", "minimum": 1 },
+                    "uid_validity": { "type": "integer", "minimum": 1 },
+                    "to": { "type": "string" },
+                    "cc": { "type": "array", "items": { "type": "string" } },
+                    "bcc": { "type": "array", "items": { "type": "string" } },
+                    "subject": { "type": "string" },
+                    "text": { "type": "string" },
+                    "html": { "type": "string" },
+                    "attachments": { "type": "array", "items": { "type": "string" } }
+                },
+                "required": ["uid", "uid_validity", "to", "subject"],
+                "additionalProperties": false
+            }),
+            None,
+            ui_enabled,
+        ),
+        tool(
+            "yacli.mail.draft.create",
+            "Создать неотправленный черновик в почтовом ящике; в DevCat требуется предварительная проверка.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "account": { "type": "string" },
+                    "to": { "type": "string" },
+                    "cc": { "type": "array", "items": { "type": "string" } },
+                    "bcc": { "type": "array", "items": { "type": "string" } },
+                    "subject": { "type": "string" },
+                    "text": { "type": "string" },
+                    "html": { "type": "string" },
+                    "attachments": { "type": "array", "items": { "type": "string" } }
+                },
+                "required": ["to", "subject"],
+                "additionalProperties": false
+            }),
+            None,
+            ui_enabled,
+        ),
+        tool("yacli.mail.rules.list", "Показать локальные правила Mail и их контрольные точки; это правила yacli, не серверные фильтры Яндекса.", json!({"type":"object","properties":{"account":{"type":"string"}},"additionalProperties":false}), None, ui_enabled),
+        tool("yacli.mail.rules.audit", "Показать content-free аудит запусков и откатов локальных правил Mail.", json!({"type":"object","properties":{"account":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":1000}},"additionalProperties":false}), None, ui_enabled),
+        tool("yacli.mail.rules.preview", "Прочитать следующий ограниченный пакет (до 50 UID) для указанного включённого локального правила. Без baseline вернёт baseline_required и не изменит локальное состояние.", json!({"type":"object","properties":{"account":{"type":"string"},"rule":{"type":"string"}},"required":["account","rule"],"additionalProperties":false}), None, ui_enabled),
+        tool("yacli.mail.rules.configure", "Создать, изменить, включить, выключить, сбросить или удалить локальное правило либо явно создать его baseline; создание правила выключено по умолчанию. В DevCat требуется mail.mutate и review.", json!({"type":"object","properties":{"account":{"type":"string"},"operation":{"type":"string","enum":["add","update","enable","disable","baseline","reset","delete"]},"id":{"type":"string"},"mailbox":{"type":"string"},"from_contains":{"type":"string"},"subject_contains":{"type":"string"},"clear_from":{"type":"boolean"},"clear_subject":{"type":"boolean"},"action":{"type":"string","enum":["mark_read","mark_unread","star","unstar"]}},"required":["account","operation","id"],"additionalProperties":false}), None, ui_enabled),
+        tool("yacli.mail.rules.run", "Применить только пакет, показанный preview, после проверки digest. Сначала вызовите с dry_run=true; затем передайте plan_sha256 и MCP review_sha256 из соответствующих preview.", json!({"type":"object","properties":{"account":{"type":"string"},"rule":{"type":"string"},"plan_sha256":{"type":"string"}},"required":["account","rule"],"additionalProperties":false}), None, ui_enabled),
+        tool("yacli.mail.rules.undo", "Просмотреть или отменить одно выполнение правил; undo возможен только если целевой флаг не изменялся после применения. В DevCat требуется review.", json!({"type":"object","properties":{"account":{"type":"string"},"run_id":{"type":"string"},"plan_sha256":{"type":"string"}},"required":["account","run_id"],"additionalProperties":false}), None, ui_enabled),
+        tool(
             "yacli.mail.send",
             "Send one mail message.",
             json!({
@@ -1365,6 +1545,10 @@ fn tool_definitions(ui_enabled: bool, roots_enabled: bool) -> Result<Vec<Value>>
                         "type": "array",
                         "items": { "type": "string" }
                     },
+                    "attachment_files": { "type": "array", "items": { "type": "object", "properties": {
+                        "download_url": { "type": "string" }, "file_id": { "type": "string" },
+                        "mime_type": { "type": "string" }, "file_name": { "type": "string" }
+                    }, "required": ["download_url", "file_id"], "additionalProperties": false } },
                     "dry_run": { "type": "boolean" }
                 },
                 "required": ["to", "subject"],
@@ -1433,7 +1617,7 @@ fn tool_definitions(ui_enabled: bool, roots_enabled: bool) -> Result<Vec<Value>>
         ),
         tool(
             "yacli.mail.reply",
-            "Reply to one message by UID.",
+            "Ответить на письмо; reply_all=true добавляет остальных адресатов исходного письма в копию, исключая адрес текущего аккаунта.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1442,10 +1626,16 @@ fn tool_definitions(ui_enabled: bool, roots_enabled: bool) -> Result<Vec<Value>>
                     "uid": { "type": "integer", "minimum": 1 },
                     "text": { "type": "string" },
                     "html": { "type": "string" },
+                    "reply_all": { "type": "boolean" },
+                    "dry_run": { "type": "boolean" },
                     "cc": {
                         "type": "array",
                         "items": { "type": "string" }
-                    }
+                    },
+                    "attachment_files": { "type": "array", "items": { "type": "object", "properties": {
+                        "download_url": { "type": "string" }, "file_id": { "type": "string" },
+                        "mime_type": { "type": "string" }, "file_name": { "type": "string" }
+                    }, "required": ["download_url", "file_id"], "additionalProperties": false } }
                 },
                 "required": ["uid"],
                 "additionalProperties": false
@@ -1455,7 +1645,7 @@ fn tool_definitions(ui_enabled: bool, roots_enabled: bool) -> Result<Vec<Value>>
         ),
         tool(
             "yacli.mail.forward",
-            "Forward one message by UID.",
+            "Переслать письмо по UID с проверкой адресатов и предварительным review.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1473,7 +1663,11 @@ fn tool_definitions(ui_enabled: bool, roots_enabled: bool) -> Result<Vec<Value>>
                         "type": "array",
                         "items": { "type": "string" }
                     },
-                    "max_source_bytes": { "type": "integer", "minimum": 1 }
+                    "max_source_bytes": { "type": "integer", "minimum": 1 },
+                    "attachment_files": { "type": "array", "items": { "type": "object", "properties": {
+                        "download_url": { "type": "string" }, "file_id": { "type": "string" },
+                        "mime_type": { "type": "string" }, "file_name": { "type": "string" }
+                    }, "required": ["download_url", "file_id"], "additionalProperties": false } }
                 },
                 "required": ["uid", "to"],
                 "additionalProperties": false
@@ -1495,6 +1689,26 @@ fn tool_definitions(ui_enabled: bool, roots_enabled: bool) -> Result<Vec<Value>>
                     "output_path": { "type": "string" },
                     "force": { "type": "boolean" },
                     "max_bytes": { "type": "integer", "minimum": 1 }
+                },
+                "required": ["uid", "output_path"],
+                "additionalProperties": false
+            }),
+            None,
+            ui_enabled,
+        ),
+        tool(
+            "yacli.mail.eml.export",
+            "Экспортировать исходные байты письма в файл .eml с ограничением размера; в DevCat нужен review и путь в разрешённом каталоге выгрузки.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "account": { "type": "string" },
+                    "folder": { "type": "string" },
+                    "uid": { "type": "integer", "minimum": 1 },
+                    "output_path": { "type": "string" },
+                    "force": { "type": "boolean" },
+                    "max_bytes": { "type": "integer", "minimum": 1, "maximum": 26214400 },
+                    "dry_run": { "type": "boolean" }
                 },
                 "required": ["uid", "output_path"],
                 "additionalProperties": false
@@ -1639,12 +1853,106 @@ fn tool_definitions(ui_enabled: bool, roots_enabled: bool) -> Result<Vec<Value>>
             ui_enabled,
         ),
         tool(
+            "yacli.disk.trash.list",
+            "Просмотреть элементы в Корзине Диска с постраничной навигацией.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "account": { "type": "string" },
+                    "path": { "type": "string", "default": "trash:/" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000 },
+                    "offset": { "type": "integer", "minimum": 0 }
+                },
+                "additionalProperties": false
+            }),
+            None,
+            ui_enabled,
+        ),
+        tool(
+            "yacli.disk.copy",
+            "Скопировать файл или папку Диска в указанное место; операция требует предварительной проверки.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "account": { "type": "string" },
+                    "from_path": { "type": "string" },
+                    "to_path": { "type": "string" },
+                    "overwrite": { "type": "boolean" }
+                },
+                "required": ["from_path", "to_path"],
+                "additionalProperties": false
+            }),
+            None,
+            ui_enabled,
+        ),
+        tool(
+            "yacli.disk.move",
+            "Переместить или переименовать файл или папку Диска; операция требует предварительной проверки.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "account": { "type": "string" },
+                    "from_path": { "type": "string" },
+                    "to_path": { "type": "string" },
+                    "overwrite": { "type": "boolean" }
+                },
+                "required": ["from_path", "to_path"],
+                "additionalProperties": false
+            }),
+            None,
+            ui_enabled,
+        ),
+        tool(
+            "yacli.disk.trash.move",
+            "Переместить файл или папку Диска в Корзину без безвозвратного удаления; требуется отдельное разрешение и предварительная проверка.",
+            json!({
+                "type": "object",
+                "properties": {"account": {"type":"string"},"path": {"type":"string"}},
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+            None,
+            ui_enabled,
+        ),
+        tool(
+            "yacli.disk.trash.restore",
+            "Восстановить файл или папку из Корзины; перезапись назначения по умолчанию отключена.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "account": { "type": "string" },
+                    "trash_path": { "type": "string" },
+                    "restore_name": { "type": "string" },
+                    "overwrite": { "type": "boolean" }
+                },
+                "required": ["trash_path"],
+                "additionalProperties": false
+            }),
+            None,
+            ui_enabled,
+        ),
+        tool(
             "yacli.disk.read",
             "Read a Yandex Disk file up to 1 MiB as base64.",
             json!({
                 "type": "object",
                 "properties": { "account": {"type":"string"}, "path": {"type":"string"} },
                 "required": ["path"], "additionalProperties": false
+            }),
+            None,
+            ui_enabled,
+        ),
+        tool(
+            "yacli.disk.permissions",
+            "Проверить, опубликован ли файл или папка по публичной ссылке; персональные права пользователей не включены.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "account": { "type": "string" },
+                    "path": { "type": "string" }
+                },
+                "required": ["path"],
+                "additionalProperties": false
             }),
             None,
             ui_enabled,
@@ -1702,7 +2010,7 @@ fn tool_definitions(ui_enabled: bool, roots_enabled: bool) -> Result<Vec<Value>>
         ),
         tool(
             "yacli.disk.download",
-            "Download one private Yandex Disk file to a local path on the MCP server host.",
+            "Скачать личный файл с Диска в разрешенную локальную папку сервера; в DevCat требуется предварительная проверка.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1785,7 +2093,7 @@ fn tool(
         {
             properties.insert(
                 "review_sha256".into(),
-                json!({"type":"string", "description":"SHA-256 returned by the matching dry run"}),
+                json!({"type":"string", "description":"SHA-256, возвращенный соответствующей предварительной проверкой"}),
             );
             properties.insert("dry_run".into(), json!({"type":"boolean"}));
         }
@@ -1803,9 +2111,11 @@ fn tool(
             "annotations".into(),
             json!({
                 "readOnlyHint": read_only,
-            "destructiveHint": name == "yacli.disk.upload" || name == "yacli.disk.upload_link",
+            "destructiveHint": devcat::is_risky(name),
                 "idempotentHint": read_only,
             "openWorldHint": name.starts_with("yacli.mail.send")
+                || name == "yacli.mail.reply"
+                || name == "yacli.mail.forward"
             }),
         );
     }
@@ -1813,6 +2123,17 @@ fn tool(
         && ui_enabled
     {
         object.insert("_meta".to_string(), app_meta(visibility));
+    }
+    if matches!(
+        name,
+        "yacli.mail.send" | "yacli.mail.reply" | "yacli.mail.forward"
+    ) {
+        object
+            .entry("_meta")
+            .or_insert_with(|| Value::Object(Map::new()))
+            .as_object_mut()
+            .expect("tool _meta must be an object")
+            .insert("openai/fileParams".into(), json!(["attachment_files"]));
     }
     Value::Object(object)
 }
@@ -1831,6 +2152,110 @@ fn call_tool(params: Value, ui_enabled: bool) -> Result<Value> {
             if let Some(object) = arguments.as_object_mut() {
                 object.entry("account").or_insert(Value::String(account));
             }
+        }
+    }
+    devcat::check_tool_access(name, &arguments)?;
+    let native_attachments = if matches!(
+        name,
+        "yacli.mail.send" | "yacli.mail.reply" | "yacli.mail.forward"
+    ) {
+        let files: Vec<NativeMailFile> = arguments
+            .get("attachment_files")
+            .map(|value| {
+                serde_json::from_value(value.clone())
+                    .map_err(|error| YacliError::Validation(error.to_string()))
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let downloaded = download_native_mail_files(&files)?;
+        if let Some(object) = arguments.as_object_mut() {
+            object.insert(
+                "_native_attachment_sha256".into(),
+                json!(
+                    downloaded
+                        .iter()
+                        .map(|file| &file.sha256)
+                        .collect::<Vec<_>>()
+                ),
+            );
+        }
+        downloaded
+    } else {
+        Vec::new()
+    };
+    if devcat::enabled() && name == "yacli.mail.eml.export" {
+        required_string(&arguments, "output_path")?;
+        validate_mail_eml_output_path(Path::new(required_string(&arguments, "output_path")?))?;
+        let mut validation_arguments = arguments.clone();
+        validation_arguments["dry_run"] = Value::Bool(true);
+        devcat::check_tool(name, &validation_arguments)?;
+        let folder = optional_string(&arguments, "folder").unwrap_or("INBOX");
+        let uid = required_u64(&arguments, "uid")?;
+        let max_bytes = optional_u64(&arguments, "max_bytes").unwrap_or(25 * 1024 * 1024);
+        let (_, auth, context) =
+            resolve_mail_private_context(arguments.get("account").and_then(Value::as_str))?;
+        let preview = review_mail_eml_export(
+            &context.imap_host,
+            context.imap_port,
+            auth,
+            folder,
+            uid,
+            max_bytes,
+        )?;
+        if let Some(object) = arguments.as_object_mut() {
+            object.insert("_eml_sha256".into(), Value::String(preview.sha256));
+        }
+    }
+    if devcat::enabled() && name == "yacli.mail.forward" {
+        let request = mail_forward_tool_request(&arguments)?;
+        let (resolved_account, auth, context) =
+            resolve_mail_private_context(arguments.get("account").and_then(Value::as_str))?;
+        let (review, source_sha256) = review_mail_forward_submission_with_attachments(
+            &context.imap_host,
+            context.imap_port,
+            auth,
+            &request.folder,
+            mail_forward_provider_request(&request),
+            native_files_to_mail_attachments(native_attachments.clone()).0,
+        )?;
+        if let Some(object) = arguments.as_object_mut() {
+            object.insert(
+                "_forward_source_sha256".into(),
+                Value::String(source_sha256),
+            );
+            object.insert(
+                "_forward_review".into(),
+                serde_json::to_value(review)
+                    .map_err(|error| YacliError::Serialization(error.to_string()))?,
+            );
+            object.insert("account".into(), Value::String(resolved_account));
+        }
+    }
+    if name == "yacli.mail.draft.update" {
+        let mut validation_arguments = arguments.clone();
+        validation_arguments["dry_run"] = Value::Bool(true);
+        devcat::check_tool(name, &validation_arguments)?;
+        let uid = required_u64(&arguments, "uid")?;
+        let uid_validity = required_u64(&arguments, "uid_validity")?;
+        let (account, auth, context) =
+            resolve_mail_private_context(arguments.get("account").and_then(Value::as_str))?;
+        let source = review_mail_draft_update(
+            &context.imap_host,
+            context.imap_port,
+            auth,
+            uid,
+            uid_validity,
+        )?;
+        if let Some(object) = arguments.as_object_mut() {
+            object.insert(
+                "_draft_source_sha256".into(),
+                Value::String(source.source_sha256.clone()),
+            );
+            object.insert(
+                "_draft_source_bytes".into(),
+                Value::Number(source.source_bytes.into()),
+            );
+            object.insert("account".into(), Value::String(account));
         }
     }
     devcat::check_tool(name, &arguments)?;
@@ -1874,23 +2299,51 @@ fn call_tool(params: Value, ui_enabled: bool) -> Result<Value> {
             structured
         }
         "yacli.mail.folders" => mail_folders(arguments.get("account").and_then(Value::as_str))?,
+        "yacli.mail.folder.create" => mail_folder_create(&arguments)?,
+        "yacli.mail.folder.rename" => mail_folder_rename(&arguments)?,
+        "yacli.mail.folder.delete" => mail_folder_delete(&arguments)?,
+        "yacli.mail.copy" => mail_copy_move(&arguments, false)?,
+        "yacli.mail.move" => mail_copy_move(&arguments, true)?,
+        "yacli.mail.flags" => mail_flags(&arguments)?,
+        "yacli.mail.bulk" => mail_bulk(&arguments)?,
+        "yacli.mail.special_folder" => mail_special_folder(&arguments)?,
+        "yacli.contacts.list" => contacts_list(arguments.get("account").and_then(Value::as_str))?,
+        "yacli.contacts.search" => contacts_search(
+            arguments.get("account").and_then(Value::as_str),
+            required_string(&arguments, "query")?,
+        )?,
+        "yacli.contacts.create" => contacts_create(&arguments)?,
+        "yacli.contacts.update" => contacts_update(&arguments)?,
+        "yacli.contacts.delete" => contacts_delete(&arguments)?,
+        "yacli.contacts.export" => contacts_export(
+            arguments.get("account").and_then(Value::as_str),
+            optional_usize(&arguments, "limit").unwrap_or(50),
+        )?,
+        "yacli.contacts.import" => contacts_import(&arguments)?,
         "yacli.mail.list" => mail_list(
             arguments.get("account").and_then(Value::as_str),
             optional_string(&arguments, "folder").unwrap_or("INBOX"),
             optional_usize(&arguments, "limit").unwrap_or(20),
+            optional_usize(&arguments, "offset").unwrap_or(0),
         )?,
-        "yacli.mail.search" => mail_search(
-            arguments.get("account").and_then(Value::as_str),
-            optional_string(&arguments, "folder").unwrap_or("INBOX"),
-            required_string(&arguments, "query")?,
-            optional_usize(&arguments, "limit").unwrap_or(20),
-        )?,
+        "yacli.mail.search" => mail_search(&arguments)?,
         "yacli.mail.read" => mail_read(
             arguments.get("account").and_then(Value::as_str),
             optional_string(&arguments, "folder").unwrap_or("INBOX"),
             required_u64(&arguments, "uid")?,
             optional_u64(&arguments, "max_bytes").unwrap_or(15 * 1024 * 1024),
         )?,
+        "yacli.mail.draft.list" => mail_draft_list(&arguments)?,
+        "yacli.mail.checkpoint" => mail_checkpoint(&arguments)?,
+        "yacli.mail.rules.list" => mail_rules_list(&arguments)?,
+        "yacli.mail.rules.audit" => mail_rules_audit(&arguments)?,
+        "yacli.mail.rules.preview" => mail_rules_preview(&arguments)?,
+        "yacli.mail.rules.configure" => mail_rules_configure(&arguments)?,
+        "yacli.mail.rules.run" => mail_rules_run(&arguments)?,
+        "yacli.mail.rules.undo" => mail_rules_undo(&arguments)?,
+        "yacli.mail.draft.trash" => mail_draft_trash(&arguments)?,
+        "yacli.mail.draft.update" => mail_draft_update(&arguments)?,
+        "yacli.mail.draft.create" => mail_draft_create(&arguments)?,
         "yacli.mail.send" => mail_send(
             arguments.get("account").and_then(Value::as_str),
             MailSendToolRequest {
@@ -1903,6 +2356,7 @@ fn call_tool(params: Value, ui_enabled: bool) -> Result<Value> {
                 attachment_paths: string_list(&arguments, "attachments")?,
                 dry_run: optional_bool(&arguments, "dry_run").unwrap_or(false),
             },
+            native_attachments,
         )?,
         "yacli.mail.send_link" => mail_send_link(
             arguments.get("account").and_then(Value::as_str),
@@ -1932,30 +2386,8 @@ fn call_tool(params: Value, ui_enabled: bool) -> Result<Value> {
                 dry_run: optional_bool(&arguments, "dry_run").unwrap_or(false),
             },
         )?,
-        "yacli.mail.reply" => mail_reply(
-            arguments.get("account").and_then(Value::as_str),
-            optional_string(&arguments, "folder").unwrap_or("INBOX"),
-            required_u64(&arguments, "uid")?,
-            string_list(&arguments, "cc")?,
-            optional_string_owned(&arguments, "text"),
-            optional_string_owned(&arguments, "html"),
-        )?,
-        "yacli.mail.forward" => mail_forward(
-            arguments.get("account").and_then(Value::as_str),
-            MailForwardToolRequest {
-                folder: optional_string(&arguments, "folder")
-                    .unwrap_or("INBOX")
-                    .to_string(),
-                uid: required_u64(&arguments, "uid")?,
-                to: required_string(&arguments, "to")?.to_string(),
-                cc: string_list(&arguments, "cc")?,
-                bcc: string_list(&arguments, "bcc")?,
-                text: optional_string_owned(&arguments, "text"),
-                html: optional_string_owned(&arguments, "html"),
-                max_source_bytes: optional_u64(&arguments, "max_source_bytes")
-                    .unwrap_or(15 * 1024 * 1024),
-            },
-        )?,
+        "yacli.mail.reply" => mail_reply(&arguments, native_attachments)?,
+        "yacli.mail.forward" => mail_forward(&arguments, native_attachments)?,
         "yacli.mail.attachment.export" => mail_attachment_export(
             arguments.get("account").and_then(Value::as_str),
             MailAttachmentExportToolRequest {
@@ -1969,6 +2401,7 @@ fn call_tool(params: Value, ui_enabled: bool) -> Result<Value> {
                 max_bytes: optional_u64(&arguments, "max_bytes").unwrap_or(15 * 1024 * 1024),
             },
         )?,
+        "yacli.mail.eml.export" => mail_eml_export(&arguments)?,
         "yacli.mail.invite.inspect" => mail_invite_inspect(
             arguments.get("account").and_then(Value::as_str),
             MailInviteInspectToolRequest {
@@ -2038,7 +2471,21 @@ fn call_tool(params: Value, ui_enabled: bool) -> Result<Value> {
             optional_usize(&arguments, "limit").unwrap_or(100),
             optional_u64(&arguments, "offset").unwrap_or(0),
         )?,
+        "yacli.disk.trash.list" => disk_trash_list(
+            arguments.get("account").and_then(Value::as_str),
+            optional_string(&arguments, "path").unwrap_or("trash:/"),
+            optional_usize(&arguments, "limit").unwrap_or(100),
+            optional_u64(&arguments, "offset").unwrap_or(0),
+        )?,
+        "yacli.disk.copy" => disk_copy_move(&arguments, false)?,
+        "yacli.disk.move" => disk_copy_move(&arguments, true)?,
+        "yacli.disk.trash.move" => disk_trash_move(&arguments)?,
+        "yacli.disk.trash.restore" => disk_trash_restore(&arguments)?,
         "yacli.disk.read" => disk_read(
+            arguments.get("account").and_then(Value::as_str),
+            required_string(&arguments, "path")?,
+        )?,
+        "yacli.disk.permissions" => disk_permissions(
             arguments.get("account").and_then(Value::as_str),
             required_string(&arguments, "path")?,
         )?,
@@ -2065,14 +2512,7 @@ fn call_tool(params: Value, ui_enabled: bool) -> Result<Value> {
                 dry_run: optional_bool(&arguments, "dry_run").unwrap_or(false),
             },
         )?,
-        "yacli.disk.download" => disk_download(
-            arguments.get("account").and_then(Value::as_str),
-            DiskDownloadToolRequest {
-                path: required_string(&arguments, "path")?.to_string(),
-                output_path: required_string(&arguments, "output_path")?.to_string(),
-                force: optional_bool(&arguments, "force").unwrap_or(false),
-            },
-        )?,
+        "yacli.disk.download" => disk_download(&arguments)?,
         "yacli.disk.publish" => disk_publish(
             arguments.get("account").and_then(Value::as_str),
             DiskPublishToolRequest {
@@ -2633,30 +3073,459 @@ fn mail_folders(account: Option<&str>) -> Result<Value> {
     }))
 }
 
-fn mail_list(account: Option<&str>, folder: &str, limit: usize) -> Result<Value> {
+fn mail_folder_create(args: &Value) -> Result<Value> {
+    let name = required_string(args, "folder")?;
+    if optional_bool(args, "dry_run") == Some(true) {
+        let digest = devcat::review_hash("yacli.mail.folder.create", args)?;
+        devcat::record_review(digest.clone());
+        return Ok(json!({"folder":name,"dry_run":true,"review_sha256":digest}));
+    }
+    let (account, auth, ctx) =
+        resolve_mail_private_context(args.get("account").and_then(Value::as_str))?;
+    create_mail_folder(&ctx.imap_host, ctx.imap_port, auth, name)?;
+    Ok(json!({"account":account,"folder":name,"created":true}))
+}
+
+fn mail_folder_rename(args: &Value) -> Result<Value> {
+    let folder = required_string(args, "folder")?;
+    let new_folder = required_string(args, "new_folder")?;
+    validate_mail_folder_rename(folder, new_folder)?;
+    if optional_bool(args, "dry_run") == Some(true) {
+        let digest = devcat::review_hash("yacli.mail.folder.rename", args)?;
+        devcat::record_review(digest.clone());
+        return Ok(
+            json!({"folder":folder,"new_folder":new_folder,"dry_run":true,"review_sha256":digest}),
+        );
+    }
+    let (account, auth, ctx) =
+        resolve_mail_private_context(args.get("account").and_then(Value::as_str))?;
+    rename_mail_folder(&ctx.imap_host, ctx.imap_port, auth, folder, new_folder)?;
+    Ok(json!({"account":account,"folder":folder,"new_folder":new_folder,"renamed":true}))
+}
+
+fn mail_folder_delete(args: &Value) -> Result<Value> {
+    let folder = required_string(args, "folder")?;
+    let (account, auth, ctx) =
+        resolve_mail_private_context(args.get("account").and_then(Value::as_str))?;
+    if optional_bool(args, "dry_run") == Some(true) {
+        let preview = review_mail_folder_delete(&ctx.imap_host, ctx.imap_port, auth, folder)?;
+        let digest = devcat::review_hash("yacli.mail.folder.delete", args)?;
+        if preview.allowed {
+            devcat::record_review(digest.clone());
+        }
+        return Ok(
+            json!({"account":account,"review":preview,"dry_run":true,"review_sha256":digest}),
+        );
+    }
+    let result = delete_mail_folder(&ctx.imap_host, ctx.imap_port, auth, folder)?;
+    Ok(json!({"account":account,"review":result,"deleted":true}))
+}
+
+fn mail_copy_move(args: &Value, is_move: bool) -> Result<Value> {
+    let uid = required_u64(args, "uid")?;
+    let uid_validity = required_u64(args, "uid_validity")?;
+    let source = optional_string(args, "source_folder").unwrap_or("INBOX");
+    let destination = required_string(args, "destination_folder")?;
+    let tool_name = if is_move {
+        "yacli.mail.move"
+    } else {
+        "yacli.mail.copy"
+    };
+    if optional_bool(args, "dry_run") == Some(true) {
+        let digest = devcat::review_hash(tool_name, args)?;
+        devcat::record_review(digest.clone());
+        return Ok(
+            json!({"uid":uid,"source_folder":source,"destination_folder":destination,"operation":if is_move {"move"} else {"copy"},"dry_run":true,"review_sha256":digest}),
+        );
+    }
+    let (account, auth, ctx) =
+        resolve_mail_private_context(args.get("account").and_then(Value::as_str))?;
+    if is_move {
+        move_mail_message(
+            &ctx.imap_host,
+            ctx.imap_port,
+            auth,
+            source,
+            uid,
+            uid_validity,
+            destination,
+        )?;
+    } else {
+        copy_mail_message(
+            &ctx.imap_host,
+            ctx.imap_port,
+            auth,
+            source,
+            uid,
+            uid_validity,
+            destination,
+        )?;
+    }
+    Ok(
+        json!({"account":account,"uid":uid,"source_folder":source,"destination_folder":destination,"moved":is_move,"copied":!is_move}),
+    )
+}
+
+fn mail_flags(args: &Value) -> Result<Value> {
+    let uid = required_u64(args, "uid")?;
+    let uid_validity = required_u64(args, "uid_validity")?;
+    let folder = optional_string(args, "folder").unwrap_or("INBOX");
+    let update = MailFlagUpdate {
+        seen: optional_bool(args, "seen"),
+        flagged: optional_bool(args, "flagged"),
+    };
+    if update.seen.is_none() && update.flagged.is_none() {
+        return Err(YacliError::Validation(
+            "Для изменения флагов укажите seen и/или flagged".into(),
+        ));
+    }
+    if optional_bool(args, "dry_run") == Some(true) {
+        let digest = devcat::review_hash("yacli.mail.flags", args)?;
+        devcat::record_review(digest.clone());
+        return Ok(
+            json!({"uid":uid,"folder":folder,"seen":update.seen,"flagged":update.flagged,"dry_run":true,"review_sha256":digest}),
+        );
+    }
+    let (account, auth, ctx) =
+        resolve_mail_private_context(args.get("account").and_then(Value::as_str))?;
+    update_mail_flags(
+        &ctx.imap_host,
+        ctx.imap_port,
+        auth,
+        folder,
+        uid,
+        uid_validity,
+        update,
+    )?;
+    Ok(
+        json!({"account":account,"uid":uid,"folder":folder,"seen":update.seen,"flagged":update.flagged,"updated":true}),
+    )
+}
+
+fn mail_bulk(args: &Value) -> Result<Value> {
+    let folder = optional_string(args, "folder").unwrap_or("INBOX");
+    let uid_validity = required_u64(args, "uid_validity")?;
+    let uid_values = args
+        .get("uids")
+        .and_then(Value::as_array)
+        .ok_or_else(|| YacliError::Validation("uids должен быть массивом UID".into()))?;
+    let uids = uid_values
+        .iter()
+        .map(|value| {
+            value.as_u64().ok_or_else(|| {
+                YacliError::Validation("каждый UID должен быть положительным целым".into())
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let action_name = required_string(args, "action")?;
+    let action = match action_name {
+        "mark_read" => MailBulkAction::MarkRead,
+        "mark_unread" => MailBulkAction::MarkUnread,
+        "flag" => MailBulkAction::Flag,
+        "unflag" => MailBulkAction::Unflag,
+        "copy" => MailBulkAction::Copy,
+        "move" => MailBulkAction::Move,
+        _ => {
+            return Err(YacliError::Validation(
+                "неподдерживаемое массовое действие".into(),
+            ));
+        }
+    };
+    let destination = optional_string(args, "destination_folder");
+    if optional_bool(args, "dry_run") == Some(true) {
+        let digest = devcat::review_hash("yacli.mail.bulk", args)?;
+        devcat::record_review(digest.clone());
+        return Ok(
+            json!({"dry_run":true,"folder":folder,"uids":uids,"action":action_name,"destination_folder":destination,"review_sha256":digest}),
+        );
+    }
+    let (account, auth, ctx) =
+        resolve_mail_private_context(args.get("account").and_then(Value::as_str))?;
+    apply_mail_bulk_action(
+        &ctx.imap_host,
+        ctx.imap_port,
+        auth,
+        folder,
+        &uids,
+        uid_validity,
+        action,
+        destination,
+    )?;
+    Ok(
+        json!({"account":account,"folder":folder,"count":uids.len(),"action":action_name,"destination_folder":destination,"updated":true}),
+    )
+}
+
+fn mail_special_folder(args: &Value) -> Result<Value> {
+    let uid = required_u64(args, "uid")?;
+    let uid_validity = required_u64(args, "uid_validity")?;
+    let action_name = required_string(args, "action")?;
+    let action = match action_name {
+        "move_to_trash" => MailSpecialFolderAction::MoveToTrash,
+        "restore_from_trash" => MailSpecialFolderAction::RestoreFromTrash,
+        "move_to_spam" => MailSpecialFolderAction::MoveToSpam,
+        "restore_from_spam" => MailSpecialFolderAction::RestoreFromSpam,
+        _ => {
+            return Err(YacliError::Validation(
+                "неподдерживаемое действие с Корзиной/Спамом".into(),
+            ));
+        }
+    };
+    let source_folder = optional_string(args, "source_folder");
+    let destination_folder = optional_string(args, "destination_folder");
+    let moving_to_special = matches!(
+        action,
+        MailSpecialFolderAction::MoveToTrash | MailSpecialFolderAction::MoveToSpam
+    );
+    if moving_to_special && destination_folder.is_some()
+        || !moving_to_special && source_folder.is_some()
+    {
+        return Err(YacliError::Validation(
+            "Для выбранного действия передайте только исходную или только целевую папку".into(),
+        ));
+    }
+    if optional_bool(args, "dry_run") == Some(true) {
+        let digest = devcat::review_hash("yacli.mail.special_folder", args)?;
+        devcat::record_review(digest.clone());
+        return Ok(
+            json!({"dry_run":true,"uid":uid,"action":action_name,"source_folder":source_folder,"destination_folder":destination_folder,"review_sha256":digest}),
+        );
+    }
+    let (account, auth, ctx) =
+        resolve_mail_private_context(args.get("account").and_then(Value::as_str))?;
+    move_mail_message_to_special_folder(
+        &ctx.imap_host,
+        ctx.imap_port,
+        auth,
+        uid,
+        uid_validity,
+        action,
+        source_folder,
+        destination_folder,
+    )?;
+    Ok(json!({"account":account,"uid":uid,"action":action_name,"moved":true}))
+}
+
+fn contacts_list(account: Option<&str>) -> Result<Value> {
+    let (name, password, context) = resolve_contacts_private_context(account)?;
+    let items = fetch_contacts(&context.carddav_base_url, &context.email, &password)?;
+    Ok(json!({"account": name, "items": items}))
+}
+
+fn contacts_search(account: Option<&str>, query: &str) -> Result<Value> {
+    if query.trim().is_empty() {
+        return Err(YacliError::Validation(
+            "contacts search query must not be empty".into(),
+        ));
+    }
+    let (name, password, context) = resolve_contacts_private_context(account)?;
+    let contacts = fetch_contacts(&context.carddav_base_url, &context.email, &password)?;
+    Ok(json!({"account": name, "query": query, "items": search_contacts(&contacts, query)}))
+}
+
+fn contacts_create(args: &Value) -> Result<Value> {
+    let vcard = required_string(args, "vcard")?;
+    if optional_bool(args, "dry_run") == Some(true) {
+        let digest = devcat::review_hash("yacli.contacts.create", args)?;
+        devcat::record_review(digest.clone());
+        return Ok(
+            json!({"dry_run":true,"operation":"contacts.create","vcard_bytes":vcard.len(),"review_sha256":digest}),
+        );
+    }
+    let (account, password, ctx) =
+        resolve_contacts_private_context(args.get("account").and_then(Value::as_str))?;
+    let uid = create_contact(&ctx.carddav_base_url, &ctx.email, &password, vcard)?;
+    Ok(json!({"account":account,"uid":uid,"created":true}))
+}
+
+fn contacts_update(args: &Value) -> Result<Value> {
+    let href = required_string(args, "href")?;
+    let etag = required_string(args, "etag")?;
+    let vcard = required_string(args, "vcard")?;
+    if optional_bool(args, "dry_run") == Some(true) {
+        let digest = devcat::review_hash("yacli.contacts.update", args)?;
+        devcat::record_review(digest.clone());
+        return Ok(
+            json!({"dry_run":true,"operation":"contacts.update","href":href,"etag":etag,"vcard_bytes":vcard.len(),"review_sha256":digest}),
+        );
+    }
+    let (account, password, ctx) =
+        resolve_contacts_private_context(args.get("account").and_then(Value::as_str))?;
+    update_contact(
+        &ctx.carddav_base_url,
+        &ctx.email,
+        &password,
+        href,
+        etag,
+        vcard,
+    )?;
+    Ok(json!({"account":account,"href":href,"updated":true}))
+}
+
+fn contacts_delete(args: &Value) -> Result<Value> {
+    let href = required_string(args, "href")?;
+    let etag = required_string(args, "etag")?;
+    if optional_bool(args, "dry_run") == Some(true) {
+        let digest = devcat::review_hash("yacli.contacts.delete", args)?;
+        devcat::record_review(digest.clone());
+        return Ok(
+            json!({"dry_run":true,"operation":"contacts.delete","href":href,"etag":etag,"review_sha256":digest}),
+        );
+    }
+    let (account, password, ctx) =
+        resolve_contacts_private_context(args.get("account").and_then(Value::as_str))?;
+    delete_contact(&ctx.carddav_base_url, &ctx.email, &password, href, etag)?;
+    Ok(json!({"account":account,"href":href,"deleted":true}))
+}
+
+fn contacts_export(account: Option<&str>, limit: usize) -> Result<Value> {
+    if limit == 0 || limit > 50 {
+        return Err(YacliError::Validation(
+            "contacts export limit must be between 1 and 50".into(),
+        ));
+    }
+    let (name, password, ctx) = resolve_contacts_private_context(account)?;
+    let contacts = fetch_contacts(&ctx.carddav_base_url, &ctx.email, &password)?;
+    let count = contacts.len().min(limit);
+    let mut output = contacts
+        .into_iter()
+        .take(limit)
+        .map(|contact| contact.vcard)
+        .collect::<Vec<_>>()
+        .join("\r\n");
+    if output.len() > 1024 * 1024 {
+        return Err(YacliError::Validation(
+            "contacts export exceeds 1 MiB; reduce limit".into(),
+        ));
+    }
+    output.push_str("\r\n");
+    Ok(json!({"account":name,"count":count,"format":"text/vcard","data":output}))
+}
+
+fn contacts_import(args: &Value) -> Result<Value> {
+    let path = required_string(args, "source_path")?;
+    let bytes = std::fs::read(path)?;
+    if bytes.len() > 5 * 1024 * 1024 {
+        return Err(YacliError::Validation(
+            "contacts import file exceeds 5 MiB".into(),
+        ));
+    }
+    let input = String::from_utf8(bytes)
+        .map_err(|_| YacliError::Validation("contacts import file must be UTF-8 vCard".into()))?;
+    let contacts = crate::contacts::parse_vcards(&input);
+    if contacts.is_empty() || contacts.len() > 50 {
+        return Err(YacliError::Validation(
+            "contacts import requires 1 to 50 vCards".into(),
+        ));
+    }
+    if optional_bool(args, "dry_run") == Some(true) {
+        let digest = devcat::review_hash("yacli.contacts.import", args)?;
+        devcat::record_review(digest.clone());
+        return Ok(
+            json!({"dry_run":true,"operation":"contacts.import","count":contacts.len(),"review_sha256":digest}),
+        );
+    }
+    if devcat::enabled()
+        && optional_string(args, "review_sha256")
+            != Some(devcat::review_hash("yacli.contacts.import", args)?.as_str())
+    {
+        return Err(YacliError::Auth(
+            "contacts import source changed after review".into(),
+        ));
+    }
+    let (account, password, ctx) =
+        resolve_contacts_private_context(args.get("account").and_then(Value::as_str))?;
+    let mut created = Vec::new();
+    for contact in contacts {
+        let vcard = contact
+            .vcard
+            .lines()
+            .filter(|line| !line.to_ascii_uppercase().starts_with("UID:"))
+            .collect::<Vec<_>>()
+            .join("\r\n");
+        match create_contact(&ctx.carddav_base_url, &ctx.email, &password, &vcard) {
+            Ok(uid) => created.push(uid),
+            Err(error) => {
+                return Ok(
+                    json!({"account":account,"status":"partial","created_uids":created,"error":error.to_string()}),
+                );
+            }
+        }
+    }
+    Ok(json!({"account":account,"status":"success","created_uids":created}))
+}
+
+fn mail_list(account: Option<&str>, folder: &str, limit: usize, offset: usize) -> Result<Value> {
     let (resolved_account, auth, context) = resolve_mail_private_context(account)?;
-    let messages = list_mail_messages(&context.imap_host, context.imap_port, auth, folder, limit)?;
+    let messages = list_mail_messages_page(
+        &context.imap_host,
+        context.imap_port,
+        auth,
+        folder,
+        limit,
+        offset,
+    )?;
     Ok(json!({
         "account": resolved_account,
         "folder": folder,
+        "offset": offset,
         "items": messages,
     }))
 }
 
-fn mail_search(account: Option<&str>, folder: &str, query: &str, limit: usize) -> Result<Value> {
+fn mail_search(args: &Value) -> Result<Value> {
+    let account = args.get("account").and_then(Value::as_str);
+    let folder = optional_string(args, "folder").unwrap_or("INBOX");
+    let query = required_string(args, "query")?;
+    let since = optional_string(args, "since");
+    let before = optional_string(args, "before");
+    let limit = optional_usize(args, "limit").unwrap_or(20);
+    let offset = optional_usize(args, "offset").unwrap_or(0);
+    let all_folders = optional_bool(args, "all_folders").unwrap_or(false);
     let (resolved_account, auth, context) = resolve_mail_private_context(account)?;
-    let messages = search_mail_messages(
+    if all_folders {
+        let items = search_mail_all_folders_page(
+            &context.imap_host,
+            context.imap_port,
+            auth,
+            query,
+            MailSearchFilter {
+                since,
+                before,
+                limit,
+                offset,
+            },
+        )?;
+        return Ok(json!({
+            "account": resolved_account,
+            "all_folders": true,
+            "query": query,
+            "since": since,
+            "before": before,
+            "offset": offset,
+            "items": items,
+        }));
+    }
+    let messages = search_mail_messages_filtered_page(
         &context.imap_host,
         context.imap_port,
         auth,
         folder,
         query,
-        limit,
+        MailSearchFilter {
+            since,
+            before,
+            limit,
+            offset,
+        },
     )?;
     Ok(json!({
         "account": resolved_account,
         "folder": folder,
         "query": query,
+        "since": since,
+        "before": before,
+        "offset": offset,
         "items": messages,
     }))
 }
@@ -2698,15 +3567,410 @@ fn activity_undo(id: &str) -> Result<Value> {
     }))
 }
 
-fn mail_send(account: Option<&str>, request: MailSendToolRequest) -> Result<Value> {
+fn mail_rules_command(action: MailRulesCommand) -> Result<Value> {
+    Ok(execute_mail_rules(OutputFormat::Json, action)?.json)
+}
+
+fn mail_rules_list(args: &Value) -> Result<Value> {
+    let account = optional_string(args, "account");
+    let mut result = mail_rules_command(MailRulesCommand::List)?;
+    if let Some(items) = result.get_mut("items").and_then(Value::as_array_mut) {
+        items.retain(|item| {
+            account.is_none_or(|account| item["rule"]["account"].as_str() == Some(account))
+        });
+        result["count"] = json!(items.len());
+    }
+    Ok(result)
+}
+
+fn mail_rules_audit(args: &Value) -> Result<Value> {
+    let account = optional_string(args, "account");
+    let mut result = mail_rules_command(MailRulesCommand::Audit {
+        limit: optional_usize(args, "limit").unwrap_or(100),
+    })?;
+    if let Some(items) = result.get_mut("items").and_then(Value::as_array_mut) {
+        items
+            .retain(|item| account.is_none_or(|account| item["account"].as_str() == Some(account)));
+        result["count"] = json!(items.len());
+    }
+    Ok(result)
+}
+
+fn mail_rules_require_rule_account(args: &Value) -> Result<(String, String)> {
+    let account = required_string(args, "account")?.to_string();
+    let id = required_string(args, "rule")?.to_string();
+    let rules = MailRulesFile::load(&mail_rules_path()?)?;
+    let rule = rules
+        .rules
+        .iter()
+        .find(|rule| rule.id == id)
+        .ok_or_else(|| YacliError::Validation(format!("Правило {id} не найдено")))?;
+    if rule.account != account {
+        return Err(YacliError::Auth(
+            "Аккаунт инструмента не совпадает с точным аккаунтом правила".into(),
+        ));
+    }
+    Ok((account, id))
+}
+
+fn mail_rules_preview(args: &Value) -> Result<Value> {
+    let (_, id) = mail_rules_require_rule_account(args)?;
+    mail_rules_command(MailRulesCommand::Run {
+        rule: Some(id),
+        apply: false,
+        review_sha256: None,
+    })
+}
+
+fn mail_rules_action(value: &Value) -> Result<MailRuleActionArg> {
+    mail_rules_action_value(required_string(value, "action")?)
+}
+
+fn mail_rules_action_value(value: &str) -> Result<MailRuleActionArg> {
+    match value {
+        "mark_read" => Ok(MailRuleActionArg::MarkRead),
+        "mark_unread" => Ok(MailRuleActionArg::MarkUnread),
+        "star" => Ok(MailRuleActionArg::Star),
+        "unstar" => Ok(MailRuleActionArg::Unstar),
+        _ => Err(YacliError::Validation(
+            "Неизвестное действие правила".into(),
+        )),
+    }
+}
+
+fn mail_rules_configure(args: &Value) -> Result<Value> {
+    let account = required_string(args, "account")?.to_string();
+    let id = required_string(args, "id")?.to_string();
+    let operation = required_string(args, "operation")?;
+    let config = MailRulesFile::load(&mail_rules_path()?)?;
+    if operation == "add" {
+        if args.get("account").and_then(Value::as_str) != Some(account.as_str()) {
+            return Err(YacliError::Validation(
+                "У правила требуется точный account alias".into(),
+            ));
+        }
+    } else if !config
+        .rules
+        .iter()
+        .any(|rule| rule.id == id && rule.account == account)
+    {
+        return Err(YacliError::Auth(
+            "Правило не найдено для указанного точного аккаунта".into(),
+        ));
+    }
+    if optional_bool(args, "dry_run") == Some(true) {
+        let mut proposal = args.clone();
+        if let Some(object) = proposal.as_object_mut() {
+            object.remove("dry_run");
+            object.remove("review_sha256");
+        }
+        return Ok(
+            json!({"status":"review_required","operation":"mail.rules.configure","proposal":proposal,"dry_run":true}),
+        );
+    }
+    let command = match operation {
+        "add" => MailRulesCommand::Add {
+            id,
+            account,
+            mailbox: optional_string(args, "mailbox")
+                .unwrap_or("INBOX")
+                .to_string(),
+            from_contains: optional_string_owned(args, "from_contains"),
+            subject_contains: optional_string_owned(args, "subject_contains"),
+            action: mail_rules_action(args)?,
+        },
+        "update" => MailRulesCommand::Update {
+            id,
+            account: None,
+            mailbox: optional_string_owned(args, "mailbox"),
+            from_contains: optional_string_owned(args, "from_contains"),
+            subject_contains: optional_string_owned(args, "subject_contains"),
+            clear_from: optional_bool(args, "clear_from").unwrap_or(false),
+            clear_subject: optional_bool(args, "clear_subject").unwrap_or(false),
+            action: args
+                .get("action")
+                .and_then(Value::as_str)
+                .map(mail_rules_action_value)
+                .transpose()?,
+        },
+        "enable" => MailRulesCommand::Enable { id },
+        "disable" => MailRulesCommand::Disable { id },
+        "baseline" => MailRulesCommand::Baseline { id },
+        "reset" => MailRulesCommand::Reset { id },
+        "delete" => MailRulesCommand::Delete { id },
+        _ => {
+            return Err(YacliError::Validation(
+                "Неизвестная операция правила".into(),
+            ));
+        }
+    };
+    let mut result = mail_rules_command(command)?;
+    result["dry_run"] = json!(false);
+    Ok(result)
+}
+
+fn mail_rules_run(args: &Value) -> Result<Value> {
+    let (_, id) = mail_rules_require_rule_account(args)?;
+    let dry_run = optional_bool(args, "dry_run").unwrap_or(false);
+    let apply = !dry_run && args.get("plan_sha256").is_some();
+    if devcat::enabled() && !dry_run && !apply {
+        return Err(YacliError::Validation(
+            "Для применения правила нужен plan_sha256 из preview".into(),
+        ));
+    }
+    let plan = if apply {
+        Some(required_string(args, "plan_sha256")?.to_string())
+    } else {
+        None
+    };
+    let mut result = mail_rules_command(MailRulesCommand::Run {
+        rule: Some(id),
+        apply,
+        review_sha256: plan,
+    })?;
+    result["dry_run"] = json!(dry_run);
+    Ok(result)
+}
+
+fn normalize_mail_rules_undo_plan_digest(result: &mut Value) {
+    let plan = result
+        .get("review_sha256")
+        .or_else(|| {
+            result
+                .get("preview")
+                .and_then(|preview| preview.get("review_sha256"))
+        })
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    if let Some(plan) = plan {
+        result["plan_sha256"] = Value::String(plan);
+        if result.get("review_sha256").is_some() {
+            result
+                .as_object_mut()
+                .expect("mail rules undo response is an object")
+                .remove("review_sha256");
+        }
+    }
+}
+
+fn mail_rules_undo(args: &Value) -> Result<Value> {
+    let account = required_string(args, "account")?;
+    let run_id = required_string(args, "run_id")?;
+    let audit = MailRulesAuditFile::load(&mail_rules_audit_path()?)?;
+    let run = audit
+        .run(run_id)
+        .ok_or_else(|| YacliError::Validation("Запуск правила не найден в аудите".into()))?;
+    if run.account != account {
+        return Err(YacliError::Auth(
+            "Аккаунт инструмента не совпадает с точным аккаунтом аудита".into(),
+        ));
+    }
+    let dry_run = optional_bool(args, "dry_run").unwrap_or(false);
+    let apply = !dry_run && args.get("plan_sha256").is_some();
+    if devcat::enabled() && !dry_run && !apply {
+        return Err(YacliError::Validation(
+            "Для отката правила нужен plan_sha256 из preview".into(),
+        ));
+    }
+    let plan = if apply {
+        Some(required_string(args, "plan_sha256")?.to_string())
+    } else {
+        None
+    };
+    let mut result = mail_rules_command(MailRulesCommand::Undo {
+        run_id: run_id.to_string(),
+        apply,
+        review_sha256: plan,
+    })?;
+    normalize_mail_rules_undo_plan_digest(&mut result);
+    result["dry_run"] = json!(dry_run);
+    Ok(result)
+}
+
+fn mail_draft_list(args: &Value) -> Result<Value> {
+    let (account, auth, context) =
+        resolve_mail_private_context(args.get("account").and_then(Value::as_str))?;
+    let limit = optional_usize(args, "limit").unwrap_or(20);
+    let offset = optional_usize(args, "offset").unwrap_or(0);
+    let (folder, items) =
+        list_mail_drafts_page(&context.imap_host, context.imap_port, auth, limit, offset)?;
+    Ok(json!({"account":account,"folder":folder,"limit":limit,"offset":offset,"items":items}))
+}
+
+fn mail_draft_trash(args: &Value) -> Result<Value> {
+    let uid = required_u64(args, "uid")?;
+    let uid_validity = required_u64(args, "uid_validity")?;
+    let (account, auth, context) =
+        resolve_mail_private_context(args.get("account").and_then(Value::as_str))?;
+    if optional_bool(args, "dry_run") == Some(true) {
+        let review = review_mail_draft_trash(
+            &context.imap_host,
+            context.imap_port,
+            auth,
+            uid,
+            uid_validity,
+        )?;
+        let digest = devcat::review_hash("yacli.mail.draft.trash", args)?;
+        if review.allowed {
+            devcat::record_review(digest.clone());
+        }
+        return Ok(
+            json!({"account":account,"dry_run":true,"review":review,"review_sha256":digest}),
+        );
+    }
+    let review = move_mail_draft_to_trash(
+        &context.imap_host,
+        context.imap_port,
+        auth,
+        uid,
+        uid_validity,
+    )?;
+    Ok(json!({"account":account,"moved_to_trash":true,"review":review}))
+}
+
+fn mail_draft_update(args: &Value) -> Result<Value> {
+    let uid = required_u64(args, "uid")?;
+    let uid_validity = required_u64(args, "uid_validity")?;
+    let to = required_string(args, "to")?.to_string();
+    let cc = string_list(args, "cc")?;
+    let bcc = string_list(args, "bcc")?;
+    let subject = required_string(args, "subject")?.to_string();
+    let text = optional_string_owned(args, "text");
+    let html = optional_string_owned(args, "html");
+    let attachment_paths = string_list(args, "attachments")?;
+    let attachments = load_mail_attachments(
+        &attachment_paths
+            .iter()
+            .map(PathBuf::from)
+            .collect::<Vec<_>>(),
+    )?;
+    let request = crate::mail::MailSendRequest {
+        to: vec![to],
+        cc,
+        bcc,
+        subject,
+        text,
+        html,
+        attachments,
+        thread_headers: None,
+    };
+    let expected_source_sha256 = required_string(args, "_draft_source_sha256")?;
+    let source_bytes = required_u64(args, "_draft_source_bytes")?;
+    let (account, auth, context) =
+        resolve_mail_private_context(args.get("account").and_then(Value::as_str))?;
+    if optional_bool(args, "dry_run") == Some(true) {
+        let replacement = review_mail_submission(auth, request)?;
+        let digest = devcat::review_hash("yacli.mail.draft.update", args)?;
+        devcat::record_review(digest.clone());
+        return Ok(json!({
+            "account":account,
+            "dry_run":true,
+            "source":{"uid":uid,"uid_validity":uid_validity,"bytes":source_bytes,"sha256":expected_source_sha256},
+            "replacement":replacement,
+            "review_sha256":digest
+        }));
+    }
+    let updated = update_mail_draft(
+        &context.imap_host,
+        context.imap_port,
+        auth,
+        uid,
+        uid_validity,
+        expected_source_sha256,
+        request,
+    )?;
+    Ok(json!({"account":account,"updated":updated}))
+}
+
+fn mail_checkpoint(args: &Value) -> Result<Value> {
+    let folder = optional_string(args, "folder").unwrap_or("INBOX");
+    let (account, auth, context) =
+        resolve_mail_private_context(args.get("account").and_then(Value::as_str))?;
+    let checkpoint = mail_mailbox_checkpoint(&context.imap_host, context.imap_port, auth, folder)?;
+    Ok(json!({"account":account,"checkpoint":checkpoint}))
+}
+
+fn mail_draft_create(args: &Value) -> Result<Value> {
+    let account = args.get("account").and_then(Value::as_str);
+    let to = required_string(args, "to")?.to_string();
+    let cc = string_list(args, "cc")?;
+    let bcc = string_list(args, "bcc")?;
+    let subject = required_string(args, "subject")?.to_string();
+    let text = optional_string_owned(args, "text");
+    let html = optional_string_owned(args, "html");
+    let attachment_paths = string_list(args, "attachments")?;
     let (resolved_account, auth, context) = resolve_mail_private_context(account)?;
     let attachments = load_mail_attachments(
+        &attachment_paths
+            .iter()
+            .map(PathBuf::from)
+            .collect::<Vec<_>>(),
+    )?;
+    let draft_request = crate::mail::MailSendRequest {
+        to: vec![to],
+        cc,
+        bcc,
+        subject,
+        text,
+        html,
+        attachments,
+        thread_headers: None,
+    };
+    if optional_bool(args, "dry_run") == Some(true) {
+        let review = review_mail_submission(auth, draft_request)?;
+        let digest = devcat::review_hash("yacli.mail.draft.create", args)?;
+        devcat::record_review(digest.clone());
+        return Ok(
+            json!({"dry_run":true,"operation":"mail.draft.create","account":resolved_account,"review":review,"review_sha256":digest}),
+        );
+    }
+    let draft = create_mail_draft(&context.imap_host, context.imap_port, auth, draft_request)?;
+    Ok(json!({"account":resolved_account,"created":true,"draft":draft}))
+}
+
+fn native_files_to_mail_attachments(
+    native_files: Vec<DownloadedNativeMailFile>,
+) -> (Vec<crate::mail::MailAttachmentPayload>, Vec<Value>) {
+    let metadata = native_files
+        .iter()
+        .map(|file| {
+            json!({
+                "file_id": file.file_id,
+                "filename": file.filename,
+                "mime_type": file.mime_type,
+                "size": file.content.len(),
+                "sha256": file.sha256,
+            })
+        })
+        .collect();
+    let attachments = native_files
+        .into_iter()
+        .map(|file| crate::mail::MailAttachmentPayload {
+            filename: Some(file.filename),
+            mime_type: file.mime_type,
+            content_id: None,
+            inline: false,
+            content: file.content,
+        })
+        .collect();
+    (attachments, metadata)
+}
+
+fn mail_send(
+    account: Option<&str>,
+    request: MailSendToolRequest,
+    native_files: Vec<DownloadedNativeMailFile>,
+) -> Result<Value> {
+    let (resolved_account, auth, context) = resolve_mail_private_context(account)?;
+    let mut attachments = load_mail_attachments(
         &request
             .attachment_paths
             .iter()
             .map(PathBuf::from)
             .collect::<Vec<_>>(),
     )?;
+    let (native_attachments, native_meta) = native_files_to_mail_attachments(native_files);
+    attachments.extend(native_attachments);
     let send_request = crate::mail::MailSendRequest {
         to: vec![request.to],
         cc: request.cc,
@@ -2723,6 +3987,7 @@ fn mail_send(account: Option<&str>, request: MailSendToolRequest) -> Result<Valu
         Ok(json!({
             "account": resolved_account,
             "attachments": request.attachment_paths,
+            "native_attachments": native_meta,
             "dry_run": true,
             "review": review,
             "smtp": {
@@ -2765,6 +4030,236 @@ fn mail_send(account: Option<&str>, request: MailSendToolRequest) -> Result<Valu
             "sent": sent,
         }))
     }
+}
+
+fn validate_native_attachment_url(raw: &str) -> Result<Url> {
+    let url = Url::parse(raw)
+        .map_err(|_| YacliError::Validation("native attachment URL is invalid".into()))?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(YacliError::Validation(
+            "native attachment URL must be an HTTPS URL without credentials or fragment".into(),
+        ));
+    }
+    Ok(url)
+}
+
+fn download_native_mail_files(files: &[NativeMailFile]) -> Result<Vec<DownloadedNativeMailFile>> {
+    const MAX_FILE_BYTES: usize = 10 * 1024 * 1024;
+    download_native_mail_files_with(files, |url| {
+        let host = url.host_str().ok_or_else(|| {
+            YacliError::Validation("native attachment URL must include a host".into())
+        })?;
+        let addresses = resolve_public_download_addresses(url)?;
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(30))
+            .resolve_to_addrs(host, &addresses)
+            .build()
+            .map_err(|_| YacliError::Network("native attachment client unavailable".into()))?;
+        let response = client
+            .get(url.clone())
+            .send()
+            .map_err(|_| YacliError::Network("native attachment download failed".into()))?;
+        if !response.status().is_success() {
+            return Err(YacliError::Network(
+                "native attachment download failed".into(),
+            ));
+        }
+        read_limited_native_content(response, MAX_FILE_BYTES)
+    })
+}
+
+fn resolve_public_download_addresses(url: &Url) -> Result<Vec<SocketAddr>> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| YacliError::Validation("native attachment URL must include a host".into()))?
+        .to_string();
+    let port = url.port_or_known_default().unwrap_or(443);
+    let addresses = if let Ok(ip) = host.parse::<IpAddr>() {
+        vec![SocketAddr::new(ip, port)]
+    } else {
+        resolve_dns_addresses_with(
+            move || {
+                (host.as_str(), port)
+                    .to_socket_addrs()
+                    .map(|addresses| addresses.collect::<Vec<_>>())
+            },
+            std::time::Duration::from_secs(8),
+        )?
+    };
+    if addresses.is_empty() || addresses.iter().any(|address| !is_public_ip(address.ip())) {
+        return Err(YacliError::Validation(
+            "native attachment host resolves to a non-public address".into(),
+        ));
+    }
+    Ok(addresses)
+}
+
+fn resolve_dns_addresses_with(
+    lookup: impl FnOnce() -> std::io::Result<Vec<SocketAddr>> + Send + 'static,
+    timeout: std::time::Duration,
+) -> Result<Vec<SocketAddr>> {
+    if NATIVE_FILE_DNS_LOOKUP_ACTIVE
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        return Err(YacliError::Network(
+            "native attachment DNS resolver is busy".into(),
+        ));
+    }
+    let (sender, receiver) = mpsc::channel();
+    if thread::Builder::new()
+        .name("native-file-dns".into())
+        .spawn(move || {
+            let _guard = NativeFileDnsLookupGuard;
+            let result = lookup();
+            let _ = sender.send(result);
+        })
+        .is_err()
+    {
+        NATIVE_FILE_DNS_LOOKUP_ACTIVE.store(false, Ordering::Release);
+        return Err(YacliError::Network(
+            "native attachment DNS lookup failed".into(),
+        ));
+    }
+    receiver
+        .recv_timeout(timeout)
+        .map_err(|error| match error {
+            RecvTimeoutError::Timeout => {
+                YacliError::Network("native attachment DNS lookup timed out".into())
+            }
+            RecvTimeoutError::Disconnected => {
+                YacliError::Network("native attachment DNS lookup failed".into())
+            }
+        })?
+        .map_err(|_| YacliError::Network("native attachment DNS lookup failed".into()))
+}
+
+fn is_public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let value = u32::from(ip);
+            let in_cidr = |network: u32, prefix: u32| {
+                let mask = u32::MAX << (32 - prefix);
+                value & mask == network & mask
+            };
+            !(in_cidr(0x00000000, 8)
+                || in_cidr(0x0a000000, 8)
+                || in_cidr(0x64400000, 10)
+                || in_cidr(0x7f000000, 8)
+                || in_cidr(0xa9fe0000, 16)
+                || in_cidr(0xac100000, 12)
+                || in_cidr(0xc0000000, 24)
+                || in_cidr(0xc0000200, 24)
+                || in_cidr(0xc0586300, 24)
+                || in_cidr(0xc0a80000, 16)
+                || in_cidr(0xc6120000, 15)
+                || in_cidr(0xc6336400, 24)
+                || in_cidr(0xcb007100, 24)
+                || in_cidr(0xe0000000, 4)
+                || in_cidr(0xf0000000, 4))
+        }
+        IpAddr::V6(ip) => {
+            if let Some(mapped) = ip.to_ipv4_mapped() {
+                return is_public_ip(IpAddr::V4(mapped));
+            }
+            let segments = ip.segments();
+            (segments[0] & 0xe000) == 0x2000
+                && !(segments[0] == 0x2001 && segments[1] <= 0x01ff)
+                && segments[0] != 0x2002
+                && !(segments[0] == 0x3fff && segments[1] <= 0x0fff)
+        }
+    }
+}
+
+fn download_native_mail_files_with(
+    files: &[NativeMailFile],
+    mut fetch: impl FnMut(&Url) -> Result<Vec<u8>>,
+) -> Result<Vec<DownloadedNativeMailFile>> {
+    const MAX_FILES: usize = 5;
+    const MAX_FILE_BYTES: usize = 10 * 1024 * 1024;
+    const MAX_TOTAL_BYTES: usize = 25 * 1024 * 1024;
+    if files.len() > MAX_FILES {
+        return Err(YacliError::Validation(
+            "attachment_files accepts at most 5 files".into(),
+        ));
+    }
+    let mut total_bytes = 0usize;
+    let mut downloaded = Vec::with_capacity(files.len());
+    for file in files {
+        let url = validate_native_attachment_url(&file.download_url)?;
+        let fallback_name = url
+            .path_segments()
+            .and_then(Iterator::last)
+            .unwrap_or("")
+            .to_string();
+        let content = fetch(&url)?;
+        total_bytes = total_bytes.checked_add(content.len()).ok_or_else(|| {
+            YacliError::Validation("native attachment size limit exceeded".into())
+        })?;
+        if content.len() > MAX_FILE_BYTES || total_bytes > MAX_TOTAL_BYTES {
+            return Err(YacliError::Validation(
+                "native attachment size limit exceeded".into(),
+            ));
+        }
+        let filename = safe_native_filename(file.file_name.as_deref().unwrap_or(&fallback_name));
+        let mime_type = native_mime_type(file.mime_type.as_deref(), &filename);
+        let sha256 = format!("{:x}", Sha256::digest(&content));
+        downloaded.push(DownloadedNativeMailFile {
+            file_id: file.file_id.clone(),
+            filename,
+            mime_type,
+            sha256,
+            content,
+        });
+    }
+    Ok(downloaded)
+}
+
+fn read_limited_native_content(reader: impl Read, limit: usize) -> Result<Vec<u8>> {
+    let mut content = Vec::new();
+    reader
+        .take((limit + 1) as u64)
+        .read_to_end(&mut content)
+        .map_err(|_| YacliError::Network("native attachment download failed".into()))?;
+    if content.len() > limit {
+        return Err(YacliError::Validation(
+            "native attachment size limit exceeded".into(),
+        ));
+    }
+    Ok(content)
+}
+
+fn safe_native_filename(name: &str) -> String {
+    let basename = name.rsplit(['/', '\\']).next().unwrap_or_default();
+    if basename.is_empty()
+        || basename == "."
+        || basename == ".."
+        || basename.chars().any(char::is_control)
+    {
+        "attachment.pdf".into()
+    } else {
+        basename.to_string()
+    }
+}
+
+fn native_mime_type(declared: Option<&str>, filename: &str) -> String {
+    declared
+        .filter(|mime| {
+            mime.parse::<mime_guess::mime::Mime>().is_ok() && !mime.chars().any(char::is_control)
+        })
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            mime_guess::from_path(filename)
+                .first_or_octet_stream()
+                .to_string()
+        })
 }
 
 fn mail_send_link(account: Option<&str>, request: MailSendLinkToolRequest) -> Result<Value> {
@@ -2917,28 +4412,49 @@ fn mail_send_published_link(
     }
 }
 
-fn mail_reply(
-    account: Option<&str>,
-    folder: &str,
-    uid: u64,
-    cc: Vec<String>,
-    text: Option<String>,
-    html: Option<String>,
-) -> Result<Value> {
+fn mail_reply(args: &Value, native_files: Vec<DownloadedNativeMailFile>) -> Result<Value> {
+    let account = args.get("account").and_then(Value::as_str);
+    let folder = optional_string(args, "folder").unwrap_or("INBOX");
+    let uid = required_u64(args, "uid")?;
+    let cc = string_list(args, "cc")?;
+    let reply_all = optional_bool(args, "reply_all").unwrap_or(false);
+    let dry_run = optional_bool(args, "dry_run").unwrap_or(false);
+    let text = optional_string_owned(args, "text");
+    let html = optional_string_owned(args, "html");
+    let (attachments, native_meta) = native_files_to_mail_attachments(native_files);
     let (resolved_account, auth, context) = resolve_mail_private_context(account)?;
-    let reply = crate::mail::reply_to_mail_message(
+    let request = crate::mail::MailReplyRequest {
+        uid,
+        account_email: context.email.clone(),
+        reply_all,
+        cc,
+        text,
+        html,
+    };
+    if dry_run {
+        let review = review_mail_reply_submission_with_attachments(
+            &context.imap_host,
+            context.imap_port,
+            auth,
+            folder,
+            request,
+            attachments,
+        )?;
+        let digest = devcat::review_hash("yacli.mail.reply", args)?;
+        devcat::record_review(digest.clone());
+        return Ok(
+            json!({"account":resolved_account,"folder":folder,"uid":uid,"dry_run":true,"review":review,"native_attachments":native_meta,"review_sha256":digest}),
+        );
+    }
+    let reply = reply_to_mail_message_with_attachments(
         &context.imap_host,
         context.imap_port,
         &context.smtp_host,
         context.smtp_port,
         auth,
         folder,
-        crate::mail::MailReplyRequest {
-            uid,
-            cc,
-            text,
-            html,
-        },
+        request,
+        attachments,
     )?;
     Ok(json!({
         "account": resolved_account,
@@ -2946,34 +4462,95 @@ fn mail_reply(
         "status": reply.sent.delivery_status(),
         "warning": reply.sent.delivery_warning(),
         "reply": reply,
+        "native_attachments": native_meta,
     }))
 }
 
-fn mail_forward(account: Option<&str>, request: MailForwardToolRequest) -> Result<Value> {
+fn mail_forward_tool_request(args: &Value) -> Result<MailForwardToolRequest> {
+    Ok(MailForwardToolRequest {
+        folder: optional_string(args, "folder")
+            .unwrap_or("INBOX")
+            .to_string(),
+        uid: required_u64(args, "uid")?,
+        to: required_string(args, "to")?.to_string(),
+        cc: string_list(args, "cc")?,
+        bcc: string_list(args, "bcc")?,
+        text: optional_string_owned(args, "text"),
+        html: optional_string_owned(args, "html"),
+        max_source_bytes: optional_u64(args, "max_source_bytes").unwrap_or(15 * 1024 * 1024),
+    })
+}
+
+fn mail_forward_provider_request(request: &MailForwardToolRequest) -> MailForwardRequest {
+    MailForwardRequest {
+        uid: request.uid,
+        to: vec![request.to.clone()],
+        cc: request.cc.clone(),
+        bcc: request.bcc.clone(),
+        text: request.text.clone(),
+        html: request.html.clone(),
+        max_source_bytes: request.max_source_bytes,
+    }
+}
+
+fn mail_forward(args: &Value, native_files: Vec<DownloadedNativeMailFile>) -> Result<Value> {
+    let account = args.get("account").and_then(Value::as_str);
+    let request = mail_forward_tool_request(args)?;
+    let (attachments, native_meta) = native_files_to_mail_attachments(native_files);
     let (resolved_account, auth, context) = resolve_mail_private_context(account)?;
-    let forward = crate::mail::forward_mail_message(
-        &context.imap_host,
-        context.imap_port,
-        &context.smtp_host,
-        context.smtp_port,
-        auth,
-        &request.folder,
-        crate::mail::MailForwardRequest {
-            uid: request.uid,
-            to: vec![request.to],
-            cc: request.cc,
-            bcc: request.bcc,
-            text: request.text,
-            html: request.html,
-            max_source_bytes: request.max_source_bytes,
-        },
-    )?;
+    if optional_bool(args, "dry_run") == Some(true) {
+        let review = args.get("_forward_review").cloned().ok_or_else(|| {
+            YacliError::Auth(
+                "Предварительная проверка пересылки не привязана к исходному письму.".into(),
+            )
+        })?;
+        let digest = devcat::review_hash("yacli.mail.forward", args)?;
+        devcat::record_review(digest.clone());
+        return Ok(json!({
+            "account": resolved_account,
+            "folder": request.folder,
+            "uid": request.uid,
+            "dry_run": true,
+            "review": review,
+            "native_attachments": native_meta,
+            "review_sha256": digest,
+        }));
+    }
+    let forward_request = mail_forward_provider_request(&request);
+    let forward = if devcat::enabled() {
+        let expected_source_sha256 = required_string(args, "_forward_source_sha256")?;
+        forward_mail_message_reviewed_with_attachments(
+            &context.imap_host,
+            context.imap_port,
+            &context.smtp_host,
+            context.smtp_port,
+            auth,
+            &request.folder,
+            MailForwardReviewBinding {
+                request: forward_request,
+                source_sha256: expected_source_sha256.to_string(),
+            },
+            attachments,
+        )?
+    } else {
+        forward_mail_message_with_attachments(
+            &context.imap_host,
+            context.imap_port,
+            &context.smtp_host,
+            context.smtp_port,
+            auth,
+            &request.folder,
+            forward_request,
+            attachments,
+        )?
+    };
     Ok(json!({
         "account": resolved_account,
         "folder": request.folder,
         "status": forward.sent.delivery_status(),
         "warning": forward.sent.delivery_warning(),
         "forward": forward,
+        "native_attachments": native_meta,
     }))
 }
 
@@ -3000,6 +4577,55 @@ fn mail_attachment_export(
         "folder": request.folder,
         "attachment": attachment,
     }))
+}
+
+fn mail_eml_export(args: &Value) -> Result<Value> {
+    let folder = optional_string(args, "folder").unwrap_or("INBOX");
+    let uid = required_u64(args, "uid")?;
+    let max_bytes = optional_u64(args, "max_bytes").unwrap_or(25 * 1024 * 1024);
+    let output_path = PathBuf::from(required_string(args, "output_path")?);
+    validate_mail_eml_output_path(&output_path)?;
+    let (account, auth, context) =
+        resolve_mail_private_context(args.get("account").and_then(Value::as_str))?;
+    if optional_bool(args, "dry_run") == Some(true) {
+        let review = review_mail_eml_export(
+            &context.imap_host,
+            context.imap_port,
+            auth,
+            folder,
+            uid,
+            max_bytes,
+        )?;
+        if optional_string(args, "_eml_sha256").is_some_and(|expected| expected != review.sha256) {
+            return Err(YacliError::Auth(
+                "Содержимое письма изменилось во время предварительной проверки; повторите review."
+                    .into(),
+            ));
+        }
+        let digest = devcat::review_hash("yacli.mail.eml.export", args)?;
+        devcat::record_review(digest.clone());
+        return Ok(json!({
+            "account": account,
+            "folder": folder,
+            "review": review,
+            "dry_run": true,
+            "review_sha256": digest,
+        }));
+    }
+    let exported = export_mail_eml(
+        &context.imap_host,
+        context.imap_port,
+        auth,
+        folder,
+        MailEmlExportRequest {
+            uid,
+            output: output_path,
+            force: optional_bool(args, "force").unwrap_or(false),
+            max_bytes,
+            expected_sha256: optional_string(args, "_eml_sha256").map(str::to_string),
+        },
+    )?;
+    Ok(json!({"account":account,"folder":folder,"export":exported}))
 }
 
 fn mail_invite_inspect(
@@ -3264,6 +4890,86 @@ fn disk_list(account: Option<&str>, path: &str, limit: usize, offset: u64) -> Re
     }))
 }
 
+fn disk_trash_list(account: Option<&str>, path: &str, limit: usize, offset: u64) -> Result<Value> {
+    if limit == 0 || limit > 1000 {
+        return Err(YacliError::Validation(
+            "Лимит списка Корзины должен быть от 1 до 1000".into(),
+        ));
+    }
+    validate_private_trash_path(path)?;
+    let (resolved_account, base_url, access_token) = resolve_disk_private_context(account)?;
+    let resource = list_private_trash(
+        &base_url,
+        &access_token,
+        &PrivateDiskTrashListRequest {
+            path: Some(path.to_string()),
+            limit,
+            offset,
+        },
+    )?;
+    Ok(json!({"account":resolved_account,"path":path,"resource":resource}))
+}
+
+fn disk_copy_move(args: &Value, is_move: bool) -> Result<Value> {
+    let request = PrivateDiskCopyMoveRequest {
+        source_path: required_string(args, "from_path")?.to_string(),
+        destination_path: required_string(args, "to_path")?.to_string(),
+        overwrite: optional_bool(args, "overwrite").unwrap_or(false),
+    };
+    let operation = if is_move { "disk.move" } else { "disk.copy" };
+    if optional_bool(args, "dry_run") == Some(true) {
+        return Ok(
+            json!({"dry_run":true,"operation":operation,"from_path":request.source_path,"to_path":request.destination_path,"overwrite":request.overwrite}),
+        );
+    }
+    let (account, base_url, access_token) =
+        resolve_disk_private_context(args.get("account").and_then(Value::as_str))?;
+    let receipt = if is_move {
+        move_private_resource(&base_url, &access_token, &request)?
+    } else {
+        copy_private_resource(&base_url, &access_token, &request)?
+    };
+    Ok(
+        json!({"account":account,"operation":operation,"from_path":request.source_path,"to_path":request.destination_path,"result":receipt}),
+    )
+}
+
+fn disk_trash_move(args: &Value) -> Result<Value> {
+    let path = required_string(args, "path")?;
+    if optional_bool(args, "dry_run") == Some(true) {
+        return Ok(
+            json!({"dry_run":true,"operation":"disk.trash.move","path":path,"permanently":false}),
+        );
+    }
+    let (account, base_url, access_token) =
+        resolve_disk_private_context(args.get("account").and_then(Value::as_str))?;
+    let receipt = move_private_resource_to_trash(&base_url, &access_token, path)?;
+    Ok(json!({"account":account,"path":path,"moved_to_trash":true,"result":receipt}))
+}
+
+fn disk_trash_restore(args: &Value) -> Result<Value> {
+    let request = PrivateDiskTrashRestoreRequest {
+        trash_path: required_string(args, "trash_path")?.to_string(),
+        restore_name: optional_string(args, "restore_name").map(str::to_string),
+        overwrite: optional_bool(args, "overwrite").unwrap_or(false),
+    };
+    validate_private_trash_path(&request.trash_path)?;
+    if let Some(name) = &request.restore_name {
+        validate_trash_restore_name(name)?;
+    }
+    if optional_bool(args, "dry_run") == Some(true) {
+        return Ok(
+            json!({"dry_run":true,"operation":"disk.trash.restore","trash_path":request.trash_path,"restore_name":request.restore_name,"overwrite":request.overwrite}),
+        );
+    }
+    let (account, base_url, access_token) =
+        resolve_disk_private_context(args.get("account").and_then(Value::as_str))?;
+    let receipt = restore_private_trash_resource(&base_url, &access_token, &request)?;
+    Ok(
+        json!({"account":account,"trash_path":request.trash_path,"restore_name":request.restore_name,"restored":true,"result":receipt}),
+    )
+}
+
 fn disk_read(account: Option<&str>, path: &str) -> Result<Value> {
     let (resolved_account, base_url, access_token) = resolve_disk_private_context(account)?;
     let resource = fetch_private_resource(
@@ -3297,6 +5003,31 @@ fn disk_read(account: Option<&str>, path: &str) -> Result<Value> {
     Ok(json!({"account": resolved_account, "path": path,
         "encoding": "base64", "bytes": bytes.len(),
         "data": base64::engine::general_purpose::STANDARD.encode(bytes)}))
+}
+
+fn disk_permissions(account: Option<&str>, path: &str) -> Result<Value> {
+    let (resolved_account, base_url, access_token) = resolve_disk_private_context(account)?;
+    let resource = fetch_private_resource(
+        &base_url,
+        &access_token,
+        &PrivateDiskListRequest {
+            path: path.to_string(),
+            limit: 1,
+            offset: 0,
+        },
+    )?;
+    let is_public = resource.public_url.is_some() || resource.public_key.is_some();
+    Ok(json!({
+        "account": resolved_account,
+        "path": resource.path,
+        "resource_type": resource.resource_type,
+        "public_access": {
+            "enabled": is_public,
+            "url": resource.public_url,
+            "key": resource.public_key
+        },
+        "scope": "public_link_only"
+    }))
 }
 
 fn disk_mkdir(account: Option<&str>, path: &str, dry_run: bool) -> Result<Value> {
@@ -3415,8 +5146,33 @@ fn disk_upload_link(account: Option<&str>, request: DiskUploadLinkToolRequest) -
     }
 }
 
-fn disk_download(account: Option<&str>, request: DiskDownloadToolRequest) -> Result<Value> {
+fn disk_download(args: &Value) -> Result<Value> {
+    let account = args.get("account").and_then(Value::as_str);
+    let request = DiskDownloadToolRequest {
+        path: required_string(args, "path")?.to_string(),
+        output_path: required_string(args, "output_path")?.to_string(),
+        force: optional_bool(args, "force").unwrap_or(false),
+    };
     let (resolved_account, base_url, access_token) = resolve_disk_private_context(account)?;
+    if optional_bool(args, "dry_run") == Some(true) {
+        let resource = fetch_private_resource(
+            &base_url,
+            &access_token,
+            &PrivateDiskListRequest {
+                path: request.path.clone(),
+                limit: 1,
+                offset: 0,
+            },
+        )?;
+        if resource.resource_type != "file" {
+            return Err(YacliError::UnsupportedOperation(
+                "Скачивать можно только файл, а не папку".into(),
+            ));
+        }
+        return Ok(
+            json!({"account":resolved_account,"path":request.path,"output_path":request.output_path,"force":request.force,"dry_run":true,"resource":resource}),
+        );
+    }
     let download_request = PrivateDiskDownloadRequest {
         path: request.path,
         output: PathBuf::from(request.output_path),
@@ -4786,4 +6542,329 @@ fn canonical_base_url(server_url: &str) -> Result<String> {
     parsed.set_query(None);
     parsed.set_fragment(None);
     Ok(parsed.to_string().trim_end_matches('/').to_string())
+}
+
+#[cfg(test)]
+mod native_attachment_schema_tests {
+    use super::{
+        Digest, NativeMailFile, Sha256, Url, download_native_mail_files,
+        download_native_mail_files_with, is_public_ip, native_mime_type,
+        normalize_mail_rules_undo_plan_digest, read_limited_native_content,
+        resolve_dns_addresses_with, resolve_public_download_addresses, safe_native_filename,
+        tool_definitions, validate_native_attachment_url,
+    };
+    use serde_json::json;
+
+    static DNS_RESOLVER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn mail_send_exposes_native_chatgpt_file_contract() {
+        let tools = tool_definitions(false, false).expect("tool definitions");
+        for name in ["yacli.mail.send", "yacli.mail.reply", "yacli.mail.forward"] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap_or_else(|| panic!("{name} tool"));
+            let schema = &tool["inputSchema"];
+            let native = &schema["properties"]["attachment_files"]["items"];
+            assert_eq!(native["required"], json!(["download_url", "file_id"]));
+            assert_eq!(native["properties"]["download_url"]["type"], "string");
+            assert_eq!(native["properties"]["file_id"]["type"], "string");
+            assert_eq!(native["properties"]["mime_type"]["type"], "string");
+            assert_eq!(native["properties"]["file_name"]["type"], "string");
+            assert_eq!(native["additionalProperties"], false);
+            assert_eq!(
+                tool["_meta"]["openai/fileParams"],
+                json!(["attachment_files"])
+            );
+        }
+        let send = tools
+            .iter()
+            .find(|tool| tool["name"] == "yacli.mail.send")
+            .expect("mail.send tool");
+        assert_eq!(
+            send["inputSchema"]["properties"]["attachments"]["items"]["type"],
+            "string"
+        );
+    }
+
+    #[test]
+    fn mail_rules_undo_exposes_plan_digest_for_nested_preview() {
+        let mut response = json!({"status":"preview","preview":{"review_sha256":"plan"}});
+        normalize_mail_rules_undo_plan_digest(&mut response);
+        assert_eq!(response["plan_sha256"], "plan");
+        assert_eq!(response["preview"]["review_sha256"], "plan");
+    }
+
+    #[test]
+    fn mail_rules_undo_promotes_pending_plan_digest() {
+        let mut response = json!({"status":"pending_review","review_sha256":"plan"});
+        normalize_mail_rules_undo_plan_digest(&mut response);
+        assert_eq!(response["plan_sha256"], "plan");
+        assert!(response.get("review_sha256").is_none());
+    }
+
+    #[test]
+    fn native_mail_files_preserve_bytes_and_review_metadata() {
+        let file = super::DownloadedNativeMailFile {
+            file_id: "synthetic-id".into(),
+            filename: "пример.pdf".into(),
+            mime_type: "application/pdf".into(),
+            sha256: "synthetic-sha256".into(),
+            content: b"synthetic-pdf".to_vec(),
+        };
+        let (attachments, metadata) = super::native_files_to_mail_attachments(vec![file]);
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].filename.as_deref(), Some("пример.pdf"));
+        assert_eq!(attachments[0].content, b"synthetic-pdf");
+        assert_eq!(metadata[0]["file_id"], "synthetic-id");
+        assert_eq!(metadata[0]["sha256"], "synthetic-sha256");
+    }
+
+    #[test]
+    fn mail_eml_export_schema_requires_uid_and_output_path() {
+        let tools = tool_definitions(false, false).expect("tool definitions");
+        let tool = tools
+            .iter()
+            .find(|tool| tool["name"] == "yacli.mail.eml.export")
+            .expect("mail eml export tool");
+        assert_eq!(
+            tool["inputSchema"]["required"],
+            json!(["uid", "output_path"])
+        );
+        assert_eq!(
+            tool["inputSchema"]["properties"]["max_bytes"]["maximum"],
+            26_214_400
+        );
+    }
+
+    #[test]
+    fn native_attachment_rejects_non_https_and_url_credentials() {
+        assert!(validate_native_attachment_url("http://example.test/file.pdf").is_err());
+        assert!(validate_native_attachment_url("https://user@example.test/file.pdf").is_err());
+        assert!(validate_native_attachment_url("https://example.test/file.pdf#fragment").is_err());
+        assert_eq!(
+            validate_native_attachment_url("https://files.example.test/file.pdf")
+                .expect("valid HTTPS URL")
+                .scheme(),
+            "https"
+        );
+        assert!(
+            resolve_public_download_addresses(&Url::parse("https://127.0.0.1/secret").unwrap())
+                .is_err()
+        );
+        assert!(!is_public_ip("10.1.2.3".parse().unwrap()));
+        assert!(!is_public_ip("fd00::1".parse().unwrap()));
+        assert!(!is_public_ip("3fff::1".parse().unwrap()));
+        assert!(!is_public_ip("198.19.0.1".parse().unwrap()));
+        assert!(is_public_ip("8.8.8.8".parse().unwrap()));
+        assert!(is_public_ip("2606:4700:4700::1111".parse().unwrap()));
+    }
+
+    #[test]
+    fn native_dns_timeout_bounds_stuck_resolver_threads() {
+        let _lock = DNS_RESOLVER_TEST_LOCK.lock().unwrap();
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let pending = std::thread::spawn(move || {
+            resolve_dns_addresses_with(
+                move || {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(vec!["8.8.8.8:443".parse().unwrap()])
+                },
+                Duration::from_millis(50),
+            )
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("resolver thread started");
+        assert!(pending.join().unwrap().is_err());
+
+        let second_lookup_ran = Arc::new(AtomicBool::new(false));
+        let second_lookup_started = Arc::clone(&second_lookup_ran);
+        let second = resolve_dns_addresses_with(
+            move || {
+                second_lookup_started.store(true, Ordering::Relaxed);
+                Ok(Vec::new())
+            },
+            Duration::from_millis(50),
+        );
+        assert!(second.is_err());
+        assert!(!second_lookup_ran.load(Ordering::Relaxed));
+
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let lookup_ran = Arc::new(AtomicBool::new(false));
+            let lookup_started = Arc::clone(&lookup_ran);
+            let result = resolve_dns_addresses_with(
+                move || {
+                    lookup_started.store(true, Ordering::Relaxed);
+                    Ok(vec!["8.8.8.8:443".parse().unwrap()])
+                },
+                Duration::from_millis(100),
+            );
+            if lookup_ran.load(Ordering::Relaxed) {
+                assert_eq!(result.unwrap(), vec!["8.8.8.8:443".parse().unwrap()]);
+                break;
+            }
+            assert!(Instant::now() < deadline, "resolver slot was not released");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn native_dns_resolver_slot_is_released_after_panic() {
+        let _lock = DNS_RESOLVER_TEST_LOCK.lock().unwrap();
+        let result = resolve_dns_addresses_with(
+            || -> std::io::Result<Vec<std::net::SocketAddr>> { panic!("synthetic resolver panic") },
+            std::time::Duration::from_secs(1),
+        );
+        assert!(result.is_err());
+        let next = resolve_dns_addresses_with(
+            || Ok(vec!["8.8.8.8:443".parse().unwrap()]),
+            std::time::Duration::from_secs(1),
+        );
+        assert_eq!(next.unwrap(), vec!["8.8.8.8:443".parse().unwrap()]);
+    }
+
+    #[test]
+    fn native_filename_and_mime_are_sanitized_with_fallbacks() {
+        assert_eq!(safe_native_filename("../../report.pdf"), "report.pdf");
+        assert_eq!(
+            safe_native_filename("C:\\private\\report.pdf"),
+            "report.pdf"
+        );
+        assert_eq!(safe_native_filename("../\r\nX: bad"), "attachment.pdf");
+        assert_eq!(native_mime_type(None, "report.pdf"), "application/pdf");
+        assert_eq!(
+            native_mime_type(Some(&format!("text/plain{}X: bad", '\r')), "report.pdf"),
+            "application/pdf"
+        );
+        assert_eq!(
+            native_mime_type(Some("application/x-report"), "report.pdf"),
+            "application/x-report"
+        );
+    }
+
+    #[test]
+    fn native_download_limits_count_and_reader_bytes() {
+        let files = (0..6)
+            .map(|index| NativeMailFile {
+                download_url: format!("http://invalid.test/{index}"),
+                file_id: index.to_string(),
+                mime_type: None,
+                file_name: None,
+            })
+            .collect::<Vec<_>>();
+        assert!(download_native_mail_files(&files).is_err());
+        assert!(read_limited_native_content(&b"12345"[..], 4).is_err());
+        assert_eq!(
+            read_limited_native_content(&b"1234"[..], 4).expect("within limit"),
+            b"1234"
+        );
+    }
+
+    #[test]
+    fn native_download_mock_handles_two_pdf_like_files_without_mail_transport() {
+        let files = vec![
+            NativeMailFile {
+                download_url: "https://mock.invalid/first".into(),
+                file_id: "synthetic-1".into(),
+                mime_type: None,
+                file_name: Some("../first.pdf".into()),
+            },
+            NativeMailFile {
+                download_url: "https://mock.invalid/second.pdf".into(),
+                file_id: "synthetic-2".into(),
+                mime_type: Some("application/pdf".into()),
+                file_name: None,
+            },
+        ];
+        let bodies = [
+            b"%PDF-1.7 synthetic one".to_vec(),
+            b"%PDF-1.7 synthetic two".to_vec(),
+        ];
+        let mut index = 0;
+        let downloaded = download_native_mail_files_with(&files, |url| {
+            assert_eq!(url.scheme(), "https");
+            index += 1;
+            Ok(bodies[index - 1].clone())
+        })
+        .expect("mock native downloads");
+        assert_eq!(index, 2);
+        assert_eq!(downloaded.len(), 2);
+        assert_eq!(downloaded[0].filename, "first.pdf");
+        assert_eq!(downloaded[0].mime_type, "application/pdf");
+        assert_eq!(downloaded[1].filename, "second.pdf");
+        assert_eq!(downloaded[1].mime_type, "application/pdf");
+        assert_eq!(downloaded[0].content, bodies[0]);
+        assert_eq!(downloaded[1].content, bodies[1]);
+        assert_eq!(
+            downloaded[0].sha256,
+            format!("{:x}", Sha256::digest(&bodies[0]))
+        );
+        assert_eq!(
+            downloaded[1].sha256,
+            format!("{:x}", Sha256::digest(&bodies[1]))
+        );
+    }
+
+    #[test]
+    fn native_download_enforces_total_size_limit() {
+        let files = (0..3)
+            .map(|index| NativeMailFile {
+                download_url: format!("https://mock.invalid/{index}.pdf"),
+                file_id: format!("synthetic-{index}"),
+                mime_type: Some("application/pdf".into()),
+                file_name: None,
+            })
+            .collect::<Vec<_>>();
+        let mut fetches = 0;
+        let result = download_native_mail_files_with(&files, |_| {
+            fetches += 1;
+            Ok(vec![0u8; 9 * 1024 * 1024])
+        });
+        assert!(result.is_err());
+        assert_eq!(fetches, 3);
+    }
+
+    #[test]
+    fn native_download_enforces_per_file_limit() {
+        let file = NativeMailFile {
+            download_url: "https://mock.invalid/oversized.pdf".into(),
+            file_id: "synthetic-large".into(),
+            mime_type: None,
+            file_name: None,
+        };
+        let result =
+            download_native_mail_files_with(&[file], |_| Ok(vec![0u8; 10 * 1024 * 1024 + 1]));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn native_download_errors_do_not_echo_url_or_file_id() {
+        let file = NativeMailFile {
+            download_url: "https://mock.invalid/path?token=secret-url-token".into(),
+            file_id: "secret-file-id".into(),
+            mime_type: None,
+            file_name: None,
+        };
+        let error = download_native_mail_files_with(&[file], |_| {
+            Err(crate::error::YacliError::Network(
+                "native attachment download failed".into(),
+            ))
+        })
+        .expect_err("mock download failure");
+        let message = error.to_string();
+        assert!(!message.contains("secret-url-token"));
+        assert!(!message.contains("secret-file-id"));
+        assert!(!message.contains("mock.invalid"));
+    }
 }

@@ -54,6 +54,8 @@ pub fn validate() -> Result<()> {
         "disk.write",
         "disk.delete",
         "disk.publish",
+        "contacts.read",
+        "contacts.write",
     ];
     for cap in capabilities() {
         if !known.contains(&cap.as_str()) {
@@ -147,12 +149,54 @@ pub fn has_capability(capability: &str) -> bool {
 
 fn required_capabilities(name: &str) -> Option<&'static [&'static str]> {
     match name {
-        "yacli.mail.folders" | "yacli.mail.list" | "yacli.mail.search" | "yacli.mail.read" => {
-            Some(&["mail.read"])
+        "yacli.mail.folders"
+        | "yacli.mail.list"
+        | "yacli.mail.search"
+        | "yacli.mail.read"
+        | "yacli.mail.checkpoint"
+        | "yacli.mail.draft.list"
+        | "yacli.mail.rules.list"
+        | "yacli.mail.rules.audit"
+        | "yacli.mail.rules.preview"
+        | "yacli.mail.attachment.export"
+        | "yacli.mail.eml.export" => Some(&["mail.read"]),
+        "yacli.mail.send"
+        | "yacli.mail.send_published_link"
+        | "yacli.mail.reply"
+        | "yacli.mail.forward" => Some(&["mail.send"]),
+        "yacli.mail.folder.create"
+        | "yacli.mail.folder.rename"
+        | "yacli.mail.copy"
+        | "yacli.mail.move"
+        | "yacli.mail.flags"
+        | "yacli.mail.bulk"
+        | "yacli.mail.special_folder"
+        | "yacli.mail.draft.create"
+        | "yacli.mail.draft.trash"
+        | "yacli.mail.draft.update"
+        | "yacli.mail.rules.configure"
+        | "yacli.mail.rules.run"
+        | "yacli.mail.rules.undo" => Some(&["mail.mutate"]),
+        "yacli.mail.folder.delete" => Some(&["mail.delete"]),
+        "yacli.contacts.list" | "yacli.contacts.search" | "yacli.contacts.export" => {
+            Some(&["contacts.read"])
         }
-        "yacli.mail.send" | "yacli.mail.send_published_link" => Some(&["mail.send"]),
-        "yacli.disk.info" | "yacli.disk.list" | "yacli.disk.read" => Some(&["disk.read"]),
-        "yacli.disk.mkdir" | "yacli.disk.upload" => Some(&["disk.write"]),
+        "yacli.contacts.create"
+        | "yacli.contacts.update"
+        | "yacli.contacts.delete"
+        | "yacli.contacts.import" => Some(&["contacts.write"]),
+        "yacli.disk.info"
+        | "yacli.disk.list"
+        | "yacli.disk.read"
+        | "yacli.disk.permissions"
+        | "yacli.disk.download"
+        | "yacli.disk.trash.list" => Some(&["disk.read"]),
+        "yacli.disk.mkdir"
+        | "yacli.disk.upload"
+        | "yacli.disk.copy"
+        | "yacli.disk.move"
+        | "yacli.disk.trash.restore" => Some(&["disk.write"]),
+        "yacli.disk.trash.move" => Some(&["disk.delete"]),
         "yacli.disk.publish" | "yacli.disk.unpublish" => Some(&["disk.publish"]),
         "yacli.disk.upload_link" => Some(&["disk.write", "disk.publish"]),
         "yacli.mail.send_link" => Some(&["mail.send", "disk.write", "disk.publish"]),
@@ -168,7 +212,7 @@ pub fn tool_allowed(name: &str) -> bool {
         .is_some_and(|required| required.iter().all(|cap| capabilities().contains(*cap)))
 }
 
-pub fn check_tool(name: &str, arguments: &serde_json::Value) -> Result<()> {
+pub fn check_tool_access(name: &str, arguments: &serde_json::Value) -> Result<()> {
     if !enabled() {
         return Ok(());
     }
@@ -192,8 +236,23 @@ pub fn check_tool(name: &str, arguments: &serde_json::Value) -> Result<()> {
             return Err(YacliError::Auth("MCP account denied".into()));
         }
     }
+    Ok(())
+}
+
+pub fn check_tool(name: &str, arguments: &serde_json::Value) -> Result<()> {
+    check_tool_access(name, arguments)?;
+    if !enabled() {
+        return Ok(());
+    }
     if name.starts_with("yacli.disk.")
-        && name != "yacli.disk.info"
+        && !matches!(
+            name,
+            "yacli.disk.info"
+                | "yacli.disk.trash.list"
+                | "yacli.disk.copy"
+                | "yacli.disk.move"
+                | "yacli.disk.trash.restore"
+        )
         && arguments
             .get("path")
             .and_then(serde_json::Value::as_str)
@@ -213,12 +272,39 @@ pub fn check_tool(name: &str, arguments: &serde_json::Value) -> Result<()> {
             "DevCat send_link requires disk_path".into(),
         ));
     }
-    for field in ["path", "disk_path"] {
+    for field in ["path", "disk_path", "from_path", "to_path"] {
         if let Some(path) = arguments.get(field).and_then(serde_json::Value::as_str) {
             if name.starts_with("yacli.disk.") || name == "yacli.mail.send_link" {
-                check_disk_path(path)?;
+                if name == "yacli.disk.trash.list" {
+                    crate::disk::validate_private_trash_path(path)?;
+                } else {
+                    check_disk_path(path)?;
+                }
             }
         }
+    }
+    if name == "yacli.disk.trash.restore" {
+        crate::disk::validate_private_trash_path(
+            arguments
+                .get("trash_path")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| YacliError::Validation("Параметр trash_path обязателен".into()))?,
+        )?;
+        if let Some(name) = arguments
+            .get("restore_name")
+            .and_then(serde_json::Value::as_str)
+        {
+            crate::disk::validate_trash_restore_name(name)?;
+        }
+    }
+    if matches!(
+        name,
+        "yacli.disk.download" | "yacli.mail.attachment.export" | "yacli.mail.eml.export"
+    ) && let Some(path) = arguments
+        .get("output_path")
+        .and_then(serde_json::Value::as_str)
+    {
+        check_local_download(path)?;
     }
     for field in ["source", "source_path"] {
         if let Some(path) = arguments.get(field).and_then(serde_json::Value::as_str) {
@@ -241,15 +327,25 @@ pub fn check_tool(name: &str, arguments: &serde_json::Value) -> Result<()> {
             .and_then(serde_json::Value::as_bool)
             != Some(true)
     {
-        let supplied = arguments
-            .get("review_sha256")
-            .and_then(serde_json::Value::as_str);
-        let expected = review_hash(name, arguments)?;
-        if supplied != Some(expected.as_str()) || !consume_review(&expected) {
-            return Err(YacliError::Auth(format!(
-                "{name} requires review_sha256 from its dry run"
-            )));
-        }
+        check_review_binding(name, arguments)?;
+    }
+    Ok(())
+}
+
+pub fn run_after_tool_check<T>(check: Result<()>, action: impl FnOnce() -> Result<T>) -> Result<T> {
+    check?;
+    action()
+}
+
+fn check_review_binding(name: &str, arguments: &serde_json::Value) -> Result<()> {
+    let supplied = arguments
+        .get("review_sha256")
+        .and_then(serde_json::Value::as_str);
+    let expected = review_hash(name, arguments)?;
+    if supplied != Some(expected.as_str()) || !consume_review(&expected) {
+        return Err(YacliError::Auth(format!(
+            "{name} requires review_sha256 from its dry run"
+        )));
     }
     Ok(())
 }
@@ -280,11 +376,37 @@ pub fn is_risky(name: &str) -> bool {
         "yacli.mail.send"
             | "yacli.mail.send_link"
             | "yacli.mail.send_published_link"
+            | "yacli.mail.reply"
+            | "yacli.mail.forward"
+            | "yacli.mail.folder.create"
+            | "yacli.mail.folder.rename"
+            | "yacli.mail.folder.delete"
+            | "yacli.mail.copy"
+            | "yacli.mail.move"
+            | "yacli.mail.flags"
+            | "yacli.mail.bulk"
+            | "yacli.mail.special_folder"
+            | "yacli.mail.draft.trash"
+            | "yacli.mail.draft.update"
+            | "yacli.mail.draft.create"
+            | "yacli.mail.rules.configure"
+            | "yacli.mail.rules.run"
+            | "yacli.mail.rules.undo"
+            | "yacli.mail.eml.export"
+            | "yacli.contacts.create"
+            | "yacli.contacts.update"
+            | "yacli.contacts.delete"
+            | "yacli.contacts.import"
             | "yacli.disk.mkdir"
             | "yacli.disk.upload"
             | "yacli.disk.publish"
             | "yacli.disk.unpublish"
             | "yacli.disk.upload_link"
+            | "yacli.disk.download"
+            | "yacli.disk.copy"
+            | "yacli.disk.move"
+            | "yacli.disk.trash.move"
+            | "yacli.disk.trash.restore"
     )
 }
 
@@ -354,6 +476,51 @@ fn check_local_upload(path: &str) -> Result<()> {
     } else {
         Err(YacliError::Auth(
             "upload source is outside allowed roots".into(),
+        ))
+    }
+}
+
+fn check_local_download(path: &str) -> Result<()> {
+    let roots = std::env::var("YACLI_DEVCAT_DOWNLOAD_ROOTS")
+        .map_err(|_| YacliError::Auth("Не настроены разрешенные папки для скачивания".into()))?;
+    validate_local_download_path(path, &roots)
+}
+
+fn validate_local_download_path(path: &str, roots: &str) -> Result<()> {
+    let output = Path::new(path);
+    let file_name = output
+        .file_name()
+        .ok_or_else(|| YacliError::Validation("Для сохранения скачивания укажите файл".into()))?;
+    if file_name.is_empty() || file_name == "." || file_name == ".." {
+        return Err(YacliError::Validation(
+            "Имя файла для скачивания недопустимо".into(),
+        ));
+    }
+    let parent = output.parent().unwrap_or_else(|| Path::new("."));
+    let canonical_parent = std::fs::canonicalize(parent)?;
+    match std::fs::symlink_metadata(output) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(YacliError::Validation(
+                "Путь сохранения скачивания не должен быть символической ссылкой".into(),
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    if roots
+        .split(',')
+        .map(str::trim)
+        .filter(|root| !root.is_empty())
+        .any(|root| {
+            std::fs::canonicalize(Path::new(root))
+                .is_ok_and(|root| canonical_parent.starts_with(root))
+        })
+    {
+        Ok(())
+    } else {
+        Err(YacliError::Auth(
+            "Папка сохранения находится вне разрешенных корневых папок".into(),
         ))
     }
 }
@@ -440,6 +607,186 @@ mod tests {
     }
 
     #[test]
+    fn contacts_tools_require_only_the_contacts_read_capability() {
+        assert_eq!(
+            required_capabilities("yacli.contacts.list"),
+            Some(["contacts.read"].as_slice())
+        );
+        assert_eq!(
+            required_capabilities("yacli.contacts.search"),
+            Some(["contacts.read"].as_slice())
+        );
+    }
+
+    #[test]
+    fn mail_eml_export_uses_read_scope_with_a_review_gate() {
+        assert_eq!(
+            required_capabilities("yacli.mail.eml.export"),
+            Some(["mail.read"].as_slice())
+        );
+        assert!(is_risky("yacli.mail.eml.export"));
+    }
+
+    #[test]
+    fn contact_writes_require_contacts_write_and_are_review_gated() {
+        for name in [
+            "yacli.contacts.create",
+            "yacli.contacts.update",
+            "yacli.contacts.delete",
+        ] {
+            assert_eq!(
+                required_capabilities(name),
+                Some(["contacts.write"].as_slice())
+            );
+            assert!(is_risky(name));
+        }
+    }
+
+    #[test]
+    fn mail_mutations_require_capability_and_review() {
+        for name in [
+            "yacli.mail.folder.create",
+            "yacli.mail.folder.rename",
+            "yacli.mail.folder.delete",
+            "yacli.mail.copy",
+            "yacli.mail.move",
+            "yacli.mail.flags",
+            "yacli.mail.bulk",
+            "yacli.mail.special_folder",
+            "yacli.mail.draft.create",
+            "yacli.mail.draft.trash",
+            "yacli.mail.draft.update",
+        ] {
+            assert_eq!(
+                required_capabilities(name),
+                if name == "yacli.mail.folder.delete" {
+                    Some(["mail.delete"].as_slice())
+                } else {
+                    Some(["mail.mutate"].as_slice())
+                }
+            );
+            assert!(is_risky(name));
+        }
+    }
+
+    #[test]
+    fn draft_listing_is_read_only_mail_capability() {
+        assert_eq!(
+            required_capabilities("yacli.mail.draft.list"),
+            Some(["mail.read"].as_slice())
+        );
+        assert!(!is_risky("yacli.mail.draft.list"));
+    }
+
+    #[test]
+    fn mailbox_checkpoint_is_read_only_mail_capability() {
+        assert_eq!(
+            required_capabilities("yacli.mail.checkpoint"),
+            Some(["mail.read"].as_slice())
+        );
+        assert!(!is_risky("yacli.mail.checkpoint"));
+    }
+
+    #[test]
+    fn mail_reply_uses_send_capability_and_review_gate() {
+        assert_eq!(
+            required_capabilities("yacli.mail.reply"),
+            Some(["mail.send"].as_slice())
+        );
+        assert!(is_risky("yacli.mail.reply"));
+        assert_eq!(
+            required_capabilities("yacli.mail.forward"),
+            Some(["mail.send"].as_slice())
+        );
+        assert!(is_risky("yacli.mail.forward"));
+    }
+
+    #[test]
+    fn forward_review_hash_binds_the_source_message_digest() {
+        let one = serde_json::json!({
+            "uid": 17,
+            "to": "test@example.test",
+            "_forward_source_sha256": "source-one"
+        });
+        let changed_source = serde_json::json!({
+            "uid": 17,
+            "to": "test@example.test",
+            "_forward_source_sha256": "source-two"
+        });
+        assert_ne!(
+            review_hash("yacli.mail.forward", &one).unwrap(),
+            review_hash("yacli.mail.forward", &changed_source).unwrap()
+        );
+    }
+
+    #[test]
+    fn disk_resource_mutations_use_scoped_capabilities_and_review() {
+        for name in [
+            "yacli.disk.copy",
+            "yacli.disk.move",
+            "yacli.disk.trash.restore",
+        ] {
+            assert_eq!(required_capabilities(name), Some(["disk.write"].as_slice()));
+            assert!(is_risky(name));
+        }
+        assert_eq!(
+            required_capabilities("yacli.disk.trash.move"),
+            Some(["disk.delete"].as_slice())
+        );
+        assert!(is_risky("yacli.disk.trash.move"));
+        assert_eq!(
+            required_capabilities("yacli.disk.trash.list"),
+            Some(["disk.read"].as_slice())
+        );
+        assert!(!is_risky("yacli.disk.trash.list"));
+        assert_eq!(
+            required_capabilities("yacli.disk.download"),
+            Some(["disk.read"].as_slice())
+        );
+        assert!(is_risky("yacli.disk.download"));
+        assert_eq!(
+            required_capabilities("yacli.disk.permissions"),
+            Some(["disk.read"].as_slice())
+        );
+        assert!(!is_risky("yacli.disk.permissions"));
+    }
+
+    #[test]
+    fn local_download_outputs_stay_in_configured_roots_and_reject_symlinks() {
+        let root = tempfile::tempdir().expect("root");
+        let outside = tempfile::tempdir().expect("outside");
+        let inside_output = root.path().join("download.bin");
+        assert!(
+            validate_local_download_path(
+                inside_output.to_str().expect("path"),
+                root.path().to_str().expect("root path")
+            )
+            .is_ok()
+        );
+        let outside_output = outside.path().join("download.bin");
+        assert!(
+            validate_local_download_path(
+                outside_output.to_str().expect("path"),
+                root.path().to_str().expect("root path")
+            )
+            .is_err()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let link = root.path().join("link.bin");
+            symlink(outside.path().join("target.bin"), &link).expect("symlink");
+            assert!(
+                validate_local_download_path(
+                    link.to_str().expect("path"),
+                    root.path().to_str().expect("root path")
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn rejects_traversal_forms() {
         for path in [
             "disk:/safe/../private",
@@ -469,6 +816,47 @@ mod tests {
             review_hash("yacli.disk.publish", &one).unwrap(),
             review_hash("yacli.disk.publish", &changed).unwrap()
         );
+    }
+
+    #[test]
+    fn review_hash_binds_native_attachment_content_digests() {
+        let one = serde_json::json!({
+            "attachment_files": [{"file_id":"file-a", "download_url":"https://files.example/a.pdf"}],
+            "_native_attachment_sha256": ["aaaa"]
+        });
+        let changed_content = serde_json::json!({
+            "attachment_files": [{"file_id":"file-a", "download_url":"https://files.example/a.pdf"}],
+            "_native_attachment_sha256": ["bbbb"]
+        });
+        assert_ne!(
+            review_hash("yacli.mail.send", &one).unwrap(),
+            review_hash("yacli.mail.send", &changed_content).unwrap()
+        );
+    }
+
+    #[test]
+    fn changed_native_file_after_preview_is_rejected_before_send_action() {
+        let mut preview = serde_json::json!({
+            "to": "self@example.test",
+            "subject": "synthetic preview",
+            "dry_run": true,
+            "attachment_files": [{"file_id":"file-a", "download_url":"https://files.example/a.pdf"}],
+            "_native_attachment_sha256": ["digest-before"]
+        });
+        let binding = review_hash("yacli.mail.send", &preview).unwrap();
+        record_review(binding.clone());
+
+        preview["dry_run"] = serde_json::Value::Bool(false);
+        preview["review_sha256"] = serde_json::Value::String(binding);
+        preview["_native_attachment_sha256"] = serde_json::json!(["digest-after"]);
+        let mut smtp_attempts = 0;
+        let result =
+            run_after_tool_check(check_review_binding("yacli.mail.send", &preview), || {
+                smtp_attempts += 1;
+                Ok(())
+            });
+        assert!(result.is_err());
+        assert_eq!(smtp_attempts, 0);
     }
 
     #[test]
