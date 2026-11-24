@@ -950,6 +950,8 @@ fn update_mail_draft_session<S: Read + Write>(
                 .into(),
         ));
     }
+    let append_mailbox_status =
+        select_mailbox_with_expected_uid_validity_status(session, draft_folder, uid_validity)?;
     if session
         .append_draft(draft_folder, replacement_message.as_bytes())
         .is_err()
@@ -957,7 +959,13 @@ fn update_mail_draft_session<S: Read + Write>(
         // Сервер может сохранить APPEND, а затем вернуть отрицательный ответ.
         // Не повторяем запись: ищем замену по созданному Message-ID и продолжаем
         // только при подтверждении ровно одного совпадения.
-        match confirm_appended_draft(session, draft_folder, uid_validity, replacement_message_id) {
+        match confirm_appended_draft(
+            session,
+            draft_folder,
+            uid_validity,
+            append_mailbox_status.uid_next,
+            replacement_message_id,
+        ) {
             Ok(true) => {}
             Ok(false) => {
                 return Err(YacliError::Api(
@@ -1000,19 +1008,36 @@ fn confirm_appended_draft<S: Read + Write>(
     session: &mut ImapSession<S>,
     draft_folder: &str,
     uid_validity: u64,
+    first_possible_uid: Option<u64>,
     expected_message_id: &str,
 ) -> Result<bool> {
-    select_mailbox_with_expected_uid_validity(session, draft_folder, uid_validity)?;
-    let matching_uids = session.search_uids_by_message_id(expected_message_id)?;
-    let [uid] = matching_uids.as_slice() else {
+    let Some(first_possible_uid) = first_possible_uid.filter(|uid| *uid > 0) else {
         return Ok(false);
     };
-    let message = session.fetch_message_rfc822_limited(*uid, SMTP_SAFE_MESSAGE_BYTES as u64)?;
-    Ok(mail_message_id_matches(&message, expected_message_id))
+    let status =
+        select_mailbox_with_expected_uid_validity_status(session, draft_folder, uid_validity)?;
+    if !matches!(status.uid_next, Some(uid_next) if uid_next > first_possible_uid) {
+        return Ok(false);
+    }
+    let candidate_uids = session.search_uids_after(first_possible_uid - 1)?;
+    if candidate_uids.is_empty() || candidate_uids.len() > 50 {
+        return Ok(false);
+    }
+    let mut exact_matches = 0;
+    for uid in candidate_uids {
+        let (_, headers) = session.fetch_message_headers(uid, &["MESSAGE-ID"])?;
+        if mail_message_id_header_matches(&headers, expected_message_id) {
+            exact_matches += 1;
+            if exact_matches > 1 {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(exact_matches == 1)
 }
 
-fn mail_message_id_matches(message: &[u8], expected: &str) -> bool {
-    let Ok(parsed) = mailparse::parse_mail(message) else {
+fn mail_message_id_header_matches(headers: &[u8], expected: &str) -> bool {
+    let Ok(parsed) = mailparse::parse_mail(headers) else {
         return false;
     };
     let Some(actual) = parsed.headers.get_first_value("Message-ID") else {
@@ -1536,6 +1561,15 @@ fn select_mailbox_with_expected_uid_validity<S: Read + Write>(
     mailbox_name: &str,
     expected_uid_validity: u64,
 ) -> Result<()> {
+    select_mailbox_with_expected_uid_validity_status(session, mailbox_name, expected_uid_validity)
+        .map(|_| ())
+}
+
+fn select_mailbox_with_expected_uid_validity_status<S: Read + Write>(
+    session: &mut ImapSession<S>,
+    mailbox_name: &str,
+    expected_uid_validity: u64,
+) -> Result<ImapMailboxSelectStatus> {
     if expected_uid_validity == 0 {
         return Err(YacliError::Validation(
             "UIDVALIDITY must be greater than zero".into(),
@@ -1547,7 +1581,7 @@ fn select_mailbox_with_expected_uid_validity<S: Read + Write>(
             "Папка изменила UIDVALIDITY после получения списка; обновите список писем и повторите проверку".into(),
         ));
     }
-    Ok(())
+    Ok(status)
 }
 
 fn validate_folder_name(folder: &str) -> Result<&str> {
@@ -2870,30 +2904,6 @@ impl<S: Read + Write> ImapSession<S> {
             &self.current_tag(),
             &tagged,
             "IMAP UID SEARCH",
-            TaggedErrorKind::Api,
-        )?;
-        parse_search_uids(&lines)
-    }
-
-    fn search_uids_by_message_id(&mut self, message_id: &str) -> Result<Vec<u64>> {
-        let normalized = normalize_message_id(message_id);
-        if normalized.is_empty()
-            || !normalized.is_ascii()
-            || normalized.contains(['\r', '\n', '\0', '<', '>'])
-        {
-            return Err(YacliError::Validation(
-                "Некорректный Message-ID для поиска IMAP".into(),
-            ));
-        }
-        let search_value = format!("<{normalized}>");
-        let (lines, tagged) = self.run_command(&format!(
-            "UID SEARCH HEADER Message-ID {}",
-            quote_imap_string(&search_value)
-        ))?;
-        parse_tagged_status(
-            &self.current_tag(),
-            &tagged,
-            "IMAP UID SEARCH HEADER Message-ID",
             TaggedErrorKind::Api,
         )?;
         parse_search_uids(&lines)
@@ -5377,12 +5387,14 @@ mod tests {
         let source = b"Subject: original\r\n\r\nsource";
         let replacement =
             b"Subject: replacement\r\nMessage-ID: <replacement@example.invalid>\r\n\r\nreplacement";
+        let replacement_headers = b"Message-ID: <replacement@example.invalid>\r\n\r\n";
         let script = format!(
-            "* OK [UIDVALIDITY 30] valid\r\n* OK [UIDNEXT 16] next\r\nA0001 OK [READ-WRITE] selected\r\n* SEARCH 15\r\nA0002 OK searched\r\n* 1 FETCH (UID 15 BODY[] {{{}}}\r\n{} )\r\nA0003 OK fetched\r\n+ Ready for literal\r\nA0004 NO [TEMPFAIL] response failed after commit\r\n* OK [UIDVALIDITY 30] valid\r\n* OK [UIDNEXT 17] next\r\nA0005 OK [READ-WRITE] selected\r\n* SEARCH 16\r\nA0006 OK searched\r\n* 1 FETCH (UID 16 BODY[] {{{}}}\r\n{} )\r\nA0007 OK fetched\r\n* OK [UIDVALIDITY 30] valid\r\n* OK [UIDNEXT 17] next\r\nA0008 OK [READ-WRITE] selected\r\n* SEARCH 15 16\r\nA0009 OK searched\r\n* 1 FETCH (UID 15 BODY[] {{{}}}\r\n{} )\r\nA0010 OK fetched\r\nA0011 OK moved\r\n",
+            "* OK [UIDVALIDITY 30] valid\r\n* OK [UIDNEXT 16] next\r\nA0001 OK [READ-WRITE] selected\r\n* SEARCH 15\r\nA0002 OK searched\r\n* 1 FETCH (UID 15 BODY[] {{{}}}\r\n{} )\r\nA0003 OK fetched\r\n* OK [UIDVALIDITY 30] valid\r\n* OK [UIDNEXT 16] next\r\nA0004 OK [READ-WRITE] selected\r\n+ Ready for literal\r\nA0005 NO [TEMPFAIL] response failed after commit\r\n* OK [UIDVALIDITY 30] valid\r\n* OK [UIDNEXT 17] next\r\nA0006 OK [READ-WRITE] selected\r\n* SEARCH 16\r\nA0007 OK searched\r\n* 1 FETCH (UID 16 FLAGS (\\Draft) RFC822.SIZE {} BODY[HEADER.FIELDS (MESSAGE-ID)] {{{}}}\r\n{} )\r\nA0008 OK fetched\r\n* OK [UIDVALIDITY 30] valid\r\n* OK [UIDNEXT 17] next\r\nA0009 OK [READ-WRITE] selected\r\n* SEARCH 15 16\r\nA0010 OK searched\r\n* 1 FETCH (UID 15 BODY[] {{{}}}\r\n{} )\r\nA0011 OK fetched\r\nA0012 OK moved\r\n",
             source.len(),
             String::from_utf8_lossy(source),
-            replacement.len(),
-            String::from_utf8_lossy(replacement),
+            replacement_headers.len(),
+            replacement_headers.len(),
+            String::from_utf8_lossy(replacement_headers),
             source.len(),
             String::from_utf8_lossy(source),
         );
@@ -5404,26 +5416,25 @@ mod tests {
 
         assert!(result.old_moved_to_trash);
         let commands = session.reader.get_ref().written();
-        assert!(
-            commands.contains(
-                "A0006 UID SEARCH HEADER Message-ID \"<replacement@example.invalid>\"\r\n"
-            )
-        );
-        assert!(commands.contains("A0011 UID MOVE 15 \"Trash\"\r\n"));
+        assert!(commands.contains("A0007 UID SEARCH UID 16:*\r\n"));
+        assert!(commands.contains(
+            "A0008 UID FETCH 16 (UID FLAGS RFC822.SIZE BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])\r\n"
+        ));
+        assert!(commands.contains("A0012 UID MOVE 15 \"Trash\"\r\n"));
         assert_eq!(commands.matches(" APPEND ").count(), 1);
     }
 
     #[test]
     fn draft_update_keeps_source_when_append_message_id_does_not_match() {
         let source = b"Subject: original\r\n\r\nsource";
-        let unrelated =
-            b"Subject: unrelated\r\nMessage-ID: <other@example.invalid>\r\n\r\nunrelated";
+        let unrelated_headers = b"Message-ID: <other@example.invalid>\r\n\r\n";
         let script = format!(
-            "* OK [UIDVALIDITY 30] valid\r\n* OK [UIDNEXT 16] next\r\nA0001 OK [READ-WRITE] selected\r\n* SEARCH 15\r\nA0002 OK searched\r\n* 1 FETCH (UID 15 BODY[] {{{}}}\r\n{} )\r\nA0003 OK fetched\r\n+ Ready for literal\r\nA0004 NO [TEMPFAIL] append rejected\r\n* OK [UIDVALIDITY 30] valid\r\n* OK [UIDNEXT 17] next\r\nA0005 OK [READ-WRITE] selected\r\n* SEARCH 16\r\nA0006 OK searched\r\n* 1 FETCH (UID 16 BODY[] {{{}}}\r\n{} )\r\nA0007 OK fetched\r\n",
+            "* OK [UIDVALIDITY 30] valid\r\n* OK [UIDNEXT 16] next\r\nA0001 OK [READ-WRITE] selected\r\n* SEARCH 15\r\nA0002 OK searched\r\n* 1 FETCH (UID 15 BODY[] {{{}}}\r\n{} )\r\nA0003 OK fetched\r\n* OK [UIDVALIDITY 30] valid\r\n* OK [UIDNEXT 16] next\r\nA0004 OK [READ-WRITE] selected\r\n+ Ready for literal\r\nA0005 NO [TEMPFAIL] append rejected\r\n* OK [UIDVALIDITY 30] valid\r\n* OK [UIDNEXT 17] next\r\nA0006 OK [READ-WRITE] selected\r\n* SEARCH 16\r\nA0007 OK searched\r\n* 1 FETCH (UID 16 FLAGS (\\Draft) RFC822.SIZE {} BODY[HEADER.FIELDS (MESSAGE-ID)] {{{}}}\r\n{} )\r\nA0008 OK fetched\r\n",
             source.len(),
             String::from_utf8_lossy(source),
-            unrelated.len(),
-            String::from_utf8_lossy(unrelated),
+            unrelated_headers.len(),
+            unrelated_headers.len(),
+            String::from_utf8_lossy(unrelated_headers),
         );
         let mut session = ImapSession::from_stream(FakeStream::new(&script));
         let source_sha256 = format!("{:x}", super::Sha256::digest(source));
@@ -5442,7 +5453,10 @@ mod tests {
 
         assert!(result.is_err());
         let commands = session.reader.get_ref().written();
-        assert!(commands.contains("UID SEARCH HEADER Message-ID"));
+        assert!(commands.contains("UID SEARCH UID 16:*\r\n"));
+        assert!(commands.contains(
+            "UID FETCH 16 (UID FLAGS RFC822.SIZE BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])"
+        ));
         assert!(!commands.contains("UID MOVE"));
         assert_eq!(commands.matches(" APPEND ").count(), 1);
     }
