@@ -1505,6 +1505,8 @@ fn mail_forward_source_digest(source: &MailMessage) -> String {
     add(source.message_id.as_deref().unwrap_or_default().as_bytes());
     add(source.subject.as_deref().unwrap_or_default().as_bytes());
     add(source.from.as_deref().unwrap_or_default().as_bytes());
+    add(source.to.as_deref().unwrap_or_default().as_bytes());
+    add(source.cc.as_deref().unwrap_or_default().as_bytes());
     add(source.date.as_deref().unwrap_or_default().as_bytes());
     add(source.text_body.as_deref().unwrap_or_default().as_bytes());
     add(source.html_body.as_deref().unwrap_or_default().as_bytes());
@@ -4590,7 +4592,7 @@ mod tests {
             uid: 42,
             subject: Some("Original".into()),
             from: Some("sender@example.test".into()),
-            to: None,
+            to: Some("first@example.test".into()),
             cc: None,
             date: Some("2026-11-24".into()),
             message_id: Some("<original@example.test>".into()),
@@ -4609,7 +4611,13 @@ mod tests {
         };
         let before = super::mail_forward_source_digest(&message);
         message.raw_attachments[0].content = b"changed bytes".to_vec();
-        assert_ne!(before, super::mail_forward_source_digest(&message));
+        let changed_attachment = super::mail_forward_source_digest(&message);
+        assert_ne!(before, changed_attachment);
+        message.to = Some("second@example.test".into());
+        assert_ne!(
+            changed_attachment,
+            super::mail_forward_source_digest(&message)
+        );
     }
 
     #[test]
