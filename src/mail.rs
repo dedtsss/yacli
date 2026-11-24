@@ -467,6 +467,12 @@ pub struct MailForwardRequest {
     pub max_source_bytes: u64,
 }
 
+#[derive(Clone, Debug)]
+pub struct MailForwardReviewBinding {
+    pub request: MailForwardRequest,
+    pub source_sha256: String,
+}
+
 struct NormalizedOutgoingBody {
     text: Option<String>,
     html: Option<String>,
@@ -1382,6 +1388,54 @@ pub fn forward_mail_message(
     mailbox_name: &str,
     request: MailForwardRequest,
 ) -> Result<ForwardedMail> {
+    let (source, submission) =
+        build_mail_forward_submission(imap_host, imap_port, &auth, mailbox_name, request)?;
+    send_forwarded_mail_message(
+        imap_host, imap_port, smtp_host, smtp_port, auth, source, submission,
+    )
+}
+
+pub fn review_mail_forward_submission(
+    imap_host: &str,
+    imap_port: u16,
+    auth: MailSessionAuth,
+    mailbox_name: &str,
+    request: MailForwardRequest,
+) -> Result<(MailSendReview, String)> {
+    let (source, submission) =
+        build_mail_forward_submission(imap_host, imap_port, &auth, mailbox_name, request)?;
+    let source_digest = mail_forward_source_digest(&source);
+    Ok((review_mail_submission(auth, submission)?, source_digest))
+}
+
+pub fn forward_mail_message_reviewed(
+    imap_host: &str,
+    imap_port: u16,
+    smtp_host: &str,
+    smtp_port: u16,
+    auth: MailSessionAuth,
+    mailbox_name: &str,
+    binding: MailForwardReviewBinding,
+) -> Result<ForwardedMail> {
+    let (source, submission) =
+        build_mail_forward_submission(imap_host, imap_port, &auth, mailbox_name, binding.request)?;
+    if mail_forward_source_digest(&source) != binding.source_sha256 {
+        return Err(YacliError::Auth(
+            "Исходное письмо изменилось после предварительной проверки; повторите review перед отправкой.".into(),
+        ));
+    }
+    send_forwarded_mail_message(
+        imap_host, imap_port, smtp_host, smtp_port, auth, source, submission,
+    )
+}
+
+fn build_mail_forward_submission(
+    imap_host: &str,
+    imap_port: u16,
+    auth: &MailSessionAuth,
+    mailbox_name: &str,
+    request: MailForwardRequest,
+) -> Result<(MailMessage, MailSendRequest)> {
     if request.uid == 0 {
         return Err(YacliError::Validation(
             "mail forward <id> must be greater than zero".to_string(),
@@ -1402,26 +1456,34 @@ pub fn forward_mail_message(
         normalized.intro_text.as_deref(),
         normalized.intro_html.as_deref(),
     );
+    let submission = MailSendRequest {
+        to: normalized.to,
+        cc: normalized.cc,
+        bcc: normalized.bcc,
+        subject: normalize_forward_subject(source.subject.as_deref()),
+        text: Some(body.text),
+        html: body.html,
+        attachments: source
+            .raw_attachments
+            .iter()
+            .map(MailAttachmentPart::payload)
+            .collect(),
+        thread_headers: None,
+    };
+    Ok((source, submission))
+}
+
+fn send_forwarded_mail_message(
+    imap_host: &str,
+    imap_port: u16,
+    smtp_host: &str,
+    smtp_port: u16,
+    auth: MailSessionAuth,
+    source: MailMessage,
+    submission: MailSendRequest,
+) -> Result<ForwardedMail> {
     let sent = send_mail_message_with_sent_copy(
-        smtp_host,
-        smtp_port,
-        imap_host,
-        imap_port,
-        auth,
-        MailSendRequest {
-            to: normalized.to,
-            cc: normalized.cc,
-            bcc: normalized.bcc,
-            subject: normalize_forward_subject(source.subject.as_deref()),
-            text: Some(body.text),
-            html: body.html,
-            attachments: source
-                .raw_attachments
-                .iter()
-                .map(MailAttachmentPart::payload)
-                .collect(),
-            thread_headers: None,
-        },
+        smtp_host, smtp_port, imap_host, imap_port, auth, submission,
     )?;
 
     Ok(ForwardedMail {
@@ -1431,6 +1493,37 @@ pub fn forward_mail_message(
         attachments: source.attachments,
         sent,
     })
+}
+
+fn mail_forward_source_digest(source: &MailMessage) -> String {
+    let mut digest = Sha256::new();
+    let mut add = |bytes: &[u8]| {
+        digest.update((bytes.len() as u64).to_be_bytes());
+        digest.update(bytes);
+    };
+    add(&source.uid.to_be_bytes());
+    add(source.message_id.as_deref().unwrap_or_default().as_bytes());
+    add(source.subject.as_deref().unwrap_or_default().as_bytes());
+    add(source.from.as_deref().unwrap_or_default().as_bytes());
+    add(source.date.as_deref().unwrap_or_default().as_bytes());
+    add(source.text_body.as_deref().unwrap_or_default().as_bytes());
+    add(source.html_body.as_deref().unwrap_or_default().as_bytes());
+    for attachment in &source.raw_attachments {
+        add(attachment
+            .filename
+            .as_deref()
+            .unwrap_or_default()
+            .as_bytes());
+        add(attachment.mime_type.as_bytes());
+        add(attachment
+            .content_id
+            .as_deref()
+            .unwrap_or_default()
+            .as_bytes());
+        add(&[u8::from(attachment.inline)]);
+        add(&attachment.content);
+    }
+    format!("{:x}", digest.finalize())
 }
 
 fn open_authenticated_session(
@@ -4489,6 +4582,34 @@ mod tests {
         assert!(html.contains("<strong>Forwarded message</strong>"));
         assert!(html.contains("Original <strong>body</strong>"));
         assert!(!html.contains("Attachments omitted"));
+    }
+
+    #[test]
+    fn forward_source_digest_changes_when_original_attachment_bytes_change() {
+        let mut message = MailMessage {
+            uid: 42,
+            subject: Some("Original".into()),
+            from: Some("sender@example.test".into()),
+            to: None,
+            cc: None,
+            date: Some("2026-11-24".into()),
+            message_id: Some("<original@example.test>".into()),
+            flags: Vec::new(),
+            size: Some(100),
+            text_body: Some("source body".into()),
+            html_body: None,
+            attachments: Vec::new(),
+            raw_attachments: vec![MailAttachmentPart {
+                filename: Some("report.pdf".into()),
+                mime_type: "application/pdf".into(),
+                content_id: None,
+                inline: false,
+                content: b"original bytes".to_vec(),
+            }],
+        };
+        let before = super::mail_forward_source_digest(&message);
+        message.raw_attachments[0].content = b"changed bytes".to_vec();
+        assert_ne!(before, super::mail_forward_source_digest(&message));
     }
 
     #[test]

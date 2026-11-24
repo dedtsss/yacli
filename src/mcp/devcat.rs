@@ -150,9 +150,10 @@ fn required_capabilities(name: &str) -> Option<&'static [&'static str]> {
         "yacli.mail.folders" | "yacli.mail.list" | "yacli.mail.search" | "yacli.mail.read" => {
             Some(&["mail.read"])
         }
-        "yacli.mail.send" | "yacli.mail.send_published_link" | "yacli.mail.reply" => {
-            Some(&["mail.send"])
-        }
+        "yacli.mail.send"
+        | "yacli.mail.send_published_link"
+        | "yacli.mail.reply"
+        | "yacli.mail.forward" => Some(&["mail.send"]),
         "yacli.mail.folder.create"
         | "yacli.mail.folder.rename"
         | "yacli.mail.copy"
@@ -358,6 +359,7 @@ pub fn is_risky(name: &str) -> bool {
             | "yacli.mail.send_link"
             | "yacli.mail.send_published_link"
             | "yacli.mail.reply"
+            | "yacli.mail.forward"
             | "yacli.mail.folder.create"
             | "yacli.mail.folder.rename"
             | "yacli.mail.copy"
@@ -633,6 +635,29 @@ mod tests {
             Some(["mail.send"].as_slice())
         );
         assert!(is_risky("yacli.mail.reply"));
+        assert_eq!(
+            required_capabilities("yacli.mail.forward"),
+            Some(["mail.send"].as_slice())
+        );
+        assert!(is_risky("yacli.mail.forward"));
+    }
+
+    #[test]
+    fn forward_review_hash_binds_the_source_message_digest() {
+        let one = serde_json::json!({
+            "uid": 17,
+            "to": "test@example.test",
+            "_forward_source_sha256": "source-one"
+        });
+        let changed_source = serde_json::json!({
+            "uid": 17,
+            "to": "test@example.test",
+            "_forward_source_sha256": "source-two"
+        });
+        assert_ne!(
+            review_hash("yacli.mail.forward", &one).unwrap(),
+            review_hash("yacli.mail.forward", &changed_source).unwrap()
+        );
     }
 
     #[test]

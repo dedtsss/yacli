@@ -75,12 +75,14 @@ use crate::{
     },
     mail::{
         MailAttachmentExportRequest, MailAttachmentSelector, MailBulkAction, MailFlagUpdate,
-        MailInviteInspectRequest, MailSearchFilter, MailSpecialFolderAction,
-        apply_mail_bulk_action, copy_mail_message, create_mail_draft, create_mail_folder,
-        export_mail_attachment, inspect_mail_invite, list_mail_folders, list_mail_messages_page,
-        load_mail_attachments, move_mail_message, move_mail_message_to_special_folder,
-        read_mail_message, rename_mail_folder, review_mail_reply_submission,
-        review_mail_submission, search_mail_all_folders_page, search_mail_messages_filtered_page,
+        MailForwardRequest, MailForwardReviewBinding, MailInviteInspectRequest, MailSearchFilter,
+        MailSpecialFolderAction, apply_mail_bulk_action, copy_mail_message, create_mail_draft,
+        create_mail_folder, export_mail_attachment, forward_mail_message,
+        forward_mail_message_reviewed, inspect_mail_invite, list_mail_folders,
+        list_mail_messages_page, load_mail_attachments, move_mail_message,
+        move_mail_message_to_special_folder, read_mail_message, rename_mail_folder,
+        review_mail_forward_submission, review_mail_reply_submission, review_mail_submission,
+        search_mail_all_folders_page, search_mail_messages_filtered_page,
         send_mail_message_with_sent_copy, update_mail_flags, validate_mail_folder_rename,
     },
 };
@@ -155,6 +157,7 @@ struct DashboardResourceState {
     preferred_goal: Option<String>,
 }
 
+#[derive(Clone)]
 struct MailForwardToolRequest {
     folder: String,
     uid: u64,
@@ -1553,7 +1556,7 @@ fn tool_definitions(ui_enabled: bool, roots_enabled: bool) -> Result<Vec<Value>>
         ),
         tool(
             "yacli.mail.forward",
-            "Forward one message by UID.",
+            "Переслать письмо по UID с проверкой адресатов и предварительным review.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1997,7 +2000,9 @@ fn tool(
                 "readOnlyHint": read_only,
             "destructiveHint": devcat::is_risky(name),
                 "idempotentHint": read_only,
-            "openWorldHint": name.starts_with("yacli.mail.send") || name == "yacli.mail.reply"
+            "openWorldHint": name.starts_with("yacli.mail.send")
+                || name == "yacli.mail.reply"
+                || name == "yacli.mail.forward"
             }),
         );
     }
@@ -2059,6 +2064,30 @@ fn call_tool(params: Value, ui_enabled: bool) -> Result<Value> {
     } else {
         Vec::new()
     };
+    if devcat::enabled() && name == "yacli.mail.forward" {
+        let request = mail_forward_tool_request(&arguments)?;
+        let (resolved_account, auth, context) =
+            resolve_mail_private_context(arguments.get("account").and_then(Value::as_str))?;
+        let (review, source_sha256) = review_mail_forward_submission(
+            &context.imap_host,
+            context.imap_port,
+            auth,
+            &request.folder,
+            mail_forward_provider_request(&request),
+        )?;
+        if let Some(object) = arguments.as_object_mut() {
+            object.insert(
+                "_forward_source_sha256".into(),
+                Value::String(source_sha256),
+            );
+            object.insert(
+                "_forward_review".into(),
+                serde_json::to_value(review)
+                    .map_err(|error| YacliError::Serialization(error.to_string()))?,
+            );
+            object.insert("account".into(), Value::String(resolved_account));
+        }
+    }
     devcat::check_tool(name, &arguments)?;
     if devcat::enabled()
         && devcat::is_risky(name)
@@ -2177,22 +2206,7 @@ fn call_tool(params: Value, ui_enabled: bool) -> Result<Value> {
             },
         )?,
         "yacli.mail.reply" => mail_reply(&arguments)?,
-        "yacli.mail.forward" => mail_forward(
-            arguments.get("account").and_then(Value::as_str),
-            MailForwardToolRequest {
-                folder: optional_string(&arguments, "folder")
-                    .unwrap_or("INBOX")
-                    .to_string(),
-                uid: required_u64(&arguments, "uid")?,
-                to: required_string(&arguments, "to")?.to_string(),
-                cc: string_list(&arguments, "cc")?,
-                bcc: string_list(&arguments, "bcc")?,
-                text: optional_string_owned(&arguments, "text"),
-                html: optional_string_owned(&arguments, "html"),
-                max_source_bytes: optional_u64(&arguments, "max_source_bytes")
-                    .unwrap_or(15 * 1024 * 1024),
-            },
-        )?,
+        "yacli.mail.forward" => mail_forward(&arguments)?,
         "yacli.mail.attachment.export" => mail_attachment_export(
             arguments.get("account").and_then(Value::as_str),
             MailAttachmentExportToolRequest {
@@ -3900,25 +3914,80 @@ fn mail_reply(args: &Value) -> Result<Value> {
     }))
 }
 
-fn mail_forward(account: Option<&str>, request: MailForwardToolRequest) -> Result<Value> {
+fn mail_forward_tool_request(args: &Value) -> Result<MailForwardToolRequest> {
+    Ok(MailForwardToolRequest {
+        folder: optional_string(args, "folder")
+            .unwrap_or("INBOX")
+            .to_string(),
+        uid: required_u64(args, "uid")?,
+        to: required_string(args, "to")?.to_string(),
+        cc: string_list(args, "cc")?,
+        bcc: string_list(args, "bcc")?,
+        text: optional_string_owned(args, "text"),
+        html: optional_string_owned(args, "html"),
+        max_source_bytes: optional_u64(args, "max_source_bytes").unwrap_or(15 * 1024 * 1024),
+    })
+}
+
+fn mail_forward_provider_request(request: &MailForwardToolRequest) -> MailForwardRequest {
+    MailForwardRequest {
+        uid: request.uid,
+        to: vec![request.to.clone()],
+        cc: request.cc.clone(),
+        bcc: request.bcc.clone(),
+        text: request.text.clone(),
+        html: request.html.clone(),
+        max_source_bytes: request.max_source_bytes,
+    }
+}
+
+fn mail_forward(args: &Value) -> Result<Value> {
+    let account = args.get("account").and_then(Value::as_str);
+    let request = mail_forward_tool_request(args)?;
     let (resolved_account, auth, context) = resolve_mail_private_context(account)?;
-    let forward = crate::mail::forward_mail_message(
-        &context.imap_host,
-        context.imap_port,
-        &context.smtp_host,
-        context.smtp_port,
-        auth,
-        &request.folder,
-        crate::mail::MailForwardRequest {
-            uid: request.uid,
-            to: vec![request.to],
-            cc: request.cc,
-            bcc: request.bcc,
-            text: request.text,
-            html: request.html,
-            max_source_bytes: request.max_source_bytes,
-        },
-    )?;
+    if optional_bool(args, "dry_run") == Some(true) {
+        let review = args.get("_forward_review").cloned().ok_or_else(|| {
+            YacliError::Auth(
+                "Предварительная проверка пересылки не привязана к исходному письму.".into(),
+            )
+        })?;
+        let digest = devcat::review_hash("yacli.mail.forward", args)?;
+        devcat::record_review(digest.clone());
+        return Ok(json!({
+            "account": resolved_account,
+            "folder": request.folder,
+            "uid": request.uid,
+            "dry_run": true,
+            "review": review,
+            "review_sha256": digest,
+        }));
+    }
+    let forward_request = mail_forward_provider_request(&request);
+    let forward = if devcat::enabled() {
+        let expected_source_sha256 = required_string(args, "_forward_source_sha256")?;
+        forward_mail_message_reviewed(
+            &context.imap_host,
+            context.imap_port,
+            &context.smtp_host,
+            context.smtp_port,
+            auth,
+            &request.folder,
+            MailForwardReviewBinding {
+                request: forward_request,
+                source_sha256: expected_source_sha256.to_string(),
+            },
+        )?
+    } else {
+        forward_mail_message(
+            &context.imap_host,
+            context.imap_port,
+            &context.smtp_host,
+            context.smtp_port,
+            auth,
+            &request.folder,
+            forward_request,
+        )?
+    };
     Ok(json!({
         "account": resolved_account,
         "folder": request.folder,
