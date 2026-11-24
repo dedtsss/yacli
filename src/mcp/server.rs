@@ -81,9 +81,10 @@ use crate::{
         export_mail_eml, forward_mail_message_reviewed_with_attachments,
         forward_mail_message_with_attachments, inspect_mail_invite, list_mail_drafts_page,
         list_mail_folders, list_mail_messages_page, load_mail_attachments, mail_mailbox_checkpoint,
-        move_mail_message, move_mail_message_to_special_folder, read_mail_message,
-        rename_mail_folder, reply_to_mail_message_with_attachments, review_mail_eml_export,
-        review_mail_folder_delete, review_mail_forward_submission_with_attachments,
+        move_mail_draft_to_trash, move_mail_message, move_mail_message_to_special_folder,
+        read_mail_message, rename_mail_folder, reply_to_mail_message_with_attachments,
+        review_mail_draft_trash, review_mail_eml_export, review_mail_folder_delete,
+        review_mail_forward_submission_with_attachments,
         review_mail_reply_submission_with_attachments, review_mail_submission,
         search_mail_all_folders_page, search_mail_messages_filtered_page,
         send_mail_message_with_sent_copy, update_mail_flags, validate_mail_eml_output_path,
@@ -1451,6 +1452,22 @@ fn tool_definitions(ui_enabled: bool, roots_enabled: bool) -> Result<Vec<Value>>
             ui_enabled,
         ),
         tool(
+            "yacli.mail.draft.trash",
+            "Переместить только указанный черновик из IMAP \\Drafts в серверную \\Trash; UIDVALIDITY проверяется до операции, требуется dry-run и review.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "account": { "type": "string" },
+                    "uid": { "type": "integer", "minimum": 1 },
+                    "uid_validity": { "type": "integer", "minimum": 1 }
+                },
+                "required": ["uid", "uid_validity"],
+                "additionalProperties": false
+            }),
+            None,
+            ui_enabled,
+        ),
+        tool(
             "yacli.mail.draft.create",
             "Создать неотправленный черновик в почтовом ящике; в DevCat требуется предварительная проверка.",
             json!({
@@ -2257,6 +2274,7 @@ fn call_tool(params: Value, ui_enabled: bool) -> Result<Value> {
         )?,
         "yacli.mail.draft.list" => mail_draft_list(&arguments)?,
         "yacli.mail.checkpoint" => mail_checkpoint(&arguments)?,
+        "yacli.mail.draft.trash" => mail_draft_trash(&arguments)?,
         "yacli.mail.draft.create" => mail_draft_create(&arguments)?,
         "yacli.mail.send" => mail_send(
             arguments.get("account").and_then(Value::as_str),
@@ -3489,6 +3507,37 @@ fn mail_draft_list(args: &Value) -> Result<Value> {
     let (folder, items) =
         list_mail_drafts_page(&context.imap_host, context.imap_port, auth, limit, offset)?;
     Ok(json!({"account":account,"folder":folder,"limit":limit,"offset":offset,"items":items}))
+}
+
+fn mail_draft_trash(args: &Value) -> Result<Value> {
+    let uid = required_u64(args, "uid")?;
+    let uid_validity = required_u64(args, "uid_validity")?;
+    let (account, auth, context) =
+        resolve_mail_private_context(args.get("account").and_then(Value::as_str))?;
+    if optional_bool(args, "dry_run") == Some(true) {
+        let review = review_mail_draft_trash(
+            &context.imap_host,
+            context.imap_port,
+            auth,
+            uid,
+            uid_validity,
+        )?;
+        let digest = devcat::review_hash("yacli.mail.draft.trash", args)?;
+        if review.allowed {
+            devcat::record_review(digest.clone());
+        }
+        return Ok(
+            json!({"account":account,"dry_run":true,"review":review,"review_sha256":digest}),
+        );
+    }
+    let review = move_mail_draft_to_trash(
+        &context.imap_host,
+        context.imap_port,
+        auth,
+        uid,
+        uid_validity,
+    )?;
+    Ok(json!({"account":account,"moved_to_trash":true,"review":review}))
 }
 
 fn mail_checkpoint(args: &Value) -> Result<Value> {

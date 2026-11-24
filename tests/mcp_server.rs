@@ -1035,6 +1035,17 @@ client_id = "client-123"
             .unwrap()
             .contains(r"\Drafts")
     );
+    let draft_trash = tools
+        .iter()
+        .find(|tool| tool["name"] == "yacli.mail.draft.trash")
+        .expect("draft trash tool");
+    assert!(
+        draft_trash["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field == "uid_validity")
+    );
     let mailbox_checkpoint = tools
         .iter()
         .find(|tool| tool["name"] == "yacli.mail.checkpoint")

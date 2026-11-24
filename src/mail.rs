@@ -145,6 +145,16 @@ pub struct MailboxCheckpoint {
 }
 
 #[derive(Clone, Debug, Serialize, Eq, PartialEq)]
+pub struct MailDraftTrashReview {
+    pub uid: u64,
+    pub uid_validity: u64,
+    pub draft_folder: String,
+    pub trash_folder: String,
+    pub exists_in_drafts: bool,
+    pub allowed: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
 pub struct MailFolderDeleteReview {
     pub folder: String,
     pub allowed: bool,
@@ -628,6 +638,98 @@ pub fn list_mail_drafts_page(
     }
     let _ = session.logout();
     Ok((drafts.name, items))
+}
+
+pub fn review_mail_draft_trash(
+    imap_host: &str,
+    imap_port: u16,
+    auth: MailSessionAuth,
+    uid: u64,
+    uid_validity: u64,
+) -> Result<MailDraftTrashReview> {
+    validate_mail_uid(uid)?;
+    if uid_validity == 0 {
+        return Err(YacliError::Validation(
+            "UIDVALIDITY must be greater than zero".into(),
+        ));
+    }
+    let mut session = open_authenticated_session(imap_host, imap_port, auth)?;
+    let folders = session.list_folders()?;
+    let drafts = find_special_mail_folder(&folders, "\\Drafts")?;
+    let trash = find_special_mail_folder(&folders, "\\Trash")?;
+    if drafts.raw_name == trash.raw_name {
+        return Err(YacliError::Api(
+            "IMAP Drafts and Trash folders resolve to the same mailbox".into(),
+        ));
+    }
+    let status = session.select_mailbox_with_status(&drafts.raw_name)?;
+    let exists_in_drafts = status.uid_validity == Some(uid_validity)
+        && session
+            .search_all_uids()?
+            .into_iter()
+            .any(|found| found == uid);
+    let _ = session.logout();
+    Ok(MailDraftTrashReview {
+        uid,
+        uid_validity,
+        draft_folder: drafts.name.clone(),
+        trash_folder: trash.name.clone(),
+        exists_in_drafts,
+        allowed: exists_in_drafts,
+    })
+}
+
+pub fn move_mail_draft_to_trash(
+    imap_host: &str,
+    imap_port: u16,
+    auth: MailSessionAuth,
+    uid: u64,
+    uid_validity: u64,
+) -> Result<MailDraftTrashReview> {
+    validate_mail_uid(uid)?;
+    if uid_validity == 0 {
+        return Err(YacliError::Validation(
+            "UIDVALIDITY must be greater than zero".into(),
+        ));
+    }
+    let mut session = open_authenticated_session(imap_host, imap_port, auth)?;
+    let review = move_mail_draft_to_trash_session(&mut session, uid, uid_validity)?;
+    let _ = session.logout();
+    Ok(review)
+}
+
+fn move_mail_draft_to_trash_session<S: Read + Write>(
+    session: &mut ImapSession<S>,
+    uid: u64,
+    uid_validity: u64,
+) -> Result<MailDraftTrashReview> {
+    let folders = session.list_folders()?;
+    let drafts = find_special_mail_folder(&folders, "\\Drafts")?;
+    let trash = find_special_mail_folder(&folders, "\\Trash")?;
+    if drafts.raw_name == trash.raw_name {
+        return Err(YacliError::Api(
+            "IMAP Drafts and Trash folders resolve to the same mailbox".into(),
+        ));
+    }
+    select_mailbox_with_expected_uid_validity(session, &drafts.raw_name, uid_validity)?;
+    if !session
+        .search_all_uids()?
+        .into_iter()
+        .any(|found| found == uid)
+    {
+        return Err(YacliError::Validation(
+            "Черновик исчез перед перемещением; список нужно обновить".into(),
+        ));
+    }
+    session.uid_move(uid, &trash.raw_name)?;
+    Ok(MailDraftTrashReview {
+        uid,
+        uid_validity,
+        draft_folder: drafts.name.clone(),
+        trash_folder: trash.name.clone(),
+        exists_in_drafts: true,
+        allowed: true,
+    })
 }
 
 pub fn create_mail_folder(
@@ -4857,6 +4959,21 @@ mod tests {
         assert!(!commands.contains("UID MOVE"));
         assert!(!commands.contains("UID COPY"));
         assert!(!commands.contains("UID STORE"));
+    }
+
+    #[test]
+    fn moving_draft_to_trash_checks_uid_epoch_and_never_expunges() {
+        let stream = FakeStream::new(
+            "* LIST (\\Drafts) \"/\" \"Drafts\"\r\n* LIST (\\Trash) \"/\" \"Trash\"\r\nA0001 OK listed\r\n* OK [UIDVALIDITY 30] valid\r\n* OK [UIDNEXT 16] next\r\nA0002 OK selected\r\n* SEARCH 15\r\nA0003 OK searched\r\nA0004 OK moved\r\n",
+        );
+        let mut session = ImapSession::from_stream(stream);
+        let result = super::move_mail_draft_to_trash_session(&mut session, 15, 30)
+            .expect("move test draft to Trash");
+        assert_eq!(result.draft_folder, "Drafts");
+        assert_eq!(result.trash_folder, "Trash");
+        let commands = session.reader.get_ref().written();
+        assert!(commands.contains("A0004 UID MOVE 15 \"Trash\"\r\n"));
+        assert!(!commands.contains("EXPUNGE"));
     }
 
     #[test]
