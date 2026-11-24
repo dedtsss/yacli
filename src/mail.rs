@@ -609,6 +609,104 @@ pub fn mail_mailbox_checkpoint(
     })
 }
 
+pub fn list_mail_messages_after_uid(
+    imap_host: &str,
+    imap_port: u16,
+    auth: MailSessionAuth,
+    folder: &str,
+    expected_uid_validity: u64,
+    after_uid: u64,
+    limit: usize,
+) -> Result<(MailboxCheckpoint, Vec<MailMessageSummary>, bool)> {
+    if limit == 0 || limit > 50 {
+        return Err(YacliError::Validation(
+            "Пакет правил должен содержать от 1 до 50 писем".into(),
+        ));
+    }
+    validate_folder_name(folder)?;
+    let mut session = open_authenticated_session(imap_host, imap_port, auth)?;
+    let status = session.select_mailbox_with_status(&encode_modified_utf7(folder))?;
+    let uid_validity = status.uid_validity.ok_or_else(|| {
+        YacliError::Api("IMAP SELECT omitted UIDVALIDITY; rule checkpoint unavailable".into())
+    })?;
+    let uid_next = status.uid_next.ok_or_else(|| {
+        YacliError::Api("IMAP SELECT omitted UIDNEXT; rule checkpoint unavailable".into())
+    })?;
+    if uid_validity != expected_uid_validity {
+        return Err(YacliError::Validation(
+            "UIDVALIDITY изменилась; автоматическое правило остановлено до проверки".into(),
+        ));
+    }
+    let uids = session.search_uids_after(after_uid)?;
+    if uids.len() > 5_000 {
+        return Err(YacliError::UnsupportedOperation(
+            "Пакет правил превышает 5000 UID; курсор не изменён, повторите с меньшим интервалом"
+                .into(),
+        ));
+    }
+    let mut selected = uids
+        .into_iter()
+        .filter(|uid| *uid > after_uid)
+        .collect::<Vec<_>>();
+    selected.sort_unstable();
+    let has_more = selected.len() > limit;
+    selected.truncate(limit);
+    let mut messages = if selected.is_empty() {
+        Vec::new()
+    } else {
+        session.fetch_message_summaries(&selected)?
+    };
+    for message in &mut messages {
+        message.uid_validity = Some(uid_validity);
+    }
+    messages.sort_by_key(|message| message.uid);
+    let _ = session.logout();
+    Ok((
+        MailboxCheckpoint {
+            folder: folder.into(),
+            uid_validity,
+            uid_next,
+        },
+        messages,
+        has_more,
+    ))
+}
+
+pub fn list_mail_messages_by_uid(
+    imap_host: &str,
+    imap_port: u16,
+    auth: MailSessionAuth,
+    folder: &str,
+    expected_uid_validity: u64,
+    uids: &[u64],
+) -> Result<Vec<MailMessageSummary>> {
+    if uids.is_empty() || uids.len() > 50 {
+        return Err(YacliError::Validation(
+            "Чтение правил требует от 1 до 50 UID".into(),
+        ));
+    }
+    format_mail_uid_set(uids)?;
+    validate_folder_name(folder)?;
+    let mut session = open_authenticated_session(imap_host, imap_port, auth)?;
+    select_mailbox_with_expected_uid_validity(
+        &mut session,
+        &encode_modified_utf7(folder),
+        expected_uid_validity,
+    )?;
+    let mut messages = session.fetch_message_summaries(uids)?;
+    if messages.len() != uids.len() {
+        return Err(YacliError::Validation(
+            "Одно или несколько писем исчезли до применения правила".into(),
+        ));
+    }
+    for message in &mut messages {
+        message.uid_validity = Some(expected_uid_validity);
+    }
+    messages.sort_by_key(|message| message.uid);
+    let _ = session.logout();
+    Ok(messages)
+}
+
 pub fn list_mail_drafts_page(
     imap_host: &str,
     imap_port: u16,
@@ -2715,6 +2813,20 @@ impl<S: Read + Write> ImapSession<S> {
 
     fn search_all_uids(&mut self) -> Result<Vec<u64>> {
         let (lines, tagged) = self.run_command("UID SEARCH ALL")?;
+        parse_tagged_status(
+            &self.current_tag(),
+            &tagged,
+            "IMAP UID SEARCH",
+            TaggedErrorKind::Api,
+        )?;
+        parse_search_uids(&lines)
+    }
+
+    fn search_uids_after(&mut self, after_uid: u64) -> Result<Vec<u64>> {
+        let first_uid = after_uid.checked_add(1).ok_or_else(|| {
+            YacliError::Validation("UID checkpoint is outside the supported range".into())
+        })?;
+        let (lines, tagged) = self.run_command(&format!("UID SEARCH UID {first_uid}:*"))?;
         parse_tagged_status(
             &self.current_tag(),
             &tagged,
@@ -5110,6 +5222,22 @@ mod tests {
         assert!(
             super::parse_imap_mailbox_select_status(&["* OK [UIDNEXT 0] invalid".into()]).is_err()
         );
+    }
+
+    #[test]
+    fn rules_search_starts_after_the_committed_uid_cursor() {
+        let mut session = ImapSession::from_stream(FakeStream::new(
+            "* SEARCH 21 22 23\r\nA0001 OK searched\r\n",
+        ));
+        assert_eq!(session.search_uids_after(20).unwrap(), vec![21, 22, 23]);
+        assert!(
+            session
+                .reader
+                .get_ref()
+                .written()
+                .contains("A0001 UID SEARCH UID 21:*\r\n")
+        );
+        assert!(session.search_uids_after(u64::MAX).is_err());
     }
 
     #[test]

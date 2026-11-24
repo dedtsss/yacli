@@ -723,6 +723,104 @@ pub enum MailCommand {
         #[command(subcommand)]
         action: MailInviteCommand,
     },
+    /// Настроить или запустить локальные правила через IMAP-контрольные точки.
+    Rules {
+        #[command(subcommand)]
+        action: MailRulesCommand,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum MailRuleActionArg {
+    MarkRead,
+    MarkUnread,
+    Star,
+    Unstar,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum MailRulesCommand {
+    /// Показать правила из mail-rules.toml.
+    List,
+    /// Показать content-free журнал действий и откатов.
+    Audit {
+        #[arg(long, default_value_t = 100, value_name = "ЧИСЛО")]
+        limit: usize,
+    },
+    /// Добавить выключенное правило с условиями From и/или Subject.
+    Add {
+        #[arg(long, value_name = "ID")]
+        id: String,
+        #[arg(long, value_name = "АККАУНТ")]
+        account: String,
+        #[arg(long, default_value = "INBOX", value_name = "ПАПКА")]
+        mailbox: String,
+        #[arg(long, value_name = "ТЕКСТ")]
+        from_contains: Option<String>,
+        #[arg(long, value_name = "ТЕКСТ")]
+        subject_contains: Option<String>,
+        #[arg(long, value_enum, value_name = "ДЕЙСТВИЕ")]
+        action: MailRuleActionArg,
+    },
+    /// Изменить условия или действие существующего правила.
+    Update {
+        #[arg(value_name = "ID")]
+        id: String,
+        #[arg(long, value_name = "АККАУНТ")]
+        account: Option<String>,
+        #[arg(long, value_name = "ПАПКА")]
+        mailbox: Option<String>,
+        #[arg(long, value_name = "ТЕКСТ")]
+        from_contains: Option<String>,
+        #[arg(long, value_name = "ТЕКСТ")]
+        subject_contains: Option<String>,
+        #[arg(long, default_value_t = false)]
+        clear_from: bool,
+        #[arg(long, default_value_t = false)]
+        clear_subject: bool,
+        #[arg(long, value_enum, value_name = "ДЕЙСТВИЕ")]
+        action: Option<MailRuleActionArg>,
+    },
+    /// Включить правило; новая контрольная точка не обработает старые письма.
+    Enable {
+        #[arg(value_name = "ID")]
+        id: String,
+    },
+    /// Выключить правило, сохранив его контрольную точку.
+    Disable {
+        #[arg(value_name = "ID")]
+        id: String,
+    },
+    /// Сбросить контрольную точку; следующий запуск только зафиксирует новый baseline.
+    Reset {
+        #[arg(value_name = "ID")]
+        id: String,
+    },
+    /// Удалить правило, если для него нет незавершённого действия.
+    Delete {
+        #[arg(value_name = "ID")]
+        id: String,
+    },
+    /// Просмотреть пакет; для применения нужны --apply и хеш preview.
+    Run {
+        #[arg(long, value_name = "ID")]
+        rule: Option<String>,
+        #[arg(long, default_value_t = false)]
+        apply: bool,
+        #[arg(long, value_name = "SHA256")]
+        review_sha256: Option<String>,
+    },
+    /// Выполнить одну ограниченную проверку новых писем для заранее включённых правил.
+    Poll,
+    /// Просмотреть или безопасно отменить одно выполнение правил.
+    Undo {
+        #[arg(value_name = "RUN_ID")]
+        run_id: String,
+        #[arg(long, default_value_t = false)]
+        apply: bool,
+        #[arg(long, value_name = "SHA256")]
+        review_sha256: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]

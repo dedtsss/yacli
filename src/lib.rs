@@ -15,6 +15,7 @@ pub mod home;
 mod mail;
 mod mail_invite_flow;
 mod mail_link;
+pub mod mail_rules;
 pub mod mcp;
 pub mod model;
 pub mod next_actions;
