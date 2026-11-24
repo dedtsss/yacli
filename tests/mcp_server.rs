@@ -1055,6 +1055,22 @@ client_id = "client-123"
             .unwrap()
             .contains("UIDVALIDITY")
     );
+    for name in [
+        "yacli.mail.copy",
+        "yacli.mail.move",
+        "yacli.mail.flags",
+        "yacli.mail.bulk",
+        "yacli.mail.special_folder",
+    ] {
+        let tool = tools.iter().find(|tool| tool["name"] == name).expect(name);
+        assert!(
+            tool["inputSchema"]["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|field| field == "uid_validity")
+        );
+    }
     assert_eq!(
         mail_list["inputSchema"]["properties"]["offset"]["minimum"],
         0

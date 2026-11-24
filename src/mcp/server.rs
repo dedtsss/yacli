@@ -1343,11 +1343,11 @@ fn tool_definitions(ui_enabled: bool, roots_enabled: bool) -> Result<Vec<Value>>
         tool("yacli.mail.folder.create", "Создать папку почтового ящика; в DevCat требуется предварительная проверка.", json!({"type":"object","properties":{"account":{"type":"string"},"folder":{"type":"string"}},"required":["folder"],"additionalProperties":false}), None, ui_enabled),
         tool("yacli.mail.folder.rename", "Переименовать папку почтового ящика; сервер также переименует вложенные папки. Перед изменением требуется review.", json!({"type":"object","properties":{"account":{"type":"string"},"folder":{"type":"string"},"new_folder":{"type":"string"}},"required":["folder","new_folder"],"additionalProperties":false}), None, ui_enabled),
         tool("yacli.mail.folder.delete", "Удалить только явно указанную пустую пользовательскую папку без подпапок; системные папки и папки с письмами отклоняются. В DevCat требуется mail.delete и одноразовый review.", json!({"type":"object","properties":{"account":{"type":"string"},"folder":{"type":"string"}},"required":["folder"],"additionalProperties":false}), None, ui_enabled),
-        tool("yacli.mail.copy", "Скопировать одно письмо по постоянному UID в другую папку; в DevCat требуется предварительная проверка.", json!({"type":"object","properties":{"account":{"type":"string"},"source_folder":{"type":"string"},"uid":{"type":"integer","minimum":1},"destination_folder":{"type":"string"}},"required":["uid","destination_folder"],"additionalProperties":false}), None, ui_enabled),
-        tool("yacli.mail.move", "Переместить одно письмо по постоянному UID в другую папку; в DevCat требуется предварительная проверка.", json!({"type":"object","properties":{"account":{"type":"string"},"source_folder":{"type":"string"},"uid":{"type":"integer","minimum":1},"destination_folder":{"type":"string"}},"required":["uid","destination_folder"],"additionalProperties":false}), None, ui_enabled),
-        tool("yacli.mail.flags", "Установить состояние прочитанности и отметку избранного для одного письма по постоянному UID; в DevCat требуется проверка.", json!({"type":"object","properties":{"account":{"type":"string"},"folder":{"type":"string"},"uid":{"type":"integer","minimum":1},"seen":{"type":"boolean"},"flagged":{"type":"boolean"}},"required":["uid"],"additionalProperties":false}), None, ui_enabled),
-        tool("yacli.mail.bulk", "Выполнить одно массовое действие не более чем над 50 письмами; в DevCat требуется предварительная проверка.", json!({"type":"object","properties":{"account":{"type":"string"},"folder":{"type":"string"},"uids":{"type":"array","minItems":1,"maxItems":50,"items":{"type":"integer","minimum":1}},"action":{"type":"string","enum":["mark_read","mark_unread","flag","unflag","copy","move"]},"destination_folder":{"type":"string"}},"required":["uids","action"],"additionalProperties":false}), None, ui_enabled),
-        tool("yacli.mail.special_folder", "Переместить одно письмо между обычной папкой, Корзиной или Спамом; это только IMAP-перенос, не жалоба антиспам-службе. В DevCat требуется review.", json!({"type":"object","properties":{"account":{"type":"string"},"uid":{"type":"integer","minimum":1},"action":{"type":"string","enum":["move_to_trash","restore_from_trash","move_to_spam","restore_from_spam"]},"source_folder":{"type":"string"},"destination_folder":{"type":"string"}},"required":["uid","action"],"additionalProperties":false}), None, ui_enabled),
+        tool("yacli.mail.copy", "Скопировать письмо по UID и обязательному UIDVALIDITY из результата списка; если эпоха папки изменилась, операция отклоняется. В DevCat требуется review.", json!({"type":"object","properties":{"account":{"type":"string"},"source_folder":{"type":"string"},"uid":{"type":"integer","minimum":1},"uid_validity":{"type":"integer","minimum":1},"destination_folder":{"type":"string"}},"required":["uid","uid_validity","destination_folder"],"additionalProperties":false}), None, ui_enabled),
+        tool("yacli.mail.move", "Переместить письмо по UID и обязательному UIDVALIDITY из результата списка; если эпоха папки изменилась, операция отклоняется. В DevCat требуется review.", json!({"type":"object","properties":{"account":{"type":"string"},"source_folder":{"type":"string"},"uid":{"type":"integer","minimum":1},"uid_validity":{"type":"integer","minimum":1},"destination_folder":{"type":"string"}},"required":["uid","uid_validity","destination_folder"],"additionalProperties":false}), None, ui_enabled),
+        tool("yacli.mail.flags", "Установить прочитанность и избранное по UID и обязательному UIDVALIDITY из списка; эпоха перепроверяется перед изменением. В DevCat требуется review.", json!({"type":"object","properties":{"account":{"type":"string"},"folder":{"type":"string"},"uid":{"type":"integer","minimum":1},"uid_validity":{"type":"integer","minimum":1},"seen":{"type":"boolean"},"flagged":{"type":"boolean"}},"required":["uid","uid_validity"],"additionalProperties":false}), None, ui_enabled),
+        tool("yacli.mail.bulk", "Выполнить одно массовое действие не более чем над 50 письмами; весь набор должен принадлежать указанному UIDVALIDITY. В DevCat требуется review.", json!({"type":"object","properties":{"account":{"type":"string"},"folder":{"type":"string"},"uids":{"type":"array","minItems":1,"maxItems":50,"items":{"type":"integer","minimum":1}},"uid_validity":{"type":"integer","minimum":1},"action":{"type":"string","enum":["mark_read","mark_unread","flag","unflag","copy","move"]},"destination_folder":{"type":"string"}},"required":["uids","uid_validity","action"],"additionalProperties":false}), None, ui_enabled),
+        tool("yacli.mail.special_folder", "Переместить письмо между обычной папкой, Корзиной или Спамом, проверив UIDVALIDITY; это только IMAP-перенос, не жалоба антиспам-службе. В DevCat требуется review.", json!({"type":"object","properties":{"account":{"type":"string"},"uid":{"type":"integer","minimum":1},"uid_validity":{"type":"integer","minimum":1},"action":{"type":"string","enum":["move_to_trash","restore_from_trash","move_to_spam","restore_from_spam"]},"source_folder":{"type":"string"},"destination_folder":{"type":"string"}},"required":["uid","uid_validity","action"],"additionalProperties":false}), None, ui_enabled),
         tool(
             "yacli.contacts.list",
             "Получить список контактов из отдельно настроенной адресной книги Яндекс CardDAV.",
@@ -3037,6 +3037,7 @@ fn mail_folder_delete(args: &Value) -> Result<Value> {
 
 fn mail_copy_move(args: &Value, is_move: bool) -> Result<Value> {
     let uid = required_u64(args, "uid")?;
+    let uid_validity = required_u64(args, "uid_validity")?;
     let source = optional_string(args, "source_folder").unwrap_or("INBOX");
     let destination = required_string(args, "destination_folder")?;
     let tool_name = if is_move {
@@ -3060,6 +3061,7 @@ fn mail_copy_move(args: &Value, is_move: bool) -> Result<Value> {
             auth,
             source,
             uid,
+            uid_validity,
             destination,
         )?;
     } else {
@@ -3069,6 +3071,7 @@ fn mail_copy_move(args: &Value, is_move: bool) -> Result<Value> {
             auth,
             source,
             uid,
+            uid_validity,
             destination,
         )?;
     }
@@ -3079,6 +3082,7 @@ fn mail_copy_move(args: &Value, is_move: bool) -> Result<Value> {
 
 fn mail_flags(args: &Value) -> Result<Value> {
     let uid = required_u64(args, "uid")?;
+    let uid_validity = required_u64(args, "uid_validity")?;
     let folder = optional_string(args, "folder").unwrap_or("INBOX");
     let update = MailFlagUpdate {
         seen: optional_bool(args, "seen"),
@@ -3098,7 +3102,15 @@ fn mail_flags(args: &Value) -> Result<Value> {
     }
     let (account, auth, ctx) =
         resolve_mail_private_context(args.get("account").and_then(Value::as_str))?;
-    update_mail_flags(&ctx.imap_host, ctx.imap_port, auth, folder, uid, update)?;
+    update_mail_flags(
+        &ctx.imap_host,
+        ctx.imap_port,
+        auth,
+        folder,
+        uid,
+        uid_validity,
+        update,
+    )?;
     Ok(
         json!({"account":account,"uid":uid,"folder":folder,"seen":update.seen,"flagged":update.flagged,"updated":true}),
     )
@@ -3106,6 +3118,7 @@ fn mail_flags(args: &Value) -> Result<Value> {
 
 fn mail_bulk(args: &Value) -> Result<Value> {
     let folder = optional_string(args, "folder").unwrap_or("INBOX");
+    let uid_validity = required_u64(args, "uid_validity")?;
     let uid_values = args
         .get("uids")
         .and_then(Value::as_array)
@@ -3148,6 +3161,7 @@ fn mail_bulk(args: &Value) -> Result<Value> {
         auth,
         folder,
         &uids,
+        uid_validity,
         action,
         destination,
     )?;
@@ -3158,6 +3172,7 @@ fn mail_bulk(args: &Value) -> Result<Value> {
 
 fn mail_special_folder(args: &Value) -> Result<Value> {
     let uid = required_u64(args, "uid")?;
+    let uid_validity = required_u64(args, "uid_validity")?;
     let action_name = required_string(args, "action")?;
     let action = match action_name {
         "move_to_trash" => MailSpecialFolderAction::MoveToTrash,
@@ -3197,6 +3212,7 @@ fn mail_special_folder(args: &Value) -> Result<Value> {
         ctx.imap_port,
         auth,
         uid,
+        uid_validity,
         action,
         source_folder,
         destination_folder,

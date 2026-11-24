@@ -828,13 +828,18 @@ pub fn copy_mail_message(
     auth: MailSessionAuth,
     source_folder: &str,
     uid: u64,
+    uid_validity: u64,
     destination_folder: &str,
 ) -> Result<()> {
     validate_mail_uid(uid)?;
     validate_folder_name(source_folder)?;
     validate_folder_name(destination_folder)?;
     let mut session = open_authenticated_session(imap_host, imap_port, auth)?;
-    session.select_mailbox(&encode_modified_utf7(source_folder))?;
+    select_mailbox_with_expected_uid_validity(
+        &mut session,
+        &encode_modified_utf7(source_folder),
+        uid_validity,
+    )?;
     session.uid_copy(uid, &encode_modified_utf7(destination_folder))?;
     let _ = session.logout();
     Ok(())
@@ -846,23 +851,30 @@ pub fn move_mail_message(
     auth: MailSessionAuth,
     source_folder: &str,
     uid: u64,
+    uid_validity: u64,
     destination_folder: &str,
 ) -> Result<()> {
     validate_mail_uid(uid)?;
     validate_folder_name(source_folder)?;
     validate_folder_name(destination_folder)?;
     let mut session = open_authenticated_session(imap_host, imap_port, auth)?;
-    session.select_mailbox(&encode_modified_utf7(source_folder))?;
+    select_mailbox_with_expected_uid_validity(
+        &mut session,
+        &encode_modified_utf7(source_folder),
+        uid_validity,
+    )?;
     session.uid_move(uid, &encode_modified_utf7(destination_folder))?;
     let _ = session.logout();
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn move_mail_message_to_special_folder(
     imap_host: &str,
     imap_port: u16,
     auth: MailSessionAuth,
     uid: u64,
+    uid_validity: u64,
     action: MailSpecialFolderAction,
     source_folder: Option<&str>,
     destination_folder: Option<&str>,
@@ -903,7 +915,7 @@ pub fn move_mail_message_to_special_folder(
             (source.raw_name.clone(), encode_modified_utf7(destination))
         }
     };
-    session.select_mailbox(&source)?;
+    select_mailbox_with_expected_uid_validity(&mut session, &source, uid_validity)?;
     session.uid_move(uid, &destination)?;
     let _ = session.logout();
     Ok(())
@@ -935,13 +947,18 @@ pub fn update_mail_flags(
     auth: MailSessionAuth,
     mailbox_name: &str,
     uid: u64,
+    uid_validity: u64,
     update: MailFlagUpdate,
 ) -> Result<()> {
     validate_mail_uid(uid)?;
     validate_folder_name(mailbox_name)?;
     validate_mail_flag_update(update)?;
     let mut session = open_authenticated_session(imap_host, imap_port, auth)?;
-    session.select_mailbox(&encode_modified_utf7(mailbox_name))?;
+    select_mailbox_with_expected_uid_validity(
+        &mut session,
+        &encode_modified_utf7(mailbox_name),
+        uid_validity,
+    )?;
     if let Some(enabled) = update.seen {
         session.uid_store_flag(uid, "\\Seen", enabled)?;
     }
@@ -952,12 +969,14 @@ pub fn update_mail_flags(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn apply_mail_bulk_action(
     imap_host: &str,
     imap_port: u16,
     auth: MailSessionAuth,
     mailbox_name: &str,
     uids: &[u64],
+    uid_validity: u64,
     action: MailBulkAction,
     destination_folder: Option<&str>,
 ) -> Result<()> {
@@ -982,7 +1001,11 @@ pub fn apply_mail_bulk_action(
     };
 
     let mut session = open_authenticated_session(imap_host, imap_port, auth)?;
-    session.select_mailbox(&encode_modified_utf7(mailbox_name))?;
+    select_mailbox_with_expected_uid_validity(
+        &mut session,
+        &encode_modified_utf7(mailbox_name),
+        uid_validity,
+    )?;
     match action {
         MailBulkAction::MarkRead => session.uid_store_flags(&uid_set, "\\Seen", true)?,
         MailBulkAction::MarkUnread => session.uid_store_flags(&uid_set, "\\Seen", false)?,
@@ -1088,6 +1111,25 @@ fn validate_mail_uid(uid: u64) -> Result<()> {
     } else {
         Ok(())
     }
+}
+
+fn select_mailbox_with_expected_uid_validity<S: Read + Write>(
+    session: &mut ImapSession<S>,
+    mailbox_name: &str,
+    expected_uid_validity: u64,
+) -> Result<()> {
+    if expected_uid_validity == 0 {
+        return Err(YacliError::Validation(
+            "UIDVALIDITY must be greater than zero".into(),
+        ));
+    }
+    let status = session.select_mailbox_with_status(mailbox_name)?;
+    if status.uid_validity != Some(expected_uid_validity) {
+        return Err(YacliError::Validation(
+            "Папка изменила UIDVALIDITY после получения списка; обновите список писем и повторите проверку".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_folder_name(folder: &str) -> Result<&str> {
@@ -4801,6 +4843,20 @@ mod tests {
         assert!(
             super::parse_imap_mailbox_select_status(&["* OK [UIDNEXT 0] invalid".into()]).is_err()
         );
+    }
+
+    #[test]
+    fn stale_uid_validity_is_rejected_before_message_mutation() {
+        let mut session = ImapSession::from_stream(FakeStream::new(
+            "* OK [UIDVALIDITY 22] UIDs valid\r\n* OK [UIDNEXT 11] Predicted next UID\r\nA0001 OK [READ-WRITE] selected\r\n",
+        ));
+        let result = super::select_mailbox_with_expected_uid_validity(&mut session, "Inbox", 21);
+        assert!(result.is_err());
+        let commands = session.reader.get_ref().written();
+        assert!(commands.contains("A0001 SELECT \"Inbox\"\r\n"));
+        assert!(!commands.contains("UID MOVE"));
+        assert!(!commands.contains("UID COPY"));
+        assert!(!commands.contains("UID STORE"));
     }
 
     #[test]
