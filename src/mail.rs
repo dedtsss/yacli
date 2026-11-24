@@ -1464,6 +1464,29 @@ pub fn reply_to_mail_message(
     mailbox_name: &str,
     request: MailReplyRequest,
 ) -> Result<RepliedMail> {
+    reply_to_mail_message_with_attachments(
+        imap_host,
+        imap_port,
+        smtp_host,
+        smtp_port,
+        auth,
+        mailbox_name,
+        request,
+        Vec::new(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn reply_to_mail_message_with_attachments(
+    imap_host: &str,
+    imap_port: u16,
+    smtp_host: &str,
+    smtp_port: u16,
+    auth: MailSessionAuth,
+    mailbox_name: &str,
+    request: MailReplyRequest,
+    attachments: Vec<MailAttachmentPayload>,
+) -> Result<RepliedMail> {
     if request.uid == 0 {
         return Err(YacliError::Validation(
             "mail reply <id> must be greater than zero".to_string(),
@@ -1471,8 +1494,9 @@ pub fn reply_to_mail_message(
     }
 
     let original_uid = request.uid;
-    let (target, submission) =
+    let (target, mut submission) =
         build_mail_reply_submission(imap_host, imap_port, &auth, mailbox_name, request)?;
+    submission.attachments.extend(attachments);
     let sent = send_mail_message_with_sent_copy(
         smtp_host, smtp_port, imap_host, imap_port, auth, submission,
     )?;
@@ -1486,6 +1510,7 @@ pub fn reply_to_mail_message(
     })
 }
 
+#[allow(dead_code)]
 pub fn review_mail_reply_submission(
     imap_host: &str,
     imap_port: u16,
@@ -1493,8 +1518,27 @@ pub fn review_mail_reply_submission(
     mailbox_name: &str,
     request: MailReplyRequest,
 ) -> Result<MailSendReview> {
-    let (_, submission) =
+    review_mail_reply_submission_with_attachments(
+        imap_host,
+        imap_port,
+        auth,
+        mailbox_name,
+        request,
+        Vec::new(),
+    )
+}
+
+pub fn review_mail_reply_submission_with_attachments(
+    imap_host: &str,
+    imap_port: u16,
+    auth: MailSessionAuth,
+    mailbox_name: &str,
+    request: MailReplyRequest,
+    attachments: Vec<MailAttachmentPayload>,
+) -> Result<MailSendReview> {
+    let (_, mut submission) =
         build_mail_reply_submission(imap_host, imap_port, &auth, mailbox_name, request)?;
+    submission.attachments.extend(attachments);
     review_mail_submission(auth, submission)
 }
 
@@ -1547,13 +1591,38 @@ pub fn forward_mail_message(
     mailbox_name: &str,
     request: MailForwardRequest,
 ) -> Result<ForwardedMail> {
-    let (source, submission) =
+    forward_mail_message_with_attachments(
+        imap_host,
+        imap_port,
+        smtp_host,
+        smtp_port,
+        auth,
+        mailbox_name,
+        request,
+        Vec::new(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn forward_mail_message_with_attachments(
+    imap_host: &str,
+    imap_port: u16,
+    smtp_host: &str,
+    smtp_port: u16,
+    auth: MailSessionAuth,
+    mailbox_name: &str,
+    request: MailForwardRequest,
+    attachments: Vec<MailAttachmentPayload>,
+) -> Result<ForwardedMail> {
+    let (source, mut submission) =
         build_mail_forward_submission(imap_host, imap_port, &auth, mailbox_name, request)?;
+    submission.attachments.extend(attachments);
     send_forwarded_mail_message(
         imap_host, imap_port, smtp_host, smtp_port, auth, source, submission,
     )
 }
 
+#[allow(dead_code)]
 pub fn review_mail_forward_submission(
     imap_host: &str,
     imap_port: u16,
@@ -1561,12 +1630,32 @@ pub fn review_mail_forward_submission(
     mailbox_name: &str,
     request: MailForwardRequest,
 ) -> Result<(MailSendReview, String)> {
-    let (source, submission) =
+    review_mail_forward_submission_with_attachments(
+        imap_host,
+        imap_port,
+        auth,
+        mailbox_name,
+        request,
+        Vec::new(),
+    )
+}
+
+pub fn review_mail_forward_submission_with_attachments(
+    imap_host: &str,
+    imap_port: u16,
+    auth: MailSessionAuth,
+    mailbox_name: &str,
+    request: MailForwardRequest,
+    attachments: Vec<MailAttachmentPayload>,
+) -> Result<(MailSendReview, String)> {
+    let (source, mut submission) =
         build_mail_forward_submission(imap_host, imap_port, &auth, mailbox_name, request)?;
+    submission.attachments.extend(attachments);
     let source_digest = mail_forward_source_digest(&source);
     Ok((review_mail_submission(auth, submission)?, source_digest))
 }
 
+#[allow(dead_code)]
 pub fn forward_mail_message_reviewed(
     imap_host: &str,
     imap_port: u16,
@@ -1576,8 +1665,32 @@ pub fn forward_mail_message_reviewed(
     mailbox_name: &str,
     binding: MailForwardReviewBinding,
 ) -> Result<ForwardedMail> {
-    let (source, submission) =
+    forward_mail_message_reviewed_with_attachments(
+        imap_host,
+        imap_port,
+        smtp_host,
+        smtp_port,
+        auth,
+        mailbox_name,
+        binding,
+        Vec::new(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn forward_mail_message_reviewed_with_attachments(
+    imap_host: &str,
+    imap_port: u16,
+    smtp_host: &str,
+    smtp_port: u16,
+    auth: MailSessionAuth,
+    mailbox_name: &str,
+    binding: MailForwardReviewBinding,
+    attachments: Vec<MailAttachmentPayload>,
+) -> Result<ForwardedMail> {
+    let (source, mut submission) =
         build_mail_forward_submission(imap_host, imap_port, &auth, mailbox_name, binding.request)?;
+    submission.attachments.extend(attachments);
     if mail_forward_source_digest(&source) != binding.source_sha256 {
         return Err(YacliError::Auth(
             "Исходное письмо изменилось после предварительной проверки; повторите review перед отправкой.".into(),

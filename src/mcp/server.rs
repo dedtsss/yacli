@@ -77,12 +77,14 @@ use crate::{
         MailAttachmentExportRequest, MailAttachmentSelector, MailBulkAction, MailFlagUpdate,
         MailForwardRequest, MailForwardReviewBinding, MailInviteInspectRequest, MailSearchFilter,
         MailSpecialFolderAction, apply_mail_bulk_action, copy_mail_message, create_mail_draft,
-        create_mail_folder, delete_mail_folder, export_mail_attachment, forward_mail_message,
-        forward_mail_message_reviewed, inspect_mail_invite, list_mail_folders,
-        list_mail_messages_page, load_mail_attachments, move_mail_message,
-        move_mail_message_to_special_folder, read_mail_message, rename_mail_folder,
-        review_mail_folder_delete, review_mail_forward_submission, review_mail_reply_submission,
-        review_mail_submission, search_mail_all_folders_page, search_mail_messages_filtered_page,
+        create_mail_folder, delete_mail_folder, export_mail_attachment,
+        forward_mail_message_reviewed_with_attachments, forward_mail_message_with_attachments,
+        inspect_mail_invite, list_mail_folders, list_mail_messages_page, load_mail_attachments,
+        move_mail_message, move_mail_message_to_special_folder, read_mail_message,
+        rename_mail_folder, reply_to_mail_message_with_attachments, review_mail_folder_delete,
+        review_mail_forward_submission_with_attachments,
+        review_mail_reply_submission_with_attachments, review_mail_submission,
+        search_mail_all_folders_page, search_mail_messages_filtered_page,
         send_mail_message_with_sent_copy, update_mail_flags, validate_mail_folder_rename,
     },
 };
@@ -189,7 +191,7 @@ struct NativeMailFile {
     file_name: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct DownloadedNativeMailFile {
     file_id: String,
     filename: String,
@@ -1547,7 +1549,11 @@ fn tool_definitions(ui_enabled: bool, roots_enabled: bool) -> Result<Vec<Value>>
                     "cc": {
                         "type": "array",
                         "items": { "type": "string" }
-                    }
+                    },
+                    "attachment_files": { "type": "array", "items": { "type": "object", "properties": {
+                        "download_url": { "type": "string" }, "file_id": { "type": "string" },
+                        "mime_type": { "type": "string" }, "file_name": { "type": "string" }
+                    }, "required": ["download_url", "file_id"], "additionalProperties": false } }
                 },
                 "required": ["uid"],
                 "additionalProperties": false
@@ -1575,7 +1581,11 @@ fn tool_definitions(ui_enabled: bool, roots_enabled: bool) -> Result<Vec<Value>>
                         "type": "array",
                         "items": { "type": "string" }
                     },
-                    "max_source_bytes": { "type": "integer", "minimum": 1 }
+                    "max_source_bytes": { "type": "integer", "minimum": 1 },
+                    "attachment_files": { "type": "array", "items": { "type": "object", "properties": {
+                        "download_url": { "type": "string" }, "file_id": { "type": "string" },
+                        "mime_type": { "type": "string" }, "file_name": { "type": "string" }
+                    }, "required": ["download_url", "file_id"], "additionalProperties": false } }
                 },
                 "required": ["uid", "to"],
                 "additionalProperties": false
@@ -2012,7 +2022,10 @@ fn tool(
     {
         object.insert("_meta".to_string(), app_meta(visibility));
     }
-    if name == "yacli.mail.send" {
+    if matches!(
+        name,
+        "yacli.mail.send" | "yacli.mail.reply" | "yacli.mail.forward"
+    ) {
         object
             .entry("_meta")
             .or_insert_with(|| Value::Object(Map::new()))
@@ -2040,7 +2053,10 @@ fn call_tool(params: Value, ui_enabled: bool) -> Result<Value> {
         }
     }
     devcat::check_tool_access(name, &arguments)?;
-    let native_attachments = if name == "yacli.mail.send" {
+    let native_attachments = if matches!(
+        name,
+        "yacli.mail.send" | "yacli.mail.reply" | "yacli.mail.forward"
+    ) {
         let files: Vec<NativeMailFile> = arguments
             .get("attachment_files")
             .map(|value| {
@@ -2069,12 +2085,13 @@ fn call_tool(params: Value, ui_enabled: bool) -> Result<Value> {
         let request = mail_forward_tool_request(&arguments)?;
         let (resolved_account, auth, context) =
             resolve_mail_private_context(arguments.get("account").and_then(Value::as_str))?;
-        let (review, source_sha256) = review_mail_forward_submission(
+        let (review, source_sha256) = review_mail_forward_submission_with_attachments(
             &context.imap_host,
             context.imap_port,
             auth,
             &request.folder,
             mail_forward_provider_request(&request),
+            native_files_to_mail_attachments(native_attachments.clone()).0,
         )?;
         if let Some(object) = arguments.as_object_mut() {
             object.insert(
@@ -2207,8 +2224,8 @@ fn call_tool(params: Value, ui_enabled: bool) -> Result<Value> {
                 dry_run: optional_bool(&arguments, "dry_run").unwrap_or(false),
             },
         )?,
-        "yacli.mail.reply" => mail_reply(&arguments)?,
-        "yacli.mail.forward" => mail_forward(&arguments)?,
+        "yacli.mail.reply" => mail_reply(&arguments, native_attachments)?,
+        "yacli.mail.forward" => mail_forward(&arguments, native_attachments)?,
         "yacli.mail.attachment.export" => mail_attachment_export(
             arguments.get("account").and_then(Value::as_str),
             MailAttachmentExportToolRequest {
@@ -3409,6 +3426,34 @@ fn mail_draft_create(args: &Value) -> Result<Value> {
     Ok(json!({"account":resolved_account,"created":true,"draft":draft}))
 }
 
+fn native_files_to_mail_attachments(
+    native_files: Vec<DownloadedNativeMailFile>,
+) -> (Vec<crate::mail::MailAttachmentPayload>, Vec<Value>) {
+    let metadata = native_files
+        .iter()
+        .map(|file| {
+            json!({
+                "file_id": file.file_id,
+                "filename": file.filename,
+                "mime_type": file.mime_type,
+                "size": file.content.len(),
+                "sha256": file.sha256,
+            })
+        })
+        .collect();
+    let attachments = native_files
+        .into_iter()
+        .map(|file| crate::mail::MailAttachmentPayload {
+            filename: Some(file.filename),
+            mime_type: file.mime_type,
+            content_id: None,
+            inline: false,
+            content: file.content,
+        })
+        .collect();
+    (attachments, metadata)
+}
+
 fn mail_send(
     account: Option<&str>,
     request: MailSendToolRequest,
@@ -3422,27 +3467,8 @@ fn mail_send(
             .map(PathBuf::from)
             .collect::<Vec<_>>(),
     )?;
-    let native_meta: Vec<_> = native_files
-        .iter()
-        .map(|file| {
-            json!({
-                "file_id": file.file_id,
-                "filename": file.filename,
-                "mime_type": file.mime_type,
-                "size": file.content.len(),
-                "sha256": file.sha256,
-            })
-        })
-        .collect();
-    for file in native_files {
-        attachments.push(crate::mail::MailAttachmentPayload {
-            filename: Some(file.filename),
-            mime_type: file.mime_type,
-            content_id: None,
-            inline: false,
-            content: file.content,
-        });
-    }
+    let (native_attachments, native_meta) = native_files_to_mail_attachments(native_files);
+    attachments.extend(native_attachments);
     let send_request = crate::mail::MailSendRequest {
         to: vec![request.to],
         cc: request.cc,
@@ -3884,7 +3910,7 @@ fn mail_send_published_link(
     }
 }
 
-fn mail_reply(args: &Value) -> Result<Value> {
+fn mail_reply(args: &Value, native_files: Vec<DownloadedNativeMailFile>) -> Result<Value> {
     let account = args.get("account").and_then(Value::as_str);
     let folder = optional_string(args, "folder").unwrap_or("INBOX");
     let uid = required_u64(args, "uid")?;
@@ -3893,6 +3919,7 @@ fn mail_reply(args: &Value) -> Result<Value> {
     let dry_run = optional_bool(args, "dry_run").unwrap_or(false);
     let text = optional_string_owned(args, "text");
     let html = optional_string_owned(args, "html");
+    let (attachments, native_meta) = native_files_to_mail_attachments(native_files);
     let (resolved_account, auth, context) = resolve_mail_private_context(account)?;
     let request = crate::mail::MailReplyRequest {
         uid,
@@ -3903,20 +3930,21 @@ fn mail_reply(args: &Value) -> Result<Value> {
         html,
     };
     if dry_run {
-        let review = review_mail_reply_submission(
+        let review = review_mail_reply_submission_with_attachments(
             &context.imap_host,
             context.imap_port,
             auth,
             folder,
             request,
+            attachments,
         )?;
         let digest = devcat::review_hash("yacli.mail.reply", args)?;
         devcat::record_review(digest.clone());
         return Ok(
-            json!({"account":resolved_account,"folder":folder,"uid":uid,"dry_run":true,"review":review,"review_sha256":digest}),
+            json!({"account":resolved_account,"folder":folder,"uid":uid,"dry_run":true,"review":review,"native_attachments":native_meta,"review_sha256":digest}),
         );
     }
-    let reply = crate::mail::reply_to_mail_message(
+    let reply = reply_to_mail_message_with_attachments(
         &context.imap_host,
         context.imap_port,
         &context.smtp_host,
@@ -3924,6 +3952,7 @@ fn mail_reply(args: &Value) -> Result<Value> {
         auth,
         folder,
         request,
+        attachments,
     )?;
     Ok(json!({
         "account": resolved_account,
@@ -3931,6 +3960,7 @@ fn mail_reply(args: &Value) -> Result<Value> {
         "status": reply.sent.delivery_status(),
         "warning": reply.sent.delivery_warning(),
         "reply": reply,
+        "native_attachments": native_meta,
     }))
 }
 
@@ -3961,9 +3991,10 @@ fn mail_forward_provider_request(request: &MailForwardToolRequest) -> MailForwar
     }
 }
 
-fn mail_forward(args: &Value) -> Result<Value> {
+fn mail_forward(args: &Value, native_files: Vec<DownloadedNativeMailFile>) -> Result<Value> {
     let account = args.get("account").and_then(Value::as_str);
     let request = mail_forward_tool_request(args)?;
+    let (attachments, native_meta) = native_files_to_mail_attachments(native_files);
     let (resolved_account, auth, context) = resolve_mail_private_context(account)?;
     if optional_bool(args, "dry_run") == Some(true) {
         let review = args.get("_forward_review").cloned().ok_or_else(|| {
@@ -3979,13 +4010,14 @@ fn mail_forward(args: &Value) -> Result<Value> {
             "uid": request.uid,
             "dry_run": true,
             "review": review,
+            "native_attachments": native_meta,
             "review_sha256": digest,
         }));
     }
     let forward_request = mail_forward_provider_request(&request);
     let forward = if devcat::enabled() {
         let expected_source_sha256 = required_string(args, "_forward_source_sha256")?;
-        forward_mail_message_reviewed(
+        forward_mail_message_reviewed_with_attachments(
             &context.imap_host,
             context.imap_port,
             &context.smtp_host,
@@ -3996,9 +4028,10 @@ fn mail_forward(args: &Value) -> Result<Value> {
                 request: forward_request,
                 source_sha256: expected_source_sha256.to_string(),
             },
+            attachments,
         )?
     } else {
-        forward_mail_message(
+        forward_mail_message_with_attachments(
             &context.imap_host,
             context.imap_port,
             &context.smtp_host,
@@ -4006,6 +4039,7 @@ fn mail_forward(args: &Value) -> Result<Value> {
             auth,
             &request.folder,
             forward_request,
+            attachments,
         )?
     };
     Ok(json!({
@@ -4014,6 +4048,7 @@ fn mail_forward(args: &Value) -> Result<Value> {
         "status": forward.sent.delivery_status(),
         "warning": forward.sent.delivery_warning(),
         "forward": forward,
+        "native_attachments": native_meta,
     }))
 }
 
@@ -5973,26 +6008,49 @@ mod native_attachment_schema_tests {
     #[test]
     fn mail_send_exposes_native_chatgpt_file_contract() {
         let tools = tool_definitions(false, false).expect("tool definitions");
+        for name in ["yacli.mail.send", "yacli.mail.reply", "yacli.mail.forward"] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap_or_else(|| panic!("{name} tool"));
+            let schema = &tool["inputSchema"];
+            let native = &schema["properties"]["attachment_files"]["items"];
+            assert_eq!(native["required"], json!(["download_url", "file_id"]));
+            assert_eq!(native["properties"]["download_url"]["type"], "string");
+            assert_eq!(native["properties"]["file_id"]["type"], "string");
+            assert_eq!(native["properties"]["mime_type"]["type"], "string");
+            assert_eq!(native["properties"]["file_name"]["type"], "string");
+            assert_eq!(native["additionalProperties"], false);
+            assert_eq!(
+                tool["_meta"]["openai/fileParams"],
+                json!(["attachment_files"])
+            );
+        }
         let send = tools
             .iter()
             .find(|tool| tool["name"] == "yacli.mail.send")
             .expect("mail.send tool");
-        let schema = &send["inputSchema"];
-        let native = &schema["properties"]["attachment_files"]["items"];
-        assert_eq!(native["required"], json!(["download_url", "file_id"]));
-        assert_eq!(native["properties"]["download_url"]["type"], "string");
-        assert_eq!(native["properties"]["file_id"]["type"], "string");
-        assert_eq!(native["properties"]["mime_type"]["type"], "string");
-        assert_eq!(native["properties"]["file_name"]["type"], "string");
-        assert_eq!(native["additionalProperties"], false);
         assert_eq!(
-            schema["properties"]["attachments"]["items"]["type"],
+            send["inputSchema"]["properties"]["attachments"]["items"]["type"],
             "string"
         );
-        assert_eq!(
-            send["_meta"]["openai/fileParams"],
-            json!(["attachment_files"])
-        );
+    }
+
+    #[test]
+    fn native_mail_files_preserve_bytes_and_review_metadata() {
+        let file = super::DownloadedNativeMailFile {
+            file_id: "synthetic-id".into(),
+            filename: "пример.pdf".into(),
+            mime_type: "application/pdf".into(),
+            sha256: "synthetic-sha256".into(),
+            content: b"synthetic-pdf".to_vec(),
+        };
+        let (attachments, metadata) = super::native_files_to_mail_attachments(vec![file]);
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].filename.as_deref(), Some("пример.pdf"));
+        assert_eq!(attachments[0].content, b"synthetic-pdf");
+        assert_eq!(metadata[0]["file_id"], "synthetic-id");
+        assert_eq!(metadata[0]["sha256"], "synthetic-sha256");
     }
 
     #[test]
